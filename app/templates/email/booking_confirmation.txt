@@ -1,0 +1,17 @@
+Hi {{ full_name }},
+
+Your consultation booking is confirmed.
+
+  Service:   {{ service_type }}
+  With:      {{ other_party }}
+  When:      {{ start_str }} (UTC)
+  Duration:  {{ duration_minutes }} minutes
+  Price:     ${{ price_usd }}
+
+A calendar invite (booking.ics) is attached — add it to your calendar so you
+don't miss the session.
+
+Need to reschedule or cancel? Please do so at least {{ notice_hours }} hours
+before the session via your {{ app_name }} dashboard.
+
+— The {{ app_name }} Team

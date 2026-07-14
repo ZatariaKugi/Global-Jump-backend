@@ -1,0 +1,66 @@
+"""Admin "Advisor Management" + "Verification Queue" schemas."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+from app.models.user import VerificationStatus
+from app.schemas.advisor_profile import LanguageEntry
+
+
+class AdvisorManagementListRead(BaseModel):
+    id: uuid.UUID
+    full_name: str | None
+    email: str
+    profile_photo_url: str | None
+    expertise: list[str]
+    verification_status: VerificationStatus | None
+    is_active: bool
+    session_count: int
+    avg_rating: float | None
+    review_count: int
+    created_at: datetime
+
+
+class AdvisorManagementDetailRead(AdvisorManagementListRead):
+    title: str | None
+    bio: str | None
+    years_of_experience: int | None
+    successful_applications: int | None
+    country_expertise: list[str]
+    languages: list[LanguageEntry]
+    completed_sessions: int
+    credentials_pending_count: int
+    credentials_verified_count: int
+
+
+class AdvisorEarningsSummaryRead(BaseModel):
+    total_earned_usd: float
+    total_commission_paid_usd: float
+    available_balance_usd: float
+    total_payouts_usd: float
+    pending_payout_usd: float
+    transaction_count: int
+
+
+class VerificationQueueRead(BaseModel):
+    """One row per advisor with >=1 pending AdvisorCredential. No status field —
+    the list query's own membership filter means every row is pending by
+    construction; a fully-resolved advisor simply drops off the list."""
+
+    advisor_id: uuid.UUID
+    full_name: str | None
+    email: str
+    profile_photo_url: str | None
+    pending_document_count: int
+    earliest_submitted_at: datetime
+    latest_submitted_at: datetime
+
+
+class BulkCredentialReview(BaseModel):
+    action: Literal["approve", "reject"]
+    admin_note: str | None = Field(default=None, max_length=1000)

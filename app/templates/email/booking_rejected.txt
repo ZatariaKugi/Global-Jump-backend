@@ -1,0 +1,13 @@
+Hi {{ full_name }},
+
+Unfortunately your consultation request could not be accepted.
+
+  Service:         {{ service_type }}
+  With:            {{ other_party }}
+  Requested time:  {{ start_str }} (UTC)
+{% if reason %}  Reason:          {{ reason }}
+{% endif %}
+You can browse other advisors and book a new consultation from your
+{{ app_name }} dashboard.
+
+— The {{ app_name }} Team
