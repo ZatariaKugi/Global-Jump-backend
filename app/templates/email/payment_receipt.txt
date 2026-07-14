@@ -1,0 +1,12 @@
+Hi {{ full_name }},
+
+Thanks for your payment. Here's your receipt.
+
+  Invoice:       #{{ invoice_number }}
+  Service:       {{ service_type }}
+  Advisor:       {{ advisor_name }}
+  Amount paid:   ${{ amount_usd }}
+
+You can view or download the full invoice from your {{ app_name }} dashboard at any time.
+
+— The {{ app_name }} Team

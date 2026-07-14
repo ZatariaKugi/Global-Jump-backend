@@ -1,0 +1,11 @@
+Hi {{ full_name }},
+
+You have a new consultation request awaiting your response.
+
+  Service:         {{ service_type }}
+  From:            {{ other_party }}
+  Requested time:  {{ start_str }} (UTC)
+
+Please accept or reject this request from your {{ app_name }} dashboard.
+
+— The {{ app_name }} Team

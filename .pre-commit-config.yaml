@@ -1,0 +1,84 @@
+# Pre-commit hooks for the globlejump FastAPI backend.
+# Install:  uv run pre-commit install
+# Run all:  uv run pre-commit run --all-files
+# Secrets:  uv run pre-commit run detect-secrets --hook-stage manual --all-files
+repos:
+  # ── Basic file hygiene ────────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        files: '.*\.py$'
+      - id: end-of-file-fixer
+        files: '.*\.py$'
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+        files: '.*\.py$'
+      - id: check-yaml
+        args: ["--unsafe"]
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+      - id: debug-statements
+
+  # ── Ruff — lint + format (replaces black, isort, pyupgrade, flake8) ───────
+  # rev pinned to the project's ruff (see pyproject.toml dev deps) so the
+  # pre-commit formatter matches local `uv run ruff format`.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.16
+    hooks:
+      - id: ruff
+        args:
+          - "--fix"
+          - "--select=F821,F822,F823,F401,T10,T20,PLE,B,C4,DTZ,PIE,SIM,RET,UP,I"
+          - "--ignore=SIM112"
+        files: '.*\.py$'
+      - id: ruff-format
+        files: '.*\.py$'
+
+  # ── Security — common vulnerability patterns ──────────────────────────────
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.9.4
+    hooks:
+      - id: bandit
+        args: ["-c", "pyproject.toml", "--severity-level", "medium"]
+        additional_dependencies: ["bandit[toml]"]
+        files: '.*\.py$'
+        exclude: '.*(tests|test_).*\.py$'
+
+  # ── Secrets scanning — run manually: pre-commit run detect-secrets ────────
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        stages: [manual]
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: '.*(\.venv|uv\.lock|\.env\.example).*'
+
+  # ── Static type checking ──────────────────────────────────────────────────
+  # Scoped to app/ (matches how the project verifies: `uv run mypy app`).
+  # Strict-mode settings live in [tool.mypy] in pyproject.toml.
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.1.0
+    hooks:
+      - id: mypy
+        args: [--config-file, pyproject.toml]
+        files: '^app/.*\.py$'
+        additional_dependencies:
+          - pydantic[email]>=2.0
+          - pydantic-settings>=2.0
+          - fastapi>=0.115
+          - sqlalchemy[asyncio]>=2.0
+          - asyncpg>=0.30
+          - PyJWT>=2.8
+          - pwdlib[argon2]>=0.2
+          - structlog>=24.0
+          - alembic>=1.13
+          - uvicorn>=0.30
+          - prometheus-fastapi-instrumentator>=7.0
+          - sentry-sdk>=2.0
+          - opentelemetry-sdk>=1.28
+          - opentelemetry-instrumentation-fastapi>=0.49b0
+          - opentelemetry-instrumentation-sqlalchemy>=0.49b0
