@@ -42,6 +42,7 @@ class AdvisorProfileUpdate(BaseModel):
     profile_photo_url: str | None = None
     years_of_experience: int | None = Field(default=None, ge=0, le=60)
     successful_applications: int | None = Field(default=None, ge=0)
+    successful_application_rate: float | None = Field(default=None, ge=0, le=100)
     visa_specializations: list[VisaSpecialization] | None = None
     country_expertise: list[CountryCode] | None = None
     languages: list[LanguageEntry] | None = None
@@ -56,6 +57,7 @@ class AdvisorProfileRead(BaseModel):
     profile_photo_url: str | None
     years_of_experience: int | None
     successful_applications: int | None
+    successful_application_rate: float | None
     visa_specializations: list[str]
     country_expertise: list[str]
     languages: list[LanguageEntry]
@@ -143,6 +145,7 @@ class AdvisorProfilePublicRead(BaseModel):
     profile_photo_url: str | None
     years_of_experience: int | None
     successful_applications: int | None
+    successful_application_rate: float | None
     visa_specializations: list[str]
     country_expertise: list[str]
     languages: list[LanguageEntry]

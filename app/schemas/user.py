@@ -26,10 +26,16 @@ class UserUpdate(BaseModel):
     password: str | None = Field(default=None, min_length=8, max_length=128)
 
 
-class UserRead(UserBase):
+class UserRead(BaseModel):
+    """Response schema — email is str so reserved TLDs (e.g. .test seed accounts)
+    stored in the DB can be returned without EmailStr rejection.
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
+    email: str
+    full_name: str | None = None
     role: UserRole
     is_active: bool
     is_email_verified: bool

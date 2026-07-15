@@ -68,10 +68,13 @@ async def register(
 async def register_advisor(
     data: AdvisorCreate,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorRead]:
     """Advisor self-registration. Account is inactive until admin approves."""
     user = await user_service.create_advisor(session, data)
+    raw_token = await auth_service.create_email_verification_token(session, user, settings)
+    await send_verification_email(user.email, user.full_name or "", raw_token, settings)
     return ResponseEnvelope[AdvisorRead](
         data=AdvisorRead.model_validate(user), meta=Meta(request_id=request_id)
     )
