@@ -120,6 +120,155 @@ async def send_verification_email(
         )
 
 
+
+async def send_advisor_welcome_email(
+    to: str,
+    full_name: str,
+    settings: Settings,
+) -> None:
+    """Notify an advisor that their account has been approved."""
+    login_url = f"{settings.FRONTEND_URL}/login"
+    ctx = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "login_url": login_url,
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info(
+            "advisor_welcome_issued [no smtp — logged]",
+            to=to,
+            login_url=login_url,
+        )
+        return
+
+    message = MessageSchema(
+        subject=f"Welcome to {settings.EMAILS_FROM_NAME} — you're approved!",
+        recipients=[to],
+        body=_render("advisor_welcome.html", ctx),
+        subtype=MessageType.html,
+        alternative_body=_render("advisor_welcome.txt", ctx),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            "List-Unsubscribe": f"<mailto:{settings.EMAILS_FROM}?subject=unsubscribe>",
+            **_deliverability_headers(settings),
+        },
+    )
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("advisor_welcome_email_sent", to=to)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "advisor_welcome_email_failed_smtp_unavailable",
+            to=to,
+            error=str(exc),
+        )
+
+
+async def send_advisor_rejected_email(
+    to: str,
+    full_name: str,
+    settings: Settings,
+    *,
+    reason: str | None = None,
+) -> None:
+    """Notify an advisor that their account application was rejected."""
+    login_url = f"{settings.FRONTEND_URL}/login"
+    ctx: dict[str, object] = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "reason": reason,
+        "login_url": login_url,
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info(
+            "advisor_rejected_issued [no smtp — logged]",
+            to=to,
+            reason=reason,
+            login_url=login_url,
+        )
+        return
+
+    message = MessageSchema(
+        subject=f"Your {settings.EMAILS_FROM_NAME} advisor application",
+        recipients=[to],
+        body=_render("advisor_rejected.html", ctx),
+        subtype=MessageType.html,
+        alternative_body=_render("advisor_rejected.txt", ctx),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            "List-Unsubscribe": f"<mailto:{settings.EMAILS_FROM}?subject=unsubscribe>",
+            **_deliverability_headers(settings),
+        },
+    )
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("advisor_rejected_email_sent", to=to)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "advisor_rejected_email_failed_smtp_unavailable",
+            to=to,
+            error=str(exc),
+        )
+
+
+async def send_advisor_pending_email(
+    to: str,
+    full_name: str,
+    settings: Settings,
+) -> None:
+    """Notify an advisor that their application is pending review."""
+    login_url = f"{settings.FRONTEND_URL}/login"
+    ctx = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "login_url": login_url,
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info(
+            "advisor_pending_issued [no smtp — logged]",
+            to=to,
+            login_url=login_url,
+        )
+        return
+
+    message = MessageSchema(
+        subject=f"Your {settings.EMAILS_FROM_NAME} application is pending review",
+        recipients=[to],
+        body=_render("advisor_pending.html", ctx),
+        subtype=MessageType.html,
+        alternative_body=_render("advisor_pending.txt", ctx),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            "List-Unsubscribe": f"<mailto:{settings.EMAILS_FROM}?subject=unsubscribe>",
+            **_deliverability_headers(settings),
+        },
+    )
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("advisor_pending_email_sent", to=to)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "advisor_pending_email_failed_smtp_unavailable",
+            to=to,
+            error=str(exc),
+        )
+
+
 async def send_password_reset_email(
     to: str,
     full_name: str,

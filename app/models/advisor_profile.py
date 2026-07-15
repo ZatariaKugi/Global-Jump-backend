@@ -88,6 +88,8 @@ class AdvisorProfile(BaseModel):
     # Expertise
     years_of_experience: Mapped[int | None] = mapped_column(nullable=True)
     successful_applications: Mapped[int | None] = mapped_column(nullable=True)
+    # Self-reported career success rate (0–100).
+    successful_application_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Normalised into child tables
     visa_specializations: Mapped[list[AdvisorVisaSpecialization]] = relationship(

@@ -8,6 +8,7 @@ import uuid
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.countries import country_name
 from app.core.exceptions import NotFoundError
 from app.models.advisor_credential import AdvisorCredential, CredentialStatus
 from app.models.advisor_profile import AdvisorProfile
@@ -83,6 +84,16 @@ async def build_list_read(
                 full_name=a.full_name,
                 email=a.email,
                 profile_photo_url=profile.profile_photo_url if profile else None,
+                country_code=(
+                    profile.country_expertise[0].country_code
+                    if profile and profile.country_expertise
+                    else None
+                ),
+                country=(
+                    country_name(profile.country_expertise[0].country_code)
+                    if profile and profile.country_expertise
+                    else None
+                ),
                 expertise=(
                     [s.specialization for s in profile.visa_specializations] if profile else []
                 ),
@@ -130,11 +141,15 @@ async def get_advisor_detail(
     for status, count in cred_rows:
         cred_counts[status] = count
 
+    expertise_codes = [c.country_code for c in profile.country_expertise]
+    residence_code = expertise_codes[0] if expertise_codes else None
     return AdvisorManagementDetailRead(
         id=advisor.id,
         full_name=advisor.full_name,
         email=advisor.email,
         profile_photo_url=profile.profile_photo_url,
+        country_code=residence_code,
+        country=country_name(residence_code),
         expertise=[s.specialization for s in profile.visa_specializations],
         verification_status=advisor.verification_status,
         is_active=advisor.is_active,
@@ -146,7 +161,9 @@ async def get_advisor_detail(
         bio=profile.bio,
         years_of_experience=profile.years_of_experience,
         successful_applications=profile.successful_applications,
-        country_expertise=[c.country_code for c in profile.country_expertise],
+        successful_application_rate=profile.successful_application_rate,
+        country_expertise=expertise_codes,
+        country_expertise_names=[country_name(code) or code for code in expertise_codes],
         languages=[
             LanguageEntry(language=lang.language, proficiency=lang.proficiency)
             for lang in profile.languages

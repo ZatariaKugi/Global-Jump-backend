@@ -8,20 +8,42 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import Select, or_, select
+from sqlalchemy import Select, and_, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.exceptions import NotFoundError
 from app.models.seeker_profile import SeekerProfile
-from app.models.user import User, UserRole
+from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.user_admin import AccountStatus, UserDetailRead, UserListRead
 from app.services import auth_service
 from app.services.email_service import send_password_reset_email
 
 
+# Advisors register with is_active=False until admin approves — that is
+# onboarding, not a soft-suspend.
+_ADVISOR_ONBOARDING = and_(
+    User.role == UserRole.advisor,
+    User.verification_status.in_(
+        (VerificationStatus.pending, VerificationStatus.under_review)
+    ),
+)
+
+
+def _is_advisor_onboarding(user: User) -> bool:
+    return user.role == UserRole.advisor and user.verification_status in (
+        VerificationStatus.pending,
+        VerificationStatus.under_review,
+    )
+
+
 def compute_status(user: User) -> AccountStatus:
-    if not user.is_active:
+    """Map DB flags → admin list status.
+
+    ``suspended`` is reserved for true soft-suspends (``is_active=False``),
+    not for advisors still waiting on verification approval.
+    """
+    if not user.is_active and not _is_advisor_onboarding(user):
         return AccountStatus.suspended
     if user.email_verified_at is None:
         return AccountStatus.unverified
@@ -38,11 +60,17 @@ def list_users_stmt(
         pattern = f"%{search.strip()}%"
         stmt = stmt.where(or_(User.full_name.ilike(pattern), User.email.ilike(pattern)))
     if status == AccountStatus.suspended:
-        stmt = stmt.where(User.is_active.is_(False))
+        stmt = stmt.where(User.is_active.is_(False), not_(_ADVISOR_ONBOARDING))
     elif status == AccountStatus.unverified:
-        stmt = stmt.where(User.is_active.is_(True), User.email_verified_at.is_(None))
+        stmt = stmt.where(
+            User.email_verified_at.is_(None),
+            or_(User.is_active.is_(True), _ADVISOR_ONBOARDING),
+        )
     elif status == AccountStatus.verified:
-        stmt = stmt.where(User.is_active.is_(True), User.email_verified_at.is_not(None))
+        stmt = stmt.where(
+            User.email_verified_at.is_not(None),
+            or_(User.is_active.is_(True), _ADVISOR_ONBOARDING),
+        )
     return stmt
 
 

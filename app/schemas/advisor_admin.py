@@ -17,6 +17,8 @@ class AdvisorManagementListRead(BaseModel):
     full_name: str | None
     email: str
     profile_photo_url: str | None
+    country_code: str | None  # ISO-3166 alpha-2 from first country_expertise
+    country: str | None  # display name
     expertise: list[str]
     verification_status: VerificationStatus | None
     is_active: bool
@@ -31,7 +33,9 @@ class AdvisorManagementDetailRead(AdvisorManagementListRead):
     bio: str | None
     years_of_experience: int | None
     successful_applications: int | None
-    country_expertise: list[str]
+    successful_application_rate: float | None  # 0-100 percentage
+    country_expertise: list[str]  # ISO codes
+    country_expertise_names: list[str]  # display names
     languages: list[LanguageEntry]
     completed_sessions: int
     credentials_pending_count: int

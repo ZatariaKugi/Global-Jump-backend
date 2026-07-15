@@ -1,0 +1,12 @@
+Hi {{ full_name }},
+
+Your advisor application status on {{ app_name }} has been set to pending.
+Our team will review your profile and you will hear from us once a decision
+is made.
+
+In the meantime, you can log in to check your account status and continue
+completing your profile:
+
+{{ login_url }}
+
+— The {{ app_name }} Team
