@@ -100,6 +100,7 @@ def _build_common(profile: AdvisorProfile) -> dict[str, object]:
         "profile_photo_url": profile.profile_photo_url,
         "years_of_experience": profile.years_of_experience,
         "successful_applications": profile.successful_applications,
+        "successful_application_rate": profile.successful_application_rate,
         "visa_specializations": [s.specialization for s in (profile.visa_specializations or [])],
         "country_expertise": [c.country_code for c in (profile.country_expertise or [])],
         "languages": [
@@ -184,6 +185,7 @@ def build_public_read(user: User, profile: AdvisorProfile | None) -> AdvisorProf
         profile_photo_url=None,
         years_of_experience=None,
         successful_applications=None,
+        successful_application_rate=None,
         visa_specializations=[],
         country_expertise=[],
         languages=[],

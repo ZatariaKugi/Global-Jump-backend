@@ -1,0 +1,16 @@
+Hi {{ full_name }},
+
+Thank you for applying to join {{ app_name }} as an advisor. After careful
+review, we are unable to approve your application at this time.
+{% if reason %}
+
+Reason: {{ reason }}
+{% endif %}
+
+If you believe this was a mistake or would like to reapply with updated
+credentials, please reply to this email and our team will be happy to help.
+
+Log in here:
+{{ login_url }}
+
+— The {{ app_name }} Team

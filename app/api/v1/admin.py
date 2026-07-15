@@ -120,23 +120,62 @@ async def update_advisor_verification(
     body: VerificationStatusUpdate,
     session: SessionDep,
     request_id: RequestIdDep,
+    settings: SettingsDep,
 ) -> ResponseEnvelope[AdvisorRead]:
     """Update an advisor's verification status.
 
-    Setting status to ``approved`` also activates the account (``is_active=True``).
-    Setting to ``rejected`` or ``pending`` deactivates it.
+    Setting status to ``approved`` also activates the account (``is_active=True``)
+    and sends a welcome email. Setting to ``rejected`` or ``pending`` deactivates
+    the account and sends the corresponding status email. All status emails link
+    to the frontend ``/login`` page.
     """
     from app.core.exceptions import NotFoundError
+    from app.services.email_service import (
+        send_advisor_pending_email,
+        send_advisor_rejected_email,
+        send_advisor_welcome_email,
+    )
 
     advisor = await session.get(User, advisor_id)
     if advisor is None or advisor.role != UserRole.advisor:
         raise NotFoundError("Advisor not found")
 
+    previous_status = advisor.verification_status
     advisor.verification_status = body.status
     advisor.is_active = body.status == VerificationStatus.approved
     session.add(advisor)
     await session.flush()
     await session.refresh(advisor)
+
+    if (
+        body.status == VerificationStatus.approved
+        and previous_status != VerificationStatus.approved
+    ):
+        await send_advisor_welcome_email(
+            advisor.email,
+            advisor.full_name or "",
+            settings,
+        )
+    elif (
+        body.status == VerificationStatus.rejected
+        and previous_status != VerificationStatus.rejected
+    ):
+        await send_advisor_rejected_email(
+            advisor.email,
+            advisor.full_name or "",
+            settings,
+            reason=body.reason,
+        )
+    elif (
+        body.status == VerificationStatus.pending
+        and previous_status != VerificationStatus.pending
+    ):
+        await send_advisor_pending_email(
+            advisor.email,
+            advisor.full_name or "",
+            settings,
+        )
+
     return ResponseEnvelope[AdvisorRead](
         data=AdvisorRead.model_validate(advisor),
         meta=Meta(request_id=request_id),

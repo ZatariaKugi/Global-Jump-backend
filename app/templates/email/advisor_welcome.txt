@@ -1,0 +1,14 @@
+Hi {{ full_name }},
+
+Great news — your advisor application on {{ app_name }} has been reviewed and
+approved. Your account is now active and you can start helping seekers.
+
+Next steps:
+  • Complete or update your profile so seekers can find you
+  • Set your availability and offered services
+  • Start accepting consultation bookings
+
+Log in here:
+{{ login_url }}
+
+— The {{ app_name }} Team
