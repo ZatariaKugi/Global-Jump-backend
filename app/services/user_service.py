@@ -89,11 +89,18 @@ async def authenticate(session: AsyncSession, email: str, password: str) -> User
     password_ok = verify_password(password, candidate_hash)
     if user is None or not password_ok:
         raise AuthenticationError("Incorrect email or password")
+    if getattr(user, "is_suspended", False) or (
+        user.verification_status == VerificationStatus.suspended
+    ):
+        raise AuthenticationError("Account is suspended")
     if not user.is_active:
-        if user.role == UserRole.advisor and user.verification_status == VerificationStatus.pending:
-            # Pending advisors can log in to complete their onboarding profile and
-            # upload credentials, but remain gated by require_verified_advisor on
-            # externally-facing actions (bookings, availability, etc.).
+        if user.role == UserRole.advisor and user.verification_status in (
+            VerificationStatus.pending,
+            VerificationStatus.under_review,
+        ):
+            # Pending / under-review advisors can log in to complete onboarding
+            # and view Approval Pending, but remain gated by require_verified_advisor
+            # on externally-facing actions (bookings, availability, etc.).
             return user
         if user.role == UserRole.advisor:
             raise AuthenticationError("Advisor account pending verification")

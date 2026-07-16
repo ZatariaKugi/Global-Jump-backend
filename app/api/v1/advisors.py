@@ -26,7 +26,6 @@ from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import Assessment
 from app.models.booking import Booking
-from app.models.transaction import Transaction
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.advisor_credential import (
     AdvisorCredentialCreate,
@@ -36,6 +35,8 @@ from app.schemas.advisor_credential import (
 from app.schemas.advisor_lead import AdvisorLeadRead
 from app.schemas.advisor_profile import (
     AdvisorListingCard,
+    AdvisorOnboardingCompleteRead,
+    AdvisorOnboardingStatusRead,
     AdvisorOnboardingSubmit,
     AdvisorProfilePublicRead,
     AdvisorProfileRead,
@@ -48,7 +49,7 @@ from app.schemas.payment import (
     TransactionAdvisorRead,
     TransactionRead,
 )
-from app.schemas.payout import PayoutRequestCreate, PayoutRequestRead
+from app.schemas.payout import PayoutPreviewRead, PayoutRequestCreate, PayoutRequestRead
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.seeker_document import (
     DocumentCommentCreate,
@@ -240,31 +241,47 @@ async def get_advisor_public_profile(
 # ── Advisor onboarding ───────────────────────────────────────────────────────
 
 
+@router.get(
+    "/me/onboarding/status",
+    response_model=ResponseEnvelope[AdvisorOnboardingStatusRead],
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def get_advisor_onboarding_status(
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[AdvisorOnboardingStatusRead]:
+    """Approval Pending / Status Tracking checklist (wizard step 7)."""
+    profile = await advisor_profile_service.get_or_create(session, current_user.id)
+    status = await advisor_profile_service.build_onboarding_status(session, current_user, profile)
+    return ResponseEnvelope[AdvisorOnboardingStatusRead](
+        data=status,
+        meta=Meta(request_id=request_id),
+    )
+
+
 @router.post(
     "/me/onboarding",
     status_code=200,
-    response_model=ResponseEnvelope[AdvisorProfileRead],
+    response_model=ResponseEnvelope[AdvisorOnboardingCompleteRead],
     dependencies=[Depends(require_role(UserRole.advisor))],
 )
 async def complete_advisor_onboarding(
     data: AdvisorOnboardingSubmit,
     current_user: CurrentUser,
     session: SessionDep,
-    settings: SettingsDep,
     request_id: RequestIdDep,
-) -> ResponseEnvelope[AdvisorProfileRead]:
+) -> ResponseEnvelope[AdvisorOnboardingCompleteRead]:
     """Accept the complete advisor onboarding wizard payload in one shot.
 
     The frontend accumulates step data in browser storage and calls this
-    endpoint once at the final wizard step.  For each document reference the
-    server validates the file key belongs to this advisor, then creates the
-    credential record pointing at the already-uploaded file.
-    """
-    # Build country list: base_country first (if given), then the rest
-    countries: list[str] = list(data.country_expertise)
-    if data.base_country and data.base_country not in countries:
-        countries.insert(0, data.base_country)
+    endpoint once after Verification Documents (step 6).  Sets the advisor's
+    ``verification_status`` to ``under_review`` for the Approval Pending screen.
 
+    Upload files first via ``POST /uploads`` (``category=advisor_document``
+    or ``credential``), then pass the returned ``file_key`` values in
+    ``documents``.
+    """
     profile = await advisor_profile_service.get_or_create(session, current_user.id)
     if profile.public_profile_slug is None:
         profile.public_profile_slug = await advisor_search_service.generate_unique_slug(
@@ -272,20 +289,22 @@ async def complete_advisor_onboarding(
         )
 
     update = AdvisorProfileUpdate(
-        title=data.title,
         bio=data.bio,
         years_of_experience=data.years_of_experience,
-        successful_applications=data.successful_applications,
-        visa_specializations=data.visa_specializations or None,
-        country_expertise=countries or None,
-        services=data.services or None,
+        country_of_residence=data.country_of_residence,
+        expertise_description=data.expertise_description,
+        offered_services=data.service_types or None,
+        visa_specializations=data.areas_of_expertise or None,
+        country_expertise=data.countries_you_serve or None,
     )
     profile = await advisor_profile_service.update(session, profile, update)
 
-    # Create credential records for each uploaded document
-    expected_prefix = f"credential/{current_user.id}/"
+    allowed_prefixes = (
+        f"advisor_document/{current_user.id}/",
+        f"credential/{current_user.id}/",
+    )
     for doc in data.documents:
-        if not doc.file_key.startswith(expected_prefix):
+        if not doc.file_key.startswith(allowed_prefixes):
             raise PermissionDeniedError("Invalid document key")
         file_url = f"/uploads/{doc.file_key}"
         await advisor_credential_service.create(
@@ -300,8 +319,18 @@ async def complete_advisor_onboarding(
             None,
         )
 
-    return ResponseEnvelope[AdvisorProfileRead](
-        data=advisor_profile_service.build_read(profile),
+    current_user = await advisor_profile_service.mark_under_review(session, current_user)
+    onboarding_status = await advisor_profile_service.build_onboarding_status(
+        session, current_user, profile
+    )
+    profile_data = advisor_profile_service.build_read(profile)
+
+    return ResponseEnvelope[AdvisorOnboardingCompleteRead](
+        data=AdvisorOnboardingCompleteRead(
+            **profile_data.model_dump(),
+            verification_status=current_user.verification_status,
+            onboarding_status=onboarding_status,
+        ),
         meta=Meta(request_id=request_id),
     )
 
@@ -324,10 +353,14 @@ async def create_credential(
 ) -> ResponseEnvelope[AdvisorCredentialRead]:
     """Create a credential record for a file already uploaded via ``POST /uploads``.
 
-    Upload the file first with ``category=credential``, then pass the returned
-    ``file_key`` here alongside the document metadata.
+    Upload the file first with ``category=advisor_document`` (or ``credential``),
+    then pass the returned ``file_key`` here alongside the document metadata.
     """
-    if not data.file_key.startswith(f"credential/{current_user.id}/"):
+    allowed_prefixes = (
+        f"advisor_document/{current_user.id}/",
+        f"credential/{current_user.id}/",
+    )
+    if not data.file_key.startswith(allowed_prefixes):
         raise PermissionDeniedError("Invalid file key")
     file_url = f"/uploads/{data.file_key}"
     credential = await advisor_credential_service.create(
@@ -734,19 +767,6 @@ async def add_client_document_comment(
 # ── Payments + payouts (PRD §3.10) ───────────────────────────────────────────
 
 
-def _transaction_advisor_read(
-    txn: Transaction, booking: Booking, seeker: User | None
-) -> TransactionAdvisorRead:
-    base = TransactionRead.model_validate(txn)
-    return TransactionAdvisorRead(
-        **base.model_dump(),
-        seeker_id=booking.seeker_id,
-        seeker_name=seeker.full_name if seeker else None,
-        service_type=booking.service_type,
-        scheduled_start=booking.scheduled_start,
-    )
-
-
 @router.get(
     "/me/payments",
     response_model=ResponseEnvelope[list[TransactionAdvisorRead]],
@@ -758,7 +778,7 @@ async def list_my_payments(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[TransactionAdvisorRead]]:
-    """ "Payment of customers" list — one row per transaction on this advisor's bookings."""
+    """Earnings / customer-payments history — one row per transaction on this advisor's bookings."""
     stmt = payment_service.list_for_advisor_stmt(current_user.id)
     txns, total = await paginate(session, stmt, params)
 
@@ -767,11 +787,31 @@ async def list_my_payments(
         booking = await session.get(Booking, txn.booking_id)
         seeker = await session.get(User, booking.seeker_id) if booking else None
         if booking is not None:
-            data.append(_transaction_advisor_read(txn, booking, seeker))
+            data.append(
+                await payment_service.advisor_earnings_payment_read(session, txn, booking, seeker)
+            )
 
     return ResponseEnvelope[list[TransactionAdvisorRead]](
         data=data, meta=page_meta(params, total, request_id)
     )
+
+
+@router.get(
+    "/me/payouts/preview",
+    response_model=ResponseEnvelope[PayoutPreviewRead],
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def preview_payout(
+    amount_usd: float,
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[PayoutPreviewRead]:
+    """Request Payout modal — fee breakdown before submitting."""
+    available = await payout_service.get_available_balance(session, current_user.id)
+    data = payout_service.preview_payout(available, amount_usd, settings)
+    return ResponseEnvelope[PayoutPreviewRead](data=data, meta=Meta(request_id=request_id))
 
 
 @router.get(

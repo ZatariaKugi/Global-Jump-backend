@@ -64,11 +64,19 @@ def list_seekers_stmt(
         pattern = f"%{search.strip()}%"
         stmt = stmt.where(or_(User.full_name.ilike(pattern), User.email.ilike(pattern)))
     if status == AccountStatus.suspended:
-        stmt = stmt.where(User.is_active.is_(False))
+        stmt = stmt.where(User.is_suspended.is_(True))
     elif status == AccountStatus.unverified:
-        stmt = stmt.where(User.is_active.is_(True), User.email_verified_at.is_(None))
+        stmt = stmt.where(
+            User.is_suspended.is_(False),
+            User.is_active.is_(True),
+            User.email_verified_at.is_(None),
+        )
     elif status == AccountStatus.verified:
-        stmt = stmt.where(User.is_active.is_(True), User.email_verified_at.is_not(None))
+        stmt = stmt.where(
+            User.is_suspended.is_(False),
+            User.is_active.is_(True),
+            User.email_verified_at.is_not(None),
+        )
     return stmt
 
 

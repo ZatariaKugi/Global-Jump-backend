@@ -39,6 +39,11 @@ class PayoutRequest(BaseModel):
         SAEnum(PayoutMethod, name="payout_method"), nullable=False
     )
     note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    # Bank details captured on Request Payout (bank_transfer).
+    account_holder_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    account_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    bank_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    swift_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
     processing_fee_usd: Mapped[float] = mapped_column(Float, nullable=False)
     net_amount_usd: Mapped[float] = mapped_column(Float, nullable=False)
     status: Mapped[PayoutStatus] = mapped_column(

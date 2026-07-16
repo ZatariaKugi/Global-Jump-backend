@@ -22,12 +22,44 @@ from app.schemas.payment import (
     AdvisorConnectStatus,
     CheckoutResponse,
     InvoiceLineItem,
+    InvoicePerspective,
     InvoiceRead,
+    PaymentDisplayStatus,
+    PaymentSummaryRead,
+    SeekerPaymentRead,
+    SeekerPaymentSummaryRead,
+    TransactionAdvisorRead,
     TransactionFinanceRead,
 )
 from app.services import email_service
 
 log = structlog.get_logger()
+
+_INVOICE_TERMS = (
+    "Payment is due upon receipt. This invoice reflects charges for consultation "
+    "services arranged through the platform. Refunds are subject to the platform "
+    "cancellation policy."
+)
+
+
+def display_status(txn: Transaction) -> PaymentDisplayStatus:
+    if txn.status == TransactionStatus.succeeded:
+        return "paid"
+    if txn.status == TransactionStatus.pending:
+        return "pending"
+    if txn.status in (TransactionStatus.refunded, TransactionStatus.partially_refunded):
+        return "refunded"
+    return "failed"
+
+
+def format_invoice_id(invoice_number: int | None) -> str | None:
+    if invoice_number is None:
+        return None
+    return f"INV-{invoice_number:08d}"
+
+
+def format_appointment_id(appointment_number: int) -> str:
+    return f"#{appointment_number:07d}"
 
 
 def _init_stripe(settings: Settings) -> None:
@@ -461,15 +493,17 @@ async def get_advisor_earnings(
     txns = list(result.scalars().all())
 
     total_earned = sum(
-        t.advisor_payout_usd for t in txns if t.status == TransactionStatus.succeeded
+        (t.advisor_payout_usd for t in txns if t.status == TransactionStatus.succeeded),
+        0.0,
     )
     total_commission = sum(
-        t.commission_usd for t in txns if t.status == TransactionStatus.succeeded
+        (t.commission_usd for t in txns if t.status == TransactionStatus.succeeded),
+        0.0,
     )
 
     return {
-        "total_earned_usd": round(total_earned, 2),
-        "total_commission_paid_usd": round(total_commission, 2),
+        "total_earned_usd": round(float(total_earned), 2),
+        "total_commission_paid_usd": round(float(total_commission), 2),
         "transactions": txns,
     }
 
@@ -480,6 +514,7 @@ def list_for_advisor_stmt(advisor_id: uuid.UUID) -> Select[tuple[Transaction]]:
         select(Transaction)
         .join(Booking, Booking.id == Transaction.booking_id)
         .where(Booking.advisor_id == advisor_id)
+        .where(Transaction.is_archived.is_(False))
         .order_by(Transaction.created_at.desc())
     )
 
@@ -512,7 +547,13 @@ _INVOICE_ELIGIBLE_STATUSES = (
 )
 
 
-async def build_invoice(session: AsyncSession, txn: Transaction, settings: Settings) -> InvoiceRead:
+async def build_invoice(
+    session: AsyncSession,
+    txn: Transaction,
+    settings: Settings,
+    *,
+    perspective: InvoicePerspective = "seeker",
+) -> InvoiceRead:
     if txn.status not in _INVOICE_ELIGIBLE_STATUSES:
         raise AppError("Invoice is only available for a paid transaction", code="not_paid")
     if txn.invoice_number is None:
@@ -523,37 +564,216 @@ async def build_invoice(session: AsyncSession, txn: Transaction, settings: Setti
         raise NotFoundError("Booking not found")
     seeker = await session.get(User, booking.seeker_id)
     advisor = await session.get(User, booking.advisor_id)
-    advisor_name = advisor.full_name if advisor else "Advisor"
 
-    line_items = [
-        InvoiceLineItem(
-            description=f"{booking.service_type} consultation with {advisor_name}",
-            quantity=1,
-            unit_price_usd=txn.amount_usd,
-            total_usd=txn.amount_usd,
-        ),
-        InvoiceLineItem(
-            description="Platform service fee (included in total)",
-            quantity=1,
-            unit_price_usd=txn.commission_usd,
-            total_usd=txn.commission_usd,
-        ),
-    ]
+    from app.models.seeker_profile import SeekerProfile
+
+    seeker_profile = (
+        await session.execute(
+            select(SeekerProfile).where(SeekerProfile.user_id == booking.seeker_id)
+        )
+    ).scalar_one_or_none()
+    to_address = None
+    if seeker_profile and seeker_profile.country_of_residence:
+        to_address = seeker_profile.country_of_residence
+
+    invoice_id = format_invoice_id(txn.invoice_number) or f"{txn.invoice_number:08d}"
+    issued = txn.created_at
+
+    if perspective == "advisor":
+        from_name = (advisor.full_name if advisor else None) or "Advisor"
+        from_address = None
+        line_items = [
+            InvoiceLineItem(
+                description=booking.service_type,
+                quantity=1,
+                unit_price_usd=txn.amount_usd,
+                total_usd=txn.amount_usd,
+            )
+        ]
+        subtotal = txn.amount_usd
+        tax = 0.0
+        total = txn.amount_usd
+    else:
+        # seeker / admin — platform invoice split
+        from_name = settings.EMAILS_FROM_NAME
+        from_address = getattr(settings, "INVOICE_FROM_ADDRESS", None)
+        line_items = [
+            InvoiceLineItem(
+                description="Platform Charges",
+                quantity=1,
+                unit_price_usd=txn.commission_usd,
+                total_usd=txn.commission_usd,
+            ),
+            InvoiceLineItem(
+                description="Consultant Fee",
+                quantity=1,
+                unit_price_usd=txn.advisor_payout_usd,
+                total_usd=txn.advisor_payout_usd,
+            ),
+        ]
+        if txn.tax_usd and txn.tax_usd > 0:
+            line_items.append(
+                InvoiceLineItem(
+                    description="Tax",
+                    quantity=1,
+                    unit_price_usd=txn.tax_usd,
+                    total_usd=txn.tax_usd,
+                )
+            )
+        subtotal = round(txn.commission_usd + txn.advisor_payout_usd, 2)
+        tax = txn.tax_usd
+        total = txn.amount_usd
 
     return InvoiceRead(
         invoice_number=f"{txn.invoice_number:08d}",
-        issued_date=txn.created_at,
+        invoice_id=invoice_id,
+        issued_date=issued,
+        due_date=issued,
         transaction_id=txn.id,
         booking_id=booking.id,
-        from_name=settings.EMAILS_FROM_NAME,
+        from_name=from_name,
+        from_address=from_address,
         to_name=seeker.full_name if seeker else None,
         to_email=seeker.email if seeker else "",
+        to_address=to_address,
         line_items=line_items,
-        total_usd=txn.amount_usd,
+        subtotal_usd=subtotal,
+        tax_usd=tax,
+        total_usd=total,
         status=txn.status,
+        display_status=display_status(txn),
         refunded_amount_usd=txn.refunded_amount_usd,
         refunded_at=txn.refunded_at,
         refund_reason=txn.refund_reason,
+        terms=_INVOICE_TERMS,
+    )
+
+
+def list_for_seeker_stmt(seeker_id: uuid.UUID) -> Select[tuple[Transaction]]:
+    return (
+        select(Transaction)
+        .join(Booking, Booking.id == Transaction.booking_id)
+        .where(Booking.seeker_id == seeker_id)
+        .where(Transaction.is_archived.is_(False))
+        .order_by(Transaction.created_at.desc())
+    )
+
+
+async def seeker_payment_read(session: AsyncSession, txn: Transaction) -> SeekerPaymentRead:
+    booking = await session.get(Booking, txn.booking_id)
+    if booking is None:
+        raise NotFoundError("Booking not found")
+    advisor = await session.get(User, booking.advisor_id)
+    advisor_profile = (
+        await session.execute(
+            select(AdvisorProfile).where(AdvisorProfile.user_id == booking.advisor_id)
+        )
+    ).scalar_one_or_none()
+    return SeekerPaymentRead(
+        id=txn.id,
+        booking_id=txn.booking_id,
+        invoice_id=format_invoice_id(txn.invoice_number),
+        advisor_id=booking.advisor_id,
+        advisor_name=advisor.full_name if advisor else None,
+        advisor_email=advisor.email if advisor else None,
+        advisor_photo_url=advisor_profile.profile_photo_url if advisor_profile else None,
+        service_type=booking.service_type,
+        created_at=txn.created_at,
+        platform_fee_usd=txn.commission_usd,
+        consultant_fee_usd=txn.advisor_payout_usd,
+        amount_usd=txn.amount_usd,
+        status=txn.status,
+        display_status=display_status(txn),
+        payment_method=txn.payment_method,
+        stripe_payment_intent_id=txn.stripe_payment_intent_id,
+        refunded_amount_usd=txn.refunded_amount_usd,
+        refunded_at=txn.refunded_at,
+        refund_reason=txn.refund_reason,
+    )
+
+
+async def seeker_payment_summary(
+    session: AsyncSession, seeker_id: uuid.UUID
+) -> SeekerPaymentSummaryRead:
+    rows = (
+        (
+            await session.execute(
+                select(Transaction)
+                .join(Booking, Booking.id == Transaction.booking_id)
+                .where(Booking.seeker_id == seeker_id)
+                .where(Transaction.is_archived.is_(False))
+                .order_by(Transaction.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    total_paid = 0.0
+    pending_amount = 0.0
+    refund_amount = 0.0
+    for t in rows:
+        if t.status in (TransactionStatus.succeeded, TransactionStatus.partially_refunded):
+            total_paid += t.amount_usd
+        if t.status == TransactionStatus.pending:
+            pending_amount += t.amount_usd
+        if t.status in (TransactionStatus.refunded, TransactionStatus.partially_refunded):
+            if t.refunded_amount_usd is not None:
+                refund_amount += t.refunded_amount_usd
+            elif t.status == TransactionStatus.refunded:
+                refund_amount += t.amount_usd
+    last = rows[0] if rows else None
+    return SeekerPaymentSummaryRead(
+        total_paid_usd=round(total_paid, 2),
+        pending_amount_usd=round(pending_amount, 2),
+        refund_amount_usd=round(refund_amount, 2),
+        last_transaction_usd=round(last.amount_usd, 2) if last else None,
+    )
+
+
+async def platform_payment_summary(session: AsyncSession) -> PaymentSummaryRead:
+    paid = (
+        await session.execute(
+            select(func.coalesce(func.sum(Transaction.amount_usd), 0.0)).where(
+                Transaction.is_archived.is_(False),
+                Transaction.status.in_(
+                    (TransactionStatus.succeeded, TransactionStatus.partially_refunded)
+                ),
+            )
+        )
+    ).scalar_one()
+    refunded = (
+        await session.execute(
+            select(func.coalesce(func.sum(Transaction.refunded_amount_usd), 0.0)).where(
+                Transaction.is_archived.is_(False),
+                Transaction.refunded_amount_usd.is_not(None),
+            )
+        )
+    ).scalar_one()
+    commission = (
+        await session.execute(
+            select(func.coalesce(func.sum(Transaction.commission_usd), 0.0)).where(
+                Transaction.is_archived.is_(False),
+                Transaction.status.in_(
+                    (TransactionStatus.succeeded, TransactionStatus.partially_refunded)
+                ),
+            )
+        )
+    ).scalar_one()
+    tax = (
+        await session.execute(
+            select(func.coalesce(func.sum(Transaction.tax_usd), 0.0)).where(
+                Transaction.is_archived.is_(False),
+                Transaction.status.in_(
+                    (TransactionStatus.succeeded, TransactionStatus.partially_refunded)
+                ),
+            )
+        )
+    ).scalar_one()
+    return PaymentSummaryRead(
+        total_paid_usd=round(float(paid or 0), 2),
+        total_refunded_usd=round(float(refunded or 0), 2),
+        total_commission_usd=round(float(commission or 0), 2),
+        total_tax_usd=round(float(tax or 0), 2),
     )
 
 
@@ -564,7 +784,11 @@ def list_all_stmt(
     search: str | None = None,
 ) -> Select[tuple[Transaction]]:
     """Full platform transaction list for admin Finance Management, with optional filters."""
-    stmt = select(Transaction).join(Booking, Booking.id == Transaction.booking_id)
+    stmt = (
+        select(Transaction)
+        .join(Booking, Booking.id == Transaction.booking_id)
+        .where(Transaction.is_archived.is_(False))
+    )
 
     if status is not None:
         stmt = stmt.where(Transaction.status == status)
@@ -596,6 +820,13 @@ async def finance_read(session: AsyncSession, txn: Transaction) -> TransactionFi
         raise NotFoundError("Booking not found")
     seeker = await session.get(User, booking.seeker_id)
     advisor = await session.get(User, booking.advisor_id)
+    from app.models.seeker_profile import SeekerProfile
+
+    seeker_profile = (
+        await session.execute(
+            select(SeekerProfile).where(SeekerProfile.user_id == booking.seeker_id)
+        )
+    ).scalar_one_or_none()
     return TransactionFinanceRead(
         id=txn.id,
         booking_id=txn.booking_id,
@@ -618,10 +849,80 @@ async def finance_read(session: AsyncSession, txn: Transaction) -> TransactionFi
         stripe_charge_id=txn.stripe_charge_id,
         seeker_id=booking.seeker_id,
         seeker_name=seeker.full_name if seeker else None,
+        seeker_email=seeker.email if seeker else None,
         advisor_id=booking.advisor_id,
         advisor_name=advisor.full_name if advisor else None,
+        advisor_email=advisor.email if advisor else None,
         service_type=booking.service_type,
         scheduled_start=booking.scheduled_start,
+        invoice_id=format_invoice_id(txn.invoice_number),
+        display_status=display_status(txn),
+        seeker_country=seeker_profile.country_of_residence if seeker_profile else None,
+    )
+
+
+async def advisor_earnings_payment_read(
+    session: AsyncSession, txn: Transaction, booking: Booking, seeker: User | None
+) -> TransactionAdvisorRead:
+    from app.models.seeker_profile import SeekerProfile
+
+    seeker_profile = None
+    if seeker is not None:
+        seeker_profile = (
+            await session.execute(
+                select(SeekerProfile).where(SeekerProfile.user_id == seeker.id)
+            )
+        ).scalar_one_or_none()
+    return TransactionAdvisorRead(
+        id=txn.id,
+        booking_id=txn.booking_id,
+        amount_usd=txn.amount_usd,
+        commission_rate=txn.commission_rate,
+        commission_usd=txn.commission_usd,
+        tax_rate=txn.tax_rate,
+        tax_usd=txn.tax_usd,
+        advisor_payout_usd=txn.advisor_payout_usd,
+        payment_method=txn.payment_method,
+        invoice_number=txn.invoice_number,
+        status=txn.status,
+        stripe_payment_intent_id=txn.stripe_payment_intent_id,
+        refunded_at=txn.refunded_at,
+        refund_reason=txn.refund_reason,
+        created_at=txn.created_at,
+        seeker_id=booking.seeker_id,
+        seeker_name=seeker.full_name if seeker else None,
+        service_type=booking.service_type,
+        scheduled_start=booking.scheduled_start,
+        appointment_id=format_appointment_id(booking.appointment_number),
+        invoice_id=format_invoice_id(txn.invoice_number),
+        display_status=display_status(txn),
+        seeker_photo_url=seeker_profile.profile_photo_url if seeker_profile else None,
+        platform_fee_usd=txn.commission_usd,
+        consultant_fee_usd=txn.advisor_payout_usd,
+        net_amount_usd=txn.advisor_payout_usd,
+    )
+
+
+async def resend_receipt(
+    session: AsyncSession, txn: Transaction, settings: Settings
+) -> None:
+    if txn.status not in _INVOICE_ELIGIBLE_STATUSES or txn.invoice_number is None:
+        raise AppError("Receipt is only available for a paid transaction", code="not_paid")
+    booking = await session.get(Booking, txn.booking_id)
+    if booking is None:
+        raise NotFoundError("Booking not found")
+    seeker = await session.get(User, booking.seeker_id)
+    advisor = await session.get(User, booking.advisor_id)
+    if seeker is None:
+        raise NotFoundError("Seeker not found")
+    await email_service.send_payment_receipt_email(
+        seeker.email,
+        seeker.full_name or "",
+        (advisor.full_name if advisor and advisor.full_name else "Advisor"),
+        service_type=booking.service_type,
+        amount_usd=txn.amount_usd,
+        invoice_number=format_invoice_id(txn.invoice_number) or f"{txn.invoice_number:08d}",
+        settings=settings,
     )
 
 
