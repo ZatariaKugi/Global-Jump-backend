@@ -94,6 +94,7 @@ class Settings(BaseSettings):
     PLATFORM_COMMISSION_RATE: float = 0.15  # 15% platform commission, configurable
     TAX_WITHHOLDING_RATE: float = 0.08  # 8% tax withheld from advisor payouts, configurable
     PAYOUT_PROCESSING_FEE_RATE: float = 0.02  # 2% fee on manual payout requests, configurable
+    INVOICE_FROM_ADDRESS: str | None = None  # optional platform address on invoices
 
     # OpenAI (AI assessment insights) -----------------------------------------
     OPENAI_API_KEY: str | None = None

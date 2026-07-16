@@ -1,6 +1,6 @@
 """Admin "User Management" — broad, all-roles account directory and actions
 (verify account, trigger password reset). Suspend/Reactivate are handled by
-the existing /admin/users/{id}/suspend|activate endpoints, unchanged.
+the existing /admin/users/{id}/suspend|reactivate endpoints, unchanged.
 """
 
 from __future__ import annotations
@@ -19,9 +19,8 @@ from app.schemas.user_admin import AccountStatus, UserDetailRead, UserListRead
 from app.services import auth_service
 from app.services.email_service import send_password_reset_email
 
-
 # Advisors register with is_active=False until admin approves — that is
-# onboarding, not a soft-suspend.
+# onboarding, not a soft-suspend. Mirror the login gate in user_service.
 _ADVISOR_ONBOARDING = and_(
     User.role == UserRole.advisor,
     User.verification_status.in_(
@@ -40,10 +39,15 @@ def _is_advisor_onboarding(user: User) -> bool:
 def compute_status(user: User) -> AccountStatus:
     """Map DB flags → admin list status.
 
-    ``suspended`` is reserved for true soft-suspends (``is_active=False``),
-    not for advisors still waiting on verification approval.
+    ``is_suspended`` / ``verification_status=suspended`` mark an intentional
+    admin soft-suspend and always win. Pending/under-review advisors who are
+    merely inactive for onboarding are not treated as suspended.
     """
-    if not user.is_active and not _is_advisor_onboarding(user):
+    onboarding = _is_advisor_onboarding(user)
+    suspended = bool(getattr(user, "is_suspended", False)) or (
+        user.verification_status == VerificationStatus.suspended
+    )
+    if suspended or (not user.is_active and not onboarding):
         return AccountStatus.suspended
     if user.email_verified_at is None:
         return AccountStatus.unverified
@@ -60,14 +64,24 @@ def list_users_stmt(
         pattern = f"%{search.strip()}%"
         stmt = stmt.where(or_(User.full_name.ilike(pattern), User.email.ilike(pattern)))
     if status == AccountStatus.suspended:
-        stmt = stmt.where(User.is_active.is_(False), not_(_ADVISOR_ONBOARDING))
+        stmt = stmt.where(
+            or_(
+                User.is_suspended.is_(True),
+                User.verification_status == VerificationStatus.suspended,
+                and_(User.is_active.is_(False), not_(_ADVISOR_ONBOARDING)),
+            )
+        )
     elif status == AccountStatus.unverified:
         stmt = stmt.where(
+            User.is_suspended.is_(False),
+            User.verification_status.is_distinct_from(VerificationStatus.suspended),
             User.email_verified_at.is_(None),
             or_(User.is_active.is_(True), _ADVISOR_ONBOARDING),
         )
     elif status == AccountStatus.verified:
         stmt = stmt.where(
+            User.is_suspended.is_(False),
+            User.verification_status.is_distinct_from(VerificationStatus.suspended),
             User.email_verified_at.is_not(None),
             or_(User.is_active.is_(True), _ADVISOR_ONBOARDING),
         )
@@ -126,11 +140,56 @@ async def get_user_detail(session: AsyncSession, user_id: uuid.UUID) -> UserDeta
 
 
 async def verify_account(session: AsyncSession, user_id: uuid.UUID, admin_id: uuid.UUID) -> User:
+    """Mark email verified. For advisors, also set ``verification_status=approved``
+    (frontend badge) and activate the account."""
     user = await session.get(User, user_id)
     if user is None:
         raise NotFoundError("User not found")
     user.email_verified_at = datetime.now(UTC)
     user.updated_by = admin_id
+    if user.role == UserRole.advisor:
+        user.verification_status = VerificationStatus.approved
+        user.pre_suspend_verification_status = None
+        user.is_suspended = False
+        user.is_active = True
+    session.add(user)
+    await session.flush()
+    await session.refresh(user)
+    return user
+
+
+async def suspend_account(session: AsyncSession, user_id: uuid.UUID) -> User:
+    """Soft-suspend. For advisors, sets ``verification_status=suspended`` so the
+    frontend badge updates, preserving the prior status for reactivate."""
+    user = await session.get(User, user_id)
+    if user is None:
+        raise NotFoundError("User not found")
+    if user.role == UserRole.advisor and user.verification_status != VerificationStatus.suspended:
+        user.pre_suspend_verification_status = user.verification_status
+        user.verification_status = VerificationStatus.suspended
+    user.is_active = False
+    user.is_suspended = True
+    session.add(user)
+    await session.flush()
+    await session.refresh(user)
+    return user
+
+
+async def reactivate_account(session: AsyncSession, user_id: uuid.UUID) -> User:
+    """Clear soft-suspend and restore the pre-suspend ``verification_status``."""
+    user = await session.get(User, user_id)
+    if user is None:
+        raise NotFoundError("User not found")
+    user.is_suspended = False
+    if user.role == UserRole.advisor:
+        restored = user.pre_suspend_verification_status
+        if restored is None or restored == VerificationStatus.suspended:
+            restored = VerificationStatus.pending
+        user.verification_status = restored
+        user.pre_suspend_verification_status = None
+        user.is_active = restored == VerificationStatus.approved
+    else:
+        user.is_active = True
     session.add(user)
     await session.flush()
     await session.refresh(user)

@@ -16,6 +16,7 @@ class UploadCategory(StrEnum):
 
     profile_photo = "profile_photo"
     credential = "credential"
+    advisor_document = "advisor_document"
     message_attachment = "message_attachment"
     booking_note = "booking_note"
     booking_document = "booking_document"

@@ -44,6 +44,7 @@ class Principal:
     role: str | None
     is_external: bool
     user: User | None = None
+    impersonated_by: uuid.UUID | None = None
 
 
 async def get_current_principal(
@@ -69,14 +70,22 @@ async def get_current_principal(
     user = await user_service.get_by_id(session, payload.sub)
     if user is None:
         raise AuthenticationError("User not found or inactive")
-    # Pending advisors are allowed through so they can complete onboarding (fill
-    # their profile, upload credentials).  All externally-facing advisor actions
+    # Pending / under-review advisors are allowed through so they can complete
+    # onboarding and view Approval Pending.  Externally-facing advisor actions
     # are still gated by require_verified_advisor.
     if not user.is_active and not (
-        user.role.value == "advisor" and user.verification_status == VerificationStatus.pending
+        user.role.value == "advisor"
+        and user.verification_status
+        in (VerificationStatus.pending, VerificationStatus.under_review)
     ):
         raise AuthenticationError("User not found or inactive")
-    return Principal(id=user.id, role=user.role.value, is_external=False, user=user)
+    return Principal(
+        id=user.id,
+        role=user.role.value,
+        is_external=False,
+        user=user,
+        impersonated_by=payload.impersonated_by,
+    )
 
 
 CurrentPrincipal = Annotated[Principal, Depends(get_current_principal)]

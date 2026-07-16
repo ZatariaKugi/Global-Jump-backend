@@ -36,6 +36,8 @@ class TokenPayload(BaseModel):
     sub: uuid.UUID
     iss: str | None = None
     role: str | None = None
+    impersonated_by: uuid.UUID | None = None
+    imp: bool | None = None
 
 
 class RefreshRequest(BaseModel):

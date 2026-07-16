@@ -23,6 +23,8 @@ class VerificationStatus(StrEnum):
     under_review = "under_review"
     approved = "approved"
     rejected = "rejected"
+    # Soft-suspend badge for the admin UI (frontend reads ``verification_status``).
+    suspended = "suspended"
 
 
 class SignupSource(StrEnum):
@@ -40,6 +42,10 @@ class User(BaseModel):
     full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(default=True, server_default="true", nullable=False)
+    # Explicit admin soft-suspend — distinct from advisor onboarding (is_active=False + pending).
+    is_suspended: Mapped[bool] = mapped_column(
+        default=False, server_default="false", nullable=False, sort_order=102
+    )
     role: Mapped[UserRole] = mapped_column(
         SAEnum(UserRole, name="user_role"),
         default=UserRole.seeker,
@@ -53,6 +59,18 @@ class User(BaseModel):
         SAEnum(VerificationStatus, name="verification_status"),
         nullable=True,
         sort_order=104,
+    )
+    # Restored by /reactivate after /suspend overwrites ``verification_status``.
+    pre_suspend_verification_status: Mapped[VerificationStatus | None] = mapped_column(
+        SAEnum(
+            VerificationStatus,
+            name="verification_status",
+            create_constraint=False,
+            native_enum=True,
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
+        nullable=True,
+        sort_order=105,
     )
     signup_source: Mapped[SignupSource] = mapped_column(
         SAEnum(SignupSource, name="signup_source"),

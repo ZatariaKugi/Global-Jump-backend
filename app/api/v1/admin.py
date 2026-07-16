@@ -57,7 +57,13 @@ from app.schemas.eligibility_rule import (
     EligibilityRuleRead,
     EligibilityRuleUpdate,
 )
-from app.schemas.payment import RefundCreate, TransactionFinanceRead
+from app.schemas.impersonation import ImpersonationRead
+from app.schemas.payment import (
+    InvoiceRead,
+    PaymentSummaryRead,
+    RefundCreate,
+    TransactionFinanceRead,
+)
 from app.schemas.payout import PayoutDecision, PayoutRequestRead
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.review import ModerationDecision, ReviewAdminRead, ReviewRead
@@ -66,7 +72,6 @@ from app.schemas.seeker_document import SeekerDocumentRead, SeekerDocumentStatus
 from app.schemas.support_ticket import TicketCreate, TicketRead, TicketUpdate
 from app.schemas.ticket_message import TicketMessageRead, TicketMessageSend
 from app.schemas.transaction_event import TransactionEventRead
-from app.schemas.user import UserRead
 from app.schemas.user_admin import AccountStatus, UserDetailRead, UserListRead
 from app.services import (
     advisor_admin_service,
@@ -78,6 +83,7 @@ from app.services import (
     conversation_service,
     dashboard_service,
     eligibility_rule_service,
+    impersonation_service,
     payment_service,
     payout_service,
     review_service,
@@ -143,6 +149,9 @@ async def update_advisor_verification(
     previous_status = advisor.verification_status
     advisor.verification_status = body.status
     advisor.is_active = body.status == VerificationStatus.approved
+    if body.status == VerificationStatus.approved:
+        advisor.is_suspended = False
+        advisor.pre_suspend_verification_status = None
     session.add(advisor)
     await session.flush()
     await session.refresh(advisor)
@@ -210,24 +219,68 @@ async def update_advisor_featured(
     )
 
 
-@router.post("/users/{user_id}/suspend", response_model=ResponseEnvelope[UserRead])
+@router.post("/users/{user_id}/suspend", response_model=ResponseEnvelope[UserDetailRead])
 async def suspend_user(
     user_id: uuid.UUID,
     session: SessionDep,
     request_id: RequestIdDep,
-) -> ResponseEnvelope[UserRead]:
-    """Deactivate a user account (soft suspend — reversible)."""
-    from app.core.exceptions import NotFoundError
+) -> ResponseEnvelope[UserDetailRead]:
+    """Soft-suspend. Advisors get ``verification_status=suspended`` for the UI badge."""
+    await user_admin_service.suspend_account(session, user_id)
+    data = await user_admin_service.get_user_detail(session, user_id)
+    return ResponseEnvelope[UserDetailRead](
+        data=data,
+        meta=Meta(request_id=request_id),
+    )
 
-    user = await session.get(User, user_id)
-    if user is None:
-        raise NotFoundError("User not found")
-    user.is_active = False
-    session.add(user)
-    await session.flush()
-    await session.refresh(user)
-    return ResponseEnvelope[UserRead](
-        data=UserRead.model_validate(user),
+
+@router.post("/users/{user_id}/reactivate", response_model=ResponseEnvelope[UserDetailRead])
+async def reactivate_user(
+    user_id: uuid.UUID,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[UserDetailRead]:
+    """Clear soft-suspend and restore the advisor's prior ``verification_status``."""
+    await user_admin_service.reactivate_account(session, user_id)
+    data = await user_admin_service.get_user_detail(session, user_id)
+    return ResponseEnvelope[UserDetailRead](
+        data=data,
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.post(
+    "/users/{user_id}/impersonate",
+    response_model=ResponseEnvelope[ImpersonationRead],
+)
+async def impersonate_user(
+    user_id: uuid.UUID,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+    admin_principal: CurrentPrincipal,
+) -> ResponseEnvelope[ImpersonationRead]:
+    """Start an impersonation session as the target user (admin only).
+
+    Returns a short-lived access token that authenticates as ``user_id``. The
+    frontend should store the admin's own tokens separately, swap to this
+    token while impersonating, and discard it on "Exit impersonation".
+
+    Cannot impersonate admins or inactive accounts.
+    """
+    from app.core.exceptions import AuthenticationError
+
+    if admin_principal.user is None:
+        raise AuthenticationError("A local admin account is required")
+
+    data = await impersonation_service.impersonate(
+        session,
+        target_user_id=user_id,
+        admin=admin_principal.user,
+        settings=settings,
+    )
+    return ResponseEnvelope[ImpersonationRead](
+        data=data,
         meta=Meta(request_id=request_id),
     )
 
@@ -325,26 +378,18 @@ async def bulk_review_advisor_credentials(
     )
 
 
-@router.post("/users/{user_id}/activate", response_model=ResponseEnvelope[UserRead])
+@router.post(
+    "/users/{user_id}/activate",
+    response_model=ResponseEnvelope[UserDetailRead],
+    deprecated=True,
+)
 async def activate_user(
     user_id: uuid.UUID,
     session: SessionDep,
     request_id: RequestIdDep,
-) -> ResponseEnvelope[UserRead]:
-    """Re-activate a suspended user account."""
-    from app.core.exceptions import NotFoundError
-
-    user = await session.get(User, user_id)
-    if user is None:
-        raise NotFoundError("User not found")
-    user.is_active = True
-    session.add(user)
-    await session.flush()
-    await session.refresh(user)
-    return ResponseEnvelope[UserRead](
-        data=UserRead.model_validate(user),
-        meta=Meta(request_id=request_id),
-    )
+) -> ResponseEnvelope[UserDetailRead]:
+    """Alias of ``POST /users/{user_id}/reactivate`` — prefer ``/reactivate``."""
+    return await reactivate_user(user_id, session, request_id)
 
 
 # ── Advisor Management (Screen A) ────────────────────────────────────────────
@@ -893,6 +938,16 @@ async def moderate_review(
 # ── Finance management (PRD §4.5) ────────────────────────────────────────────
 
 
+@router.get("/payments/summary", response_model=ResponseEnvelope[PaymentSummaryRead])
+async def get_payments_summary(
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[PaymentSummaryRead]:
+    """Platform-wide payment summary cards (paid / refunded / commission / tax)."""
+    data = await payment_service.platform_payment_summary(session)
+    return ResponseEnvelope[PaymentSummaryRead](data=data, meta=Meta(request_id=request_id))
+
+
 @router.get("/payments", response_model=ResponseEnvelope[list[TransactionFinanceRead]])
 async def list_all_payments(
     params: PaginationDep,
@@ -925,6 +980,42 @@ async def get_payment(
     return ResponseEnvelope[TransactionFinanceRead](
         data=data,
         meta=Meta(request_id=request_id),
+    )
+
+
+@router.get(
+    "/payments/{transaction_id}/invoice",
+    response_model=ResponseEnvelope[InvoiceRead],
+)
+async def get_admin_payment_invoice(
+    transaction_id: uuid.UUID,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[InvoiceRead]:
+    """Admin invoice download — platform perspective."""
+    txn = await payment_service.get_by_id(session, transaction_id)
+    invoice = await payment_service.build_invoice(
+        session, txn, settings, perspective="admin"
+    )
+    return ResponseEnvelope[InvoiceRead](data=invoice, meta=Meta(request_id=request_id))
+
+
+@router.post(
+    "/payments/{transaction_id}/send-email",
+    response_model=ResponseEnvelope[dict[str, bool]],
+)
+async def send_payment_receipt(
+    transaction_id: uuid.UUID,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[dict[str, bool]]:
+    """Resend the payment receipt email to the seeker."""
+    txn = await payment_service.get_by_id(session, transaction_id)
+    await payment_service.resend_receipt(session, txn, settings)
+    return ResponseEnvelope[dict[str, bool]](
+        data={"sent": True}, meta=Meta(request_id=request_id)
     )
 
 
