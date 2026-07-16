@@ -16,6 +16,7 @@ from fastapi import UploadFile
 from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType
 from fastapi_mail.errors import ConnectionErrors
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from pydantic import ValidationError
 from starlette.datastructures import Headers
 
 from app.core.config import Settings
@@ -118,7 +119,6 @@ async def send_verification_email(
             verify_url=verify_url,
             error=str(exc),
         )
-
 
 
 async def send_advisor_welcome_email(
@@ -351,18 +351,28 @@ async def send_payment_receipt_email(
         )
         return
 
-    message = MessageSchema(
-        subject=f"Payment receipt – {settings.EMAILS_FROM_NAME}",
-        recipients=[to],
-        body=_render("payment_receipt.html", ctx),
-        subtype=MessageType.html,
-        alternative_body=_render("payment_receipt.txt", ctx),
-        headers={
-            "X-Priority": "3",
-            "X-Mailer": settings.EMAILS_FROM_NAME,
-            **_deliverability_headers(settings),
-        },
-    )
+    try:
+        message = MessageSchema(
+            subject=f"Payment receipt – {settings.EMAILS_FROM_NAME}",
+            recipients=[to],
+            body=_render("payment_receipt.html", ctx),
+            subtype=MessageType.html,
+            alternative_body=_render("payment_receipt.txt", ctx),
+            headers={
+                "X-Priority": "3",
+                "X-Mailer": settings.EMAILS_FROM_NAME,
+                **_deliverability_headers(settings),
+            },
+        )
+    except ValidationError as exc:
+        # Reserved TLDs (e.g. .test seed data) fail pydantic email validation.
+        logger.warning(
+            "payment_receipt_failed_invalid_recipient",
+            to=to,
+            invoice_number=invoice_number,
+            error=str(exc),
+        )
+        return
 
     try:
         fm = FastMail(_make_connection(settings))

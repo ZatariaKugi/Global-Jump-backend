@@ -4,6 +4,7 @@ tabs (Overview, Session History, Earnings, Reviews)."""
 from __future__ import annotations
 
 import uuid
+from typing import Literal, cast
 
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,15 +15,36 @@ from app.models.advisor_credential import AdvisorCredential, CredentialStatus
 from app.models.advisor_profile import AdvisorProfile
 from app.models.booking import Booking, BookingStatus
 from app.models.payout_request import PayoutRequest, PayoutStatus
+from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.advisor_admin import (
     AdvisorEarningsSummaryRead,
     AdvisorManagementDetailRead,
     AdvisorManagementListRead,
+    AdvisorStatus,
 )
 from app.schemas.advisor_profile import LanguageEntry
 from app.schemas.booking import BookingRead
-from app.services import advisor_profile_service, payment_service, payout_service, review_service
+from app.services import (
+    advisor_profile_service,
+    booking_service,
+    payment_service,
+    payout_service,
+    review_service,
+)
+
+_LanguageProficiency = Literal["basic", "conversational", "fluent", "native"]
+
+
+def advisor_display_status(user: User) -> AdvisorStatus:
+    """UI badge from ``verification_status`` (frontend key), with ``is_suspended`` fallback."""
+    if getattr(user, "is_suspended", False) or (
+        user.verification_status == VerificationStatus.suspended
+    ):
+        return AdvisorStatus.suspended
+    if user.verification_status is None:
+        return AdvisorStatus.pending
+    return AdvisorStatus(user.verification_status.value)
 
 
 def list_advisors_stmt(
@@ -74,34 +96,48 @@ async def build_list_read(
 
     ratings = await review_service.rating_summaries(session, ids)
 
+    earnings_rows = (
+        await session.execute(
+            select(
+                Booking.advisor_id,
+                func.coalesce(func.sum(Transaction.advisor_payout_usd), 0.0),
+            )
+            .join(Transaction, Transaction.booking_id == Booking.id)
+            .where(
+                Booking.advisor_id.in_(ids),
+                Transaction.status == TransactionStatus.succeeded,
+            )
+            .group_by(Booking.advisor_id)
+        )
+    ).all()
+    earnings_by_advisor: dict[uuid.UUID, float] = {}
+    for advisor_id, total in earnings_rows:
+        earnings_by_advisor[advisor_id] = round(float(total), 2)
+
     out = []
     for a in advisors:
         profile = profiles.get(a.id)
         avg, review_count = ratings.get(a.id, (None, 0))
+        residence_code = profile.country_of_residence if profile else None
         out.append(
             AdvisorManagementListRead(
                 id=a.id,
                 full_name=a.full_name,
                 email=a.email,
                 profile_photo_url=profile.profile_photo_url if profile else None,
-                country_code=(
-                    profile.country_expertise[0].country_code
-                    if profile and profile.country_expertise
-                    else None
-                ),
-                country=(
-                    country_name(profile.country_expertise[0].country_code)
-                    if profile and profile.country_expertise
-                    else None
-                ),
+                country_code=residence_code,
+                country=country_name(residence_code),
                 expertise=(
                     [s.specialization for s in profile.visa_specializations] if profile else []
                 ),
+                status=advisor_display_status(a),
                 verification_status=a.verification_status,
+                is_suspended=bool(getattr(a, "is_suspended", False)),
                 is_active=a.is_active,
                 session_count=session_counts.get(a.id, 0),
                 avg_rating=avg,
                 review_count=review_count,
+                earnings=earnings_by_advisor.get(a.id, 0.0),
                 created_at=a.created_at,
             )
         )
@@ -141,21 +177,26 @@ async def get_advisor_detail(
     for status, count in cred_rows:
         cred_counts[status] = count
 
+    earnings = await payment_service.get_advisor_earnings(session, advisor_id)
+    total_earned_usd = float(earnings["total_earned_usd"])  # type: ignore[arg-type]
+
     expertise_codes = [c.country_code for c in profile.country_expertise]
-    residence_code = expertise_codes[0] if expertise_codes else None
     return AdvisorManagementDetailRead(
         id=advisor.id,
         full_name=advisor.full_name,
         email=advisor.email,
         profile_photo_url=profile.profile_photo_url,
-        country_code=residence_code,
-        country=country_name(residence_code),
+        country_code=profile.country_of_residence,
+        country=country_name(profile.country_of_residence),
         expertise=[s.specialization for s in profile.visa_specializations],
+        status=advisor_display_status(advisor),
         verification_status=advisor.verification_status,
+        is_suspended=bool(getattr(advisor, "is_suspended", False)),
         is_active=advisor.is_active,
         session_count=total_sessions,
         avg_rating=avg,
         review_count=review_count,
+        earnings=total_earned_usd,
         created_at=advisor.created_at,
         title=profile.title,
         bio=profile.bio,
@@ -163,16 +204,20 @@ async def get_advisor_detail(
         successful_applications=profile.successful_applications,
         successful_application_rate=profile.successful_application_rate,
         country_expertise=expertise_codes,
-        country_expertise_names=[country_name(code) or code for code in expertise_codes],
+        country_expertise_names=[
+            country_name(code) or code for code in expertise_codes
+        ],
         languages=[
-            LanguageEntry(language=lang.language, proficiency=lang.proficiency)
+            LanguageEntry(
+                language=lang.language,
+                proficiency=cast(_LanguageProficiency, lang.proficiency),
+            )
             for lang in profile.languages
         ],
         completed_sessions=completed_sessions,
         credentials_pending_count=cred_counts.get(CredentialStatus.pending, 0),
         credentials_verified_count=cred_counts.get(CredentialStatus.verified, 0),
     )
-
 
 async def build_session_reads(session: AsyncSession, bookings: list[Booking]) -> list[BookingRead]:
     """Session History tab — bulk seeker-name enrichment (not N+1)."""
@@ -182,26 +227,10 @@ async def build_session_reads(session: AsyncSession, bookings: list[Booking]) ->
         rows = (await session.execute(select(User).where(User.id.in_(seeker_ids)))).scalars().all()
         seekers = {u.id: u for u in rows}
     return [
-        BookingRead(
-            id=b.id,
-            seeker_id=b.seeker_id,
-            advisor_id=b.advisor_id,
-            seeker_name=seekers[b.seeker_id].full_name if b.seeker_id in seekers else None,
-            advisor_name=None,
-            service_type=b.service_type,
-            duration_minutes=b.duration_minutes,
-            price_usd=b.price_usd,
-            scheduled_start=b.scheduled_start,
-            scheduled_end=b.scheduled_end,
-            status=b.status,
-            payment_status=b.payment_status,
-            cancellation_reason=b.cancellation_reason,
-            seeker_note=b.seeker_note,
-            is_important=b.is_important,
-            interpreter_name=b.interpreter_name,
-            interpreter_contact=b.interpreter_contact,
-            interpreter_language=b.interpreter_language,
-            created_at=b.created_at,
+        booking_service.build_read(
+            b,
+            seekers.get(b.seeker_id),
+            None,
         )
         for b in bookings
     ]
@@ -224,11 +253,9 @@ async def get_earnings_summary(
     for status, total in payout_rows:
         payout_totals[status] = total
 
-    total_earned_usd = earnings["total_earned_usd"]
-    total_commission_paid_usd = earnings["total_commission_paid_usd"]
+    total_earned_usd = float(earnings["total_earned_usd"])  # type: ignore[arg-type]
+    total_commission_paid_usd = float(earnings["total_commission_paid_usd"])  # type: ignore[arg-type]
     transactions = earnings["transactions"]
-    assert isinstance(total_earned_usd, float)
-    assert isinstance(total_commission_paid_usd, float)
     assert isinstance(transactions, list)
     return AdvisorEarningsSummaryRead(
         total_earned_usd=total_earned_usd,

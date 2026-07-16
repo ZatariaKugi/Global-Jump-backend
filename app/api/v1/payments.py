@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import uuid
+from typing import Literal
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 
 from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.api.pagination import PaginationDep, page_meta, paginate
@@ -15,7 +16,9 @@ from app.schemas.payment import (
     CheckoutCreate,
     CheckoutResponse,
     InvoiceRead,
-    TransactionRead,
+    PaymentConfigRead,
+    SeekerPaymentRead,
+    SeekerPaymentSummaryRead,
 )
 from app.schemas.response import Meta, ResponseEnvelope
 from app.services import payment_service
@@ -30,6 +33,19 @@ async def _get_accessible_transaction(
     if current_user.role == UserRole.admin:
         return await payment_service.get_by_id(session, transaction_id)
     return await payment_service.get_for_party(session, transaction_id, current_user.id)
+
+
+@router.get("/config", response_model=ResponseEnvelope[PaymentConfigRead])
+async def get_payment_config(
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+    _current_user: CurrentUser,
+) -> ResponseEnvelope[PaymentConfigRead]:
+    """Stripe publishable key for frontend Checkout / Elements."""
+    return ResponseEnvelope[PaymentConfigRead](
+        data=PaymentConfigRead(publishable_key=settings.STRIPE_PUBLISHABLE_KEY),
+        meta=Meta(request_id=request_id),
+    )
 
 
 @router.post("/checkout", response_model=ResponseEnvelope[CheckoutResponse], status_code=201)
@@ -63,42 +79,48 @@ async def stripe_webhook(
     return {"received": True}
 
 
-@router.get("/history", response_model=ResponseEnvelope[list[TransactionRead]])
+@router.get("/summary", response_model=ResponseEnvelope[SeekerPaymentSummaryRead])
+async def get_payment_summary(
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[SeekerPaymentSummaryRead]:
+    """Seeker Payments summary cards (Total Paid / Pending / Refund / Last)."""
+    data = await payment_service.seeker_payment_summary(session, current_user.id)
+    return ResponseEnvelope[SeekerPaymentSummaryRead](
+        data=data, meta=Meta(request_id=request_id)
+    )
+
+
+@router.get("/history", response_model=ResponseEnvelope[list[SeekerPaymentRead]])
 async def get_payment_history(
     params: PaginationDep,
     current_user: CurrentUser,
     session: SessionDep,
     request_id: RequestIdDep,
-) -> ResponseEnvelope[list[TransactionRead]]:
-    """Transaction history for the current user (seeker sees their payments)."""
-    from sqlalchemy import select
-
-    from app.models.booking import Booking
-
-    stmt = (
-        select(Transaction)
-        .join(Booking, Booking.id == Transaction.booking_id)
-        .where(Booking.seeker_id == current_user.id)
-        .order_by(Transaction.created_at.desc())
-    )
+) -> ResponseEnvelope[list[SeekerPaymentRead]]:
+    """Visa-seeker payment history with advisor + fee split columns."""
+    stmt = payment_service.list_for_seeker_stmt(current_user.id)
     txns, total = await paginate(session, stmt, params)
-    return ResponseEnvelope[list[TransactionRead]](
-        data=[TransactionRead.model_validate(t) for t in txns],
+    data = [await payment_service.seeker_payment_read(session, t) for t in txns]
+    return ResponseEnvelope[list[SeekerPaymentRead]](
+        data=data,
         meta=page_meta(params, total, request_id),
     )
 
 
-@router.get("/{transaction_id}", response_model=ResponseEnvelope[TransactionRead])
+@router.get("/{transaction_id}", response_model=ResponseEnvelope[SeekerPaymentRead])
 async def get_payment_detail(
     transaction_id: uuid.UUID,
     current_user: CurrentUser,
     session: SessionDep,
     request_id: RequestIdDep,
-) -> ResponseEnvelope[TransactionRead]:
-    """Payment Details modal — the booking's seeker, its advisor, or admin only."""
+) -> ResponseEnvelope[SeekerPaymentRead]:
+    """Payment Details — seeker/advisor/admin with enriched seeker-oriented fields."""
     txn = await _get_accessible_transaction(session, transaction_id, current_user)
-    return ResponseEnvelope[TransactionRead](
-        data=TransactionRead.model_validate(txn),
+    data = await payment_service.seeker_payment_read(session, txn)
+    return ResponseEnvelope[SeekerPaymentRead](
+        data=data,
         meta=Meta(request_id=request_id),
     )
 
@@ -110,10 +132,20 @@ async def get_payment_invoice(
     session: SessionDep,
     settings: SettingsDep,
     request_id: RequestIdDep,
+    perspective: Literal["seeker", "advisor", "admin"] | None = Query(default=None),
 ) -> ResponseEnvelope[InvoiceRead]:
     """Invoice Detail — only available once the transaction has succeeded."""
     txn = await _get_accessible_transaction(session, transaction_id, current_user)
-    invoice = await payment_service.build_invoice(session, txn, settings)
+    if perspective is None:
+        if current_user.role == UserRole.advisor:
+            perspective = "advisor"
+        elif current_user.role == UserRole.admin:
+            perspective = "admin"
+        else:
+            perspective = "seeker"
+    invoice = await payment_service.build_invoice(
+        session, txn, settings, perspective=perspective
+    )
     return ResponseEnvelope[InvoiceRead](
         data=invoice,
         meta=Meta(request_id=request_id),

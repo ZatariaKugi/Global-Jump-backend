@@ -32,7 +32,12 @@ async def upload_file(
 
     - ``credential`` — advisor verification documents (immigration license,
       bar membership, government ID, etc.).  Pass the returned key in
-      ``POST /advisors/me/onboarding`` → ``documents[].file_key``.
+      ``POST /advisors/me/onboarding`` → ``documents[].file_key`` or
+      ``POST /advisors/me/credentials`` → ``file_key``. Preferred alias:
+      ``advisor_document``.
+    - ``advisor_document`` — same as ``credential`` (advisor verification /
+      portfolio documents). Prefer this name for new clients; ``credential``
+      remains accepted for backwards compatibility.
     - ``profile_photo`` — advisor or seeker profile picture.  Pass the
       returned key in ``PATCH /advisors/me/profile`` or
       ``PATCH /users/me/profile`` → ``profile_photo_url``.
@@ -49,7 +54,7 @@ async def upload_file(
       ``POST /users/me/documents`` → ``file_key``.
     - ``general`` — anything else that does not fit the categories above.
 
-    **Accepted formats:** pdf, jpg, jpeg, png.
+    **Accepted formats:** pdf, jpg, jpeg, png, docx.
     """
     subdir = f"{category.value}/{current_user.id}"
     url_path, size = await save_upload(file, subdir, settings)
