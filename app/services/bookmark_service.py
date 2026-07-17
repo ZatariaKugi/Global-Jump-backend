@@ -14,7 +14,12 @@ from app.models.advisor_profile import AdvisorProfile, AdvisorVisaSpecialization
 from app.models.user import User, UserRole, VerificationStatus
 from app.models.visa_type import VisaType
 from app.schemas.bookmark import BookmarkRead
-from app.services import advisor_matching_service, advisor_search_service, review_service
+from app.services import (
+    advisor_matching_service,
+    advisor_search_service,
+    conversation_service,
+    review_service,
+)
 from app.services.advisor_search_service import SortOption
 
 _AdvisorStatus = Literal["active", "inactive"]
@@ -195,6 +200,9 @@ async def build_list_reads(
     destination, visa_type = await advisor_matching_service.match_context_for_seeker(
         session, seeker_id
     )
+    conversations = await conversation_service.conversation_ids_for_seeker(
+        session, seeker_id, advisor_ids
+    )
 
     out: list[BookmarkRead] = []
     for bookmark in bookmarks:
@@ -227,6 +235,7 @@ async def build_list_reads(
                 status=_advisor_status(advisor),
                 public_profile_slug=profile.public_profile_slug if profile else None,
                 is_bookmarked=True,
+                conversation_id=conversations.get(bookmark.advisor_id),
                 bookmarked_at=bookmark.created_at,
             )
         )

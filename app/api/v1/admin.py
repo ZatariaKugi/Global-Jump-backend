@@ -19,7 +19,7 @@ from app.models.booking import BookingStatus
 from app.models.eligibility_rule import EligibilityRule
 from app.models.payout_request import PayoutStatus
 from app.models.review import Review
-from app.models.support_ticket import TicketCategory, TicketPriority
+from app.models.support_ticket import TicketPriority
 from app.models.ticket_message import TicketMessageAttachment
 from app.models.transaction import TransactionStatus
 from app.models.user import User, UserRole, VerificationStatus
@@ -256,7 +256,7 @@ async def update_advisor_featured(
     await session.flush()
     await session.refresh(profile)
     return ResponseEnvelope[AdvisorProfileRead](
-        data=advisor_profile_service.build_read(profile),
+        data=await advisor_profile_service.build_enriched_read(session, profile, advisor),
         meta=Meta(request_id=request_id),
     )
 
@@ -649,10 +649,25 @@ async def list_users(
     session: SessionDep,
     request_id: RequestIdDep,
     search: str | None = None,
+    username: str | None = None,
+    user_id: uuid.UUID | None = None,
     status: AccountStatus | None = None,
     role: UserRole | None = None,
+    user_type: UserRole | None = None,
 ) -> ResponseEnvelope[list[UserListRead]]:
-    stmt = user_admin_service.list_users_stmt(search, status, role)
+    """Unified seeker + advisor directory (one API for both).
+
+    Search options (combinable):
+
+    - ``search`` — matches full name, email, or user id (UUID / substring)
+    - ``username`` — full_name ilike only
+    - ``user_id`` — exact UUID
+    - ``role`` / ``user_type`` — ``seeker`` or ``advisor`` (aliases; ``user_type`` wins)
+    """
+    effective_role = user_type if user_type is not None else role
+    stmt = user_admin_service.list_users_stmt(
+        search, status, effective_role, username=username, user_id=user_id
+    )
     users, total = await paginate(session, stmt, params)
     return ResponseEnvelope[list[UserListRead]](
         data=await user_admin_service.build_list_read(session, users),
@@ -1373,7 +1388,31 @@ async def create_support_ticket(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[TicketRead]:
-    ticket = await support_ticket_service.create(session, body, principal.id)
+    """Create a ticket.
+
+    Body accepts ``user_id`` **or** ``user_email``, optional ``assigned_to``,
+    ``internal_notes``, and ``attachments[]`` (upload via ``POST /uploads`` with
+    ``category=ticket_attachment`` first). Category alias: ``payment`` → ``billing``.
+    """
+    from app.core.exceptions import PermissionDeniedError
+
+    opening: list[TicketMessageAttachment] = []
+    expected_prefix = f"ticket_attachment/{principal.id}/"
+    for ref in body.attachments:
+        if not ref.file_key.startswith(expected_prefix):
+            raise PermissionDeniedError("Invalid attachment key")
+        opening.append(
+            TicketMessageAttachment(
+                file_url=resolve_url(f"/uploads/{ref.file_key}", settings),
+                file_name=ref.file_name,
+                file_size=ref.file_size_bytes,
+                content_type=ref.content_type,
+            )
+        )
+
+    ticket = await support_ticket_service.create(
+        session, body, principal.id, opening_attachments=opening
+    )
     return ResponseEnvelope[TicketRead](
         data=await support_ticket_service.ticket_read(session, ticket, settings),
         meta=Meta(request_id=request_id),
@@ -1388,14 +1427,15 @@ async def list_support_tickets(
     request_id: RequestIdDep,
     status: str | None = None,
     priority: TicketPriority | None = None,
-    category: TicketCategory | None = None,
+    category: str | None = None,
     search: str | None = None,
 ) -> ResponseEnvelope[list[TicketRead]]:
     """List support tickets.
 
     ``status`` accepts canonical values (``open``, ``in_progress``, ``resolved``,
     ``closed``) plus FE aliases ``pending``→open, ``inprogress``/``escalated``→
-    in_progress. Conversation thread: ``GET/POST .../{id}/messages``.
+    in_progress. ``category`` accepts ``payment`` as an alias for ``billing``.
+    Conversation thread: ``GET/POST .../{id}/messages``.
     """
     from app.core.exceptions import AppError
 
@@ -1403,8 +1443,12 @@ async def list_support_tickets(
         status_filter = support_ticket_service.coerce_status_filter(status)
     except ValueError as exc:
         raise AppError(str(exc), code="invalid_status") from exc
+    try:
+        category_filter = support_ticket_service.coerce_category_filter(category)
+    except ValueError as exc:
+        raise AppError(str(exc), code="invalid_category") from exc
 
-    stmt = support_ticket_service.list_stmt(status_filter, priority, category, search)
+    stmt = support_ticket_service.list_stmt(status_filter, priority, category_filter, search)
     tickets, total = await paginate(session, stmt, params)
     data = await support_ticket_service.build_list_reads(session, tickets, settings)
     return ResponseEnvelope[list[TicketRead]](data=data, meta=page_meta(params, total, request_id))

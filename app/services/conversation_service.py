@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import resolve_url
-from app.models.booking import Booking
 from app.models.conversation import Conversation
 from app.models.message import Message, MessageAttachment
 from app.models.review import ModerationStatus
@@ -27,21 +26,28 @@ from app.services.ws_manager import manager
 PUBLIC_STATUSES = (ModerationStatus.visible, ModerationStatus.flagged)
 
 
-async def _has_booking_relationship(
-    session: AsyncSession, seeker_id: uuid.UUID, advisor_id: uuid.UUID
-) -> bool:
-    result = await session.execute(
-        select(Booking.id)
-        .where(Booking.seeker_id == seeker_id)
-        .where(Booking.advisor_id == advisor_id)
-        .limit(1)
-    )
-    return result.scalar_one_or_none() is not None
+async def conversation_ids_for_seeker(
+    session: AsyncSession,
+    seeker_id: uuid.UUID,
+    advisor_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, uuid.UUID]:
+    """Map advisor_id → conversation.id for threads the seeker already has."""
+    if not advisor_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(Conversation.advisor_id, Conversation.id)
+            .where(Conversation.seeker_id == seeker_id)
+            .where(Conversation.advisor_id.in_(advisor_ids))
+        )
+    ).all()
+    return {row[0]: row[1] for row in rows}
 
 
 async def get_or_create(
     session: AsyncSession, current_user: User, other_user_id: uuid.UUID
 ) -> Conversation:
+    """Open (or return) a seeker↔advisor thread. Booking is not required."""
     if other_user_id == current_user.id:
         raise AppError("Cannot start a conversation with yourself", code="invalid_participants")
 
@@ -58,9 +64,6 @@ async def get_or_create(
             "Conversations are only allowed between a seeker and an advisor",
             code="invalid_participants",
         )
-
-    if not await _has_booking_relationship(session, seeker_id, advisor_id):
-        raise PermissionDeniedError("A booking relationship is required to start a conversation")
 
     existing = await session.execute(
         select(Conversation)
