@@ -26,11 +26,12 @@ async def list_my_tickets(
     params: PaginationDep,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[TicketRead]]:
     stmt = support_ticket_service.list_for_user_stmt(current_user.id)
     tickets, total = await paginate(session, stmt, params)
-    data = [await support_ticket_service.ticket_read(session, t) for t in tickets]
+    data = await support_ticket_service.build_list_reads(session, tickets, settings)
     return ResponseEnvelope[list[TicketRead]](data=data, meta=page_meta(params, total, request_id))
 
 
@@ -39,11 +40,12 @@ async def get_my_ticket(
     ticket_id: uuid.UUID,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[TicketRead]:
     ticket = await support_ticket_service.get_for_user(session, ticket_id, current_user.id)
     return ResponseEnvelope[TicketRead](
-        data=await support_ticket_service.ticket_read(session, ticket),
+        data=await support_ticket_service.ticket_read(session, ticket, settings),
         meta=Meta(request_id=request_id),
     )
 

@@ -5,18 +5,72 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import Select, or_, select
+from sqlalchemy import Select, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.types import String
 
+from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
+from app.core.visa_types import humanize_slug
 from app.models.advisor_profile import AdvisorProfile, AdvisorService
-from app.models.booking import Booking, BookingStatus
+from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus, PaymentStatus
+from app.models.booking_document_request import DocumentRequestStatus
+from app.models.transaction import Transaction
 from app.models.user import User, UserRole, VerificationStatus
-from app.schemas.booking import AdvisorBookingCreate, BookingCreate
-from app.services import availability_service
+from app.schemas.booking import (
+    AdvisorBookingCreate,
+    BookingAiSuggestionRead,
+    BookingAttachmentRead,
+    BookingCreate,
+    BookingDetailsRead,
+    BookingHistoryRead,
+    BookingMeetingRead,
+    BookingRead,
+)
+from app.services import availability_service, booking_document_service, booking_note_service
 from app.services.availability_service import as_utc
 
 DEFAULT_NOTICE_HOURS = 24
+
+
+async def _next_appointment_number(session: AsyncSession) -> int:
+    """Allocate the next human-readable Appointment ID (SQLite- and Postgres-safe)."""
+    result = await session.execute(select(func.max(Booking.appointment_number)))
+    current = result.scalar_one_or_none()
+    if current is None:
+        return APPOINTMENT_NUMBER_START
+    return int(current) + 1
+
+
+def appointment_id_str(booking: Booking) -> str:
+    return str(booking.appointment_number)
+
+
+def build_read(booking: Booking, seeker: User | None, advisor: User | None) -> BookingRead:
+    return BookingRead(
+        id=booking.id,
+        appointment_id=appointment_id_str(booking),
+        seeker_id=booking.seeker_id,
+        advisor_id=booking.advisor_id,
+        seeker_name=seeker.full_name if seeker else None,
+        seeker_email=seeker.email if seeker else None,
+        advisor_name=advisor.full_name if advisor else None,
+        service_type=booking.service_type,
+        duration_minutes=booking.duration_minutes,
+        price_usd=booking.price_usd,
+        scheduled_start=as_utc(booking.scheduled_start),
+        scheduled_end=as_utc(booking.scheduled_end),
+        status=booking.status,
+        payment_status=booking.payment_status,
+        cancellation_reason=booking.cancellation_reason,
+        seeker_note=booking.seeker_note,
+        deal_later_at=as_utc(booking.deal_later_at) if booking.deal_later_at else None,
+        is_important=booking.is_important,
+        interpreter_name=booking.interpreter_name,
+        interpreter_contact=booking.interpreter_contact,
+        interpreter_language=booking.interpreter_language,
+        created_at=booking.created_at,
+    )
 
 
 async def _resolve_advisor(session: AsyncSession, advisor_id: uuid.UUID) -> User:
@@ -88,6 +142,7 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
     booking = Booking(
         seeker_id=seeker.id,
         advisor_id=data.advisor_id,
+        appointment_number=await _next_appointment_number(session),
         service_type=service.service_type,
         duration_minutes=service.duration_minutes,
         price_usd=service.price_usd,
@@ -130,6 +185,7 @@ async def create_by_advisor(
     booking = Booking(
         seeker_id=seeker.id,
         advisor_id=advisor.id,
+        appointment_number=await _next_appointment_number(session),
         service_type=service.service_type,
         duration_minutes=service.duration_minutes,
         price_usd=service.price_usd,
@@ -153,6 +209,7 @@ def list_for_user_stmt(
     date_from: date | None = None,
     date_to: date | None = None,
     service_types: list[str] | None = None,
+    q: str | None = None,
 ) -> Select[tuple[Booking]]:
     column = Booking.advisor_id if role == UserRole.advisor else Booking.seeker_id
     stmt = select(Booking).where(column == user_id).order_by(Booking.scheduled_start.desc())
@@ -174,6 +231,17 @@ def list_for_user_stmt(
         )
     if service_types:
         stmt = stmt.where(Booking.service_type.in_(service_types))
+    if q:
+        pattern = f"%{q.strip()}%"
+        # Search appointment ID, consultation type, and client name/email.
+        stmt = stmt.join(User, User.id == Booking.seeker_id).where(
+            or_(
+                cast(Booking.appointment_number, String).ilike(pattern),
+                Booking.service_type.ilike(pattern),
+                User.full_name.ilike(pattern),
+                User.email.ilike(pattern),
+            )
+        )
     return stmt
 
 
@@ -250,6 +318,7 @@ async def accept(session: AsyncSession, booking: Booking, actor_id: uuid.UUID) -
     if booking.status != BookingStatus.pending:
         raise AppError("Booking is not pending", code="invalid_state")
     booking.status = BookingStatus.confirmed
+    booking.deal_later_at = None
     booking.updated_by = actor_id
     session.add(booking)
     await session.flush()
@@ -268,6 +337,20 @@ async def reject(
     booking.status = BookingStatus.rejected
     booking.cancellation_reason = reason
     booking.cancelled_by = actor_id
+    booking.updated_by = actor_id
+    session.add(booking)
+    await session.flush()
+    await session.refresh(booking)
+    return booking
+
+
+async def deal_later(session: AsyncSession, booking: Booking, actor_id: uuid.UUID) -> Booking:
+    """Advisor defers Accept/Reject on a pending consultation request (stays pending)."""
+    if actor_id != booking.advisor_id:
+        raise PermissionDeniedError("Only the advisor can do this")
+    if booking.status != BookingStatus.pending:
+        raise AppError("Booking is not pending", code="invalid_state")
+    booking.deal_later_at = datetime.now(UTC)
     booking.updated_by = actor_id
     session.add(booking)
     await session.flush()
@@ -335,6 +418,135 @@ async def mark_no_show(session: AsyncSession, booking: Booking, actor_id: uuid.U
     await session.flush()
     await session.refresh(booking)
     return booking
+
+
+async def build_history(
+    session: AsyncSession,
+    booking: Booking,
+    seeker: User | None,
+    advisor: User | None,
+    settings: Settings,
+) -> BookingHistoryRead:
+    """Consultation History screen — booking summary + notes + document requests."""
+    notes_result = await session.execute(booking_note_service.list_for_booking_stmt(booking.id))
+    notes = list(notes_result.scalars().all())
+    authors: dict[uuid.UUID, User] = {}
+    for note in notes:
+        if note.author_id not in authors:
+            author = await session.get(User, note.author_id)
+            if author is not None:
+                authors[note.author_id] = author
+
+    docs_result = await session.execute(booking_document_service.list_for_booking_stmt(booking.id))
+    docs = list(docs_result.scalars().all())
+
+    return BookingHistoryRead(
+        id=booking.id,
+        appointment_id=appointment_id_str(booking),
+        seeker_id=booking.seeker_id,
+        advisor_id=booking.advisor_id,
+        seeker_name=seeker.full_name if seeker else None,
+        seeker_email=seeker.email if seeker else None,
+        advisor_name=advisor.full_name if advisor else None,
+        service_type=booking.service_type,
+        scheduled_start=as_utc(booking.scheduled_start),
+        scheduled_end=as_utc(booking.scheduled_end),
+        status=booking.status,
+        seeker_note=booking.seeker_note,
+        is_important=booking.is_important,
+        deal_later_at=as_utc(booking.deal_later_at) if booking.deal_later_at else None,
+        notes=[
+            booking_note_service.build_read(n, authors.get(n.author_id), settings) for n in notes
+        ],
+        document_requests=[booking_document_service.build_read(d, settings) for d in docs],
+        created_at=booking.created_at,
+    )
+
+
+def _file_format(file_name: str | None, content_type: str | None) -> str:
+    if file_name and "." in file_name:
+        return file_name.rsplit(".", 1)[-1].upper()
+    if content_type and "/" in content_type:
+        return content_type.rsplit("/", 1)[-1].upper()
+    return "FILE"
+
+
+def _meeting_read(booking: Booking) -> BookingMeetingRead:
+    start = as_utc(booking.scheduled_start)
+    end = as_utc(booking.scheduled_end)
+    label = humanize_slug(booking.service_type) or "Consultation"
+    return BookingMeetingRead(
+        label=label,
+        time_range=(
+            f"{start.strftime('%I:%M %p').lstrip('0')} - "
+            f"{end.strftime('%I:%M %p').lstrip('0')} UTC"
+        ),
+        date=start.strftime("%d %b %Y"),
+    )
+
+
+async def build_details(
+    session: AsyncSession,
+    booking: Booking,
+    seeker: User | None,
+) -> BookingDetailsRead:
+    """View Booking Details drawer — payment, attachments, meeting, AI suggestions."""
+    txn = (
+        await session.execute(select(Transaction).where(Transaction.booking_id == booking.id))
+    ).scalar_one_or_none()
+    if txn is not None:
+        amount_paid = round(float(txn.amount_usd), 2)
+    elif booking.payment_status == PaymentStatus.paid:
+        amount_paid = round(float(booking.price_usd), 2)
+    else:
+        amount_paid = 0.0
+
+    description = (booking.seeker_note or "").strip() or (
+        f"Consultation for {booking.service_type.replace('_', ' ').strip()}"
+    )
+
+    attachments: list[BookingAttachmentRead] = []
+    docs_result = await session.execute(booking_document_service.list_for_booking_stmt(booking.id))
+    for doc in docs_result.scalars().all():
+        if doc.status != DocumentRequestStatus.fulfilled or not doc.file_name:
+            continue
+        attachments.append(
+            BookingAttachmentRead(
+                id=doc.id,
+                title=doc.file_name,
+                format=_file_format(doc.file_name, doc.content_type),
+                size=int(doc.file_size or 0),
+            )
+        )
+
+    notes_result = await session.execute(booking_note_service.list_for_booking_stmt(booking.id))
+    for note in notes_result.scalars().all():
+        for att in note.attachments or []:
+            attachments.append(
+                BookingAttachmentRead(
+                    id=att.id,
+                    title=att.file_name,
+                    format=_file_format(att.file_name, att.content_type),
+                    size=int(att.file_size),
+                )
+            )
+
+    # AI suggestions are not persisted yet — return an empty list until the
+    # suggestion pipeline lands; schema is ready for {id, message} rows.
+    ai_suggestions: list[BookingAiSuggestionRead] = []
+
+    return BookingDetailsRead(
+        appointment_id=f"#{booking.appointment_number:07d}",
+        seeker_name=seeker.full_name if seeker else None,
+        service_type=booking.service_type,
+        scheduled_start=as_utc(booking.scheduled_start),
+        duration_minutes=booking.duration_minutes,
+        amount_paid=amount_paid,
+        description=description,
+        attachments=attachments,
+        meeting=_meeting_read(booking),
+        ai_suggestions=ai_suggestions,
+    )
 
 
 def list_clients_stmt(advisor_id: uuid.UUID, q: str | None = None) -> Select[tuple[User]]:

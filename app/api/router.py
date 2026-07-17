@@ -11,6 +11,7 @@ from app.api.v1 import (
     auth,
     availability,
     bookings,
+    bookmarks,
     conversations,
     countries,
     payments,
@@ -29,6 +30,7 @@ api_router.include_router(seeker_profiles.router)
 api_router.include_router(availability.router)  # before advisors: /me/availability vs /{id}
 api_router.include_router(advisors.router)
 api_router.include_router(bookings.router)
+api_router.include_router(bookmarks.router)
 api_router.include_router(payments.router)
 api_router.include_router(reviews.router)
 api_router.include_router(conversations.router)

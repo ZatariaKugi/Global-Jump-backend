@@ -179,6 +179,12 @@ class Assessment(BaseModel):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # AI-generated improvement summary — NULL when AI was unavailable at completion.
     ai_summary: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    # Optional A/B experiment arm assigned at assessment start.
+    ab_variant_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("assessment_ab_variants.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     answers: Mapped[list[AssessmentAnswer]] = relationship(
         "AssessmentAnswer", cascade="all, delete-orphan", lazy="selectin"

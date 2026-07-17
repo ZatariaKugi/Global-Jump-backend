@@ -28,6 +28,7 @@ async def get_available_balance(session: AsyncSession, advisor_id: uuid.UUID) ->
         .join(Booking, Booking.id == Transaction.booking_id)
         .where(Booking.advisor_id == advisor_id)
         .where(Transaction.status == TransactionStatus.succeeded)
+        .where(Transaction.is_archived.is_(False))
     )
     total_earned = earned_result.scalar_one_or_none() or 0.0
 

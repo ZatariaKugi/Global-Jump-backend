@@ -212,7 +212,6 @@ async def main() -> None:
         )
 
         # ── Step 5: Stripe Connect (skipped — enable Connect in Stripe Dashboard first)
-        stripe_account_id = None
         print("\n[5] Stripe Connect skipped (sandbox account not enrolled in Connect)")
         print("    Payments will collect to the platform account.")
         print(
@@ -341,9 +340,9 @@ async def main() -> None:
     print("══════════════════════════════════════════════\n")
     print(f"  Booking ID:  {booking_id}")
     print(f"  Stripe PI:   {pi_id}")
-    print(f"  Amount:      $50.00 → seeker charged")
-    print(f"  Commission:  $7.50  → platform (15%)")
-    print(f"  Payout:      $42.50 → advisor (pending Connect setup)")
+    print("  Amount:      $50.00 → seeker charged")
+    print("  Commission:  $7.50  → platform (15%)")
+    print("  Payout:      $42.50 → advisor (pending Connect setup)")
     print()
 
 

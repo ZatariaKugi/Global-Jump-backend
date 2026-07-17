@@ -9,6 +9,7 @@ from typing import Annotated
 from pydantic import BaseModel, Field, field_validator
 
 from app.core.countries import country_code
+from app.core.visa_types import OptionalVisaType, RequiredVisaType
 from app.models.seeker_profile import EducationLevel, EmploymentStatus
 
 CountryCode = Annotated[str, Field(min_length=2, max_length=2)]
@@ -16,7 +17,7 @@ CountryCode = Annotated[str, Field(min_length=2, max_length=2)]
 
 class PriorVisa(BaseModel):
     country: CountryCode
-    visa_type: str = Field(min_length=1, max_length=100)
+    visa_type: RequiredVisaType
     year: int = Field(ge=1900, le=2100)
 
 
@@ -25,7 +26,7 @@ class SeekerProfileUpdate(BaseModel):
     nationality: CountryCode | None = None
     country_of_residence: CountryCode | None = None
     profile_photo_url: str | None = None
-    intended_visa_type: str | None = Field(default=None, max_length=50)
+    intended_visa_type: OptionalVisaType = None
     intended_destination: CountryCode | None = None
     passport_number: str | None = Field(default=None, min_length=5, max_length=20)
     passport_expiry: date | None = None
@@ -61,7 +62,7 @@ class OnboardingSubmit(BaseModel):
     """
 
     # Step 1
-    intended_visa_type: str = Field(min_length=1, max_length=50)
+    intended_visa_type: RequiredVisaType
     # Step 2 — full country name (e.g. "Japan") or 2-letter code; normalised to the code below
     intended_destination: str = Field(min_length=2, max_length=100)
     # Step 3
@@ -108,7 +109,7 @@ class SeekerProfileRead(BaseModel):
     nationality: str | None
     country_of_residence: str | None
     profile_photo_url: str | None
-    intended_visa_type: str | None
+    intended_visa_type: OptionalVisaType
     intended_destination: str | None
     passport_number_masked: str | None = None
     passport_expiry: date | None

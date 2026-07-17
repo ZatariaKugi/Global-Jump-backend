@@ -5,14 +5,27 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.advisor_credential import AdvisorCredential, CredentialStatus
+from app.models.advisor_credential import AdvisorCredential, CredentialStatus, DocumentType
 from app.models.advisor_profile import AdvisorProfile
-from app.models.user import User, UserRole
+from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.advisor_admin import VerificationQueueRead
+
+# Onboarding "Verification Documents" required types (PRD / wizard step 6).
+_REQUIRED_DOC_TYPES = frozenset(
+    {
+        DocumentType.government_id,
+        DocumentType.license,
+        DocumentType.certification,
+    }
+)
+
+_VerificationResult = Literal["all_passed", "needs_review"]
+_QueueStatus = Literal["pending", "verified", "rejected"]
 
 
 def list_stmt() -> Select[tuple[User]]:
@@ -35,6 +48,13 @@ def list_stmt() -> Select[tuple[User]]:
     return (
         select(User)
         .where(User.role == UserRole.advisor)
+        # Account already decided → leave the queue even if a credential was
+        # left pending by an older approve path.
+        .where(
+            User.verification_status.in_(
+                (VerificationStatus.pending, VerificationStatus.under_review)
+            )
+        )
         .where(
             User.id.in_(
                 select(AdvisorCredential.user_id)
@@ -44,6 +64,22 @@ def list_stmt() -> Select[tuple[User]]:
         )
         .order_by(earliest_pending.asc())
     )
+
+
+def _normalize_doc_type(doc_type: DocumentType) -> DocumentType:
+    if doc_type == DocumentType.immigration_license:
+        return DocumentType.license
+    return doc_type
+
+
+def _package_score(doc_types: set[DocumentType]) -> tuple[float, _VerificationResult]:
+    """0–100 completeness over the three required onboarding document types."""
+    present = {_normalize_doc_type(t) for t in doc_types} & _REQUIRED_DOC_TYPES
+    score = round((len(present) / len(_REQUIRED_DOC_TYPES)) * 100, 1)
+    result: _VerificationResult = (
+        "all_passed" if present == _REQUIRED_DOC_TYPES else "needs_review"
+    )
+    return score, result
 
 
 async def build_list_read(
@@ -76,9 +112,23 @@ async def build_list_read(
     for advisor_id, count, earliest, latest in agg_rows:
         stats[advisor_id] = (count, earliest, latest)
 
+    # All non-archived credentials (any status) for package-completeness score.
+    cred_rows = (
+        await session.execute(
+            select(AdvisorCredential.user_id, AdvisorCredential.document_type)
+            .where(AdvisorCredential.user_id.in_(ids))
+            .where(AdvisorCredential.is_archived.is_(False))
+        )
+    ).all()
+    types_by_advisor: dict[uuid.UUID, set[DocumentType]] = {i: set() for i in ids}
+    for advisor_id, doc_type in cred_rows:
+        types_by_advisor[advisor_id].add(doc_type)
+
     out = []
     for a in advisors:
         count, earliest, latest = stats.get(a.id, (0, a.created_at, a.created_at))
+        ai_score, verification_result = _package_score(types_by_advisor.get(a.id, set()))
+        status: _QueueStatus = "pending"
         out.append(
             VerificationQueueRead(
                 advisor_id=a.id,
@@ -88,6 +138,9 @@ async def build_list_read(
                 pending_document_count=count,
                 earliest_submitted_at=earliest,
                 latest_submitted_at=latest,
+                ai_score=ai_score,
+                verification_result=verification_result,
+                status=status,
             )
         )
     return out

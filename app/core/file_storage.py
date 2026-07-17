@@ -22,9 +22,9 @@ from botocore.exceptions import ClientError
 from fastapi import UploadFile
 
 from app.core.config import Settings
-from app.core.exceptions import AppError
+from app.core.exceptions import AppError, NotFoundError
 
-_ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
+_ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".docx"}
 
 
 @lru_cache
@@ -121,6 +121,40 @@ def resolve_url(url_path: str, settings: Settings) -> str:
             ExpiresIn=3600,
         )
     )
+
+
+def normalize_file_key(file_key: str) -> str:
+    """Strip optional ``/uploads/`` prefix and reject path-traversal attempts."""
+    key = file_key.strip().removeprefix("/uploads/").lstrip("/")
+    if not key or key != Path(key).as_posix() or ".." in Path(key).parts:
+        raise AppError("Invalid file key", code="invalid_file_key")
+    return key
+
+
+def get_upload_by_key(file_key: str, settings: Settings) -> tuple[str, int]:
+    """Look up a previously uploaded file by ``file_key``.
+
+    Returns ``(url_path, size_bytes)`` where ``url_path`` is the stored
+    ``/uploads/{key}`` form. Raises ``NotFoundError`` when the object is missing.
+    """
+    key = normalize_file_key(file_key)
+
+    if _s3_enabled(settings):
+        client = _client(settings)
+        try:
+            head = client.head_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+        except ClientError as exc:
+            code = (exc.response.get("Error") or {}).get("Code", "")
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                raise NotFoundError("File not found") from exc
+            raise AppError("Failed to read uploaded file", code="storage_error") from exc
+        size = int(head.get("ContentLength") or 0)
+        return f"/uploads/{key}", size
+
+    full_path = Path(settings.UPLOAD_DIR) / key
+    if not full_path.is_file():
+        raise NotFoundError("File not found")
+    return f"/uploads/{key}", full_path.stat().st_size
 
 
 def delete_file(url_path: str, settings: Settings) -> None:
