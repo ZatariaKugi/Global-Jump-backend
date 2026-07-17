@@ -20,10 +20,7 @@ async def _user_id(client: AsyncClient, headers: dict) -> str:
 
 
 async def _booked_pair(client: AsyncClient, engine) -> tuple[str, dict, str, dict]:
-    """Returns (advisor_id, advisor_headers, seeker_id, seeker_headers).
-
-    The pair already has a booking, satisfying the conversation prerequisite.
-    """
+    """Returns (advisor_id, advisor_headers, seeker_id, seeker_headers) with a booking."""
     advisor_id, advisor_headers, day = await _bookable_advisor(client, engine)
     _, cust_headers = await _seeker(client)
     resp = await client.post(
@@ -43,17 +40,18 @@ async def _booked_pair(client: AsyncClient, engine) -> tuple[str, dict, str, dic
 # ── Conversation creation ────────────────────────────────────────────────────
 
 
-async def test_create_conversation_requires_booking_relationship(
-    client: AsyncClient, engine
-) -> None:
+async def test_create_conversation_without_booking(client: AsyncClient, engine) -> None:
+    """Pre-booking chat is allowed — seeker can open a thread with any advisor."""
     advisor_id, _, _ = await _bookable_advisor(client, engine)
-    _, cust_headers = await _seeker(client)  # no booking made
+    _, cust_headers = await _seeker(client)
 
     resp = await client.post(
         CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
     )
-    assert resp.status_code == 403
-    assert resp.json()["error"]["code"] == "forbidden"
+    assert resp.status_code == 201, resp.text
+    data = resp.json()["data"]
+    assert data["advisor_id"] == advisor_id
+    assert data["other_party_id"] == advisor_id
 
 
 async def test_create_conversation_happy_path_and_idempotent(client: AsyncClient, engine) -> None:

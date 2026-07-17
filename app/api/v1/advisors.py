@@ -67,6 +67,7 @@ from app.services import (
     advisor_search_service,
     booking_service,
     bookmark_service,
+    conversation_service,
     payment_service,
     payout_service,
     review_service,
@@ -96,6 +97,17 @@ async def _bookmarked_ids(
     return await bookmark_service.bookmarked_advisor_ids(session, principal.id, advisor_ids)
 
 
+async def _conversation_ids(
+    session: SessionDep, principal: Principal, advisor_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, uuid.UUID]:
+    """Existing chat threads: advisor_id → conversation_id (seekers only)."""
+    if principal.role != UserRole.seeker.value or not advisor_ids:
+        return {}
+    return await conversation_service.conversation_ids_for_seeker(
+        session, principal.id, advisor_ids
+    )
+
+
 @router.get(
     "/me/profile",
     response_model=ResponseEnvelope[AdvisorProfileRead],
@@ -106,9 +118,15 @@ async def get_my_advisor_profile(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorProfileRead]:
+    """Own profile including read-only stats (rating, response time, verification).
+
+    FE field aliases: ``avatar_url`` → ``profile_photo_url``, designation → ``title``,
+    slug → ``public_profile_slug``, ``advisor_match_score`` → ``match_percentage``
+    (always null here; real scores are seeker-context on list/public endpoints).
+    """
     profile = await advisor_profile_service.get_or_create(session, current_user.id)
     return ResponseEnvelope[AdvisorProfileRead](
-        data=advisor_profile_service.build_read(profile),
+        data=await advisor_profile_service.build_enriched_read(session, profile, current_user),
         meta=Meta(request_id=request_id),
     )
 
@@ -124,14 +142,15 @@ async def update_my_advisor_profile(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorProfileRead]:
+    """Update editable profile fields. ``successful_applications`` is not accepted."""
     profile = await advisor_profile_service.get_or_create(session, current_user.id)
-    if profile.public_profile_slug is None:
+    if profile.public_profile_slug is None and data.public_profile_slug is None:
         profile.public_profile_slug = await advisor_search_service.generate_unique_slug(
             session, current_user.full_name
         )
     profile = await advisor_profile_service.update(session, profile, data)
     return ResponseEnvelope[AdvisorProfileRead](
-        data=advisor_profile_service.build_read(profile),
+        data=await advisor_profile_service.build_enriched_read(session, profile, current_user),
         meta=Meta(request_id=request_id),
     )
 
@@ -184,6 +203,7 @@ async def list_advisors(
     ratings = await review_service.rating_summaries(session, [u.id for u in users])
     destination, match_visa = await _seeker_match_context(session, principal)
     bookmarked = await _bookmarked_ids(session, principal, [u.id for u in users])
+    conversations = await _conversation_ids(session, principal, [u.id for u in users])
 
     return ResponseEnvelope[list[AdvisorListingCard]](
         data=[
@@ -198,6 +218,7 @@ async def list_advisors(
                     (ratings.get(u.id) or (None, 0))[0],
                 ),
                 is_bookmarked=u.id in bookmarked,
+                conversation_id=conversations.get(u.id),
             )
             for u in users
         ],
@@ -218,6 +239,7 @@ async def list_featured_advisors(
     ratings = await review_service.rating_summaries(session, [u.id for u in users])
     destination, match_visa = await _seeker_match_context(session, principal)
     bookmarked = await _bookmarked_ids(session, principal, [u.id for u in users])
+    conversations = await _conversation_ids(session, principal, [u.id for u in users])
 
     return ResponseEnvelope[list[AdvisorListingCard]](
         data=[
@@ -232,6 +254,7 @@ async def list_featured_advisors(
                     (ratings.get(u.id) or (None, 0))[0],
                 ),
                 is_bookmarked=u.id in bookmarked,
+                conversation_id=conversations.get(u.id),
             )
             for u in users
         ],
@@ -391,12 +414,13 @@ async def complete_advisor_onboarding(
     onboarding_status = await advisor_profile_service.build_onboarding_status(
         session, current_user, profile
     )
-    profile_data = advisor_profile_service.build_read(profile)
+    profile_data = await advisor_profile_service.build_enriched_read(
+        session, profile, current_user
+    )
 
     return ResponseEnvelope[AdvisorOnboardingCompleteRead](
         data=AdvisorOnboardingCompleteRead(
             **profile_data.model_dump(),
-            verification_status=current_user.verification_status,
             onboarding_status=onboarding_status,
         ),
         meta=Meta(request_id=request_id),

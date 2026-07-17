@@ -8,8 +8,9 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import Select, and_, not_, or_, select
+from sqlalchemy import Select, String, and_, cast, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.config import Settings
 from app.core.exceptions import NotFoundError
@@ -54,15 +55,54 @@ def compute_status(user: User) -> AccountStatus:
     return AccountStatus.verified
 
 
+def user_search_clause(
+    search: str | None = None,
+    *,
+    username: str | None = None,
+    user_id: uuid.UUID | None = None,
+) -> ColumnElement[bool] | None:
+    """Match users by free-text ``search`` (name / email / id), and/or exact filters.
+
+    ``search`` matches ``full_name``, ``email``, and stringified ``id`` (UUID).
+    ``username`` is an ilike filter on ``full_name`` only.
+    ``user_id`` is an exact UUID match.
+    """
+    clauses: list[ColumnElement[bool]] = []
+    if search and (q := search.strip()):
+        pattern = f"%{q}%"
+        text_match = or_(
+            User.full_name.ilike(pattern),
+            User.email.ilike(pattern),
+            cast(User.id, String).ilike(pattern),
+        )
+        try:
+            uid = uuid.UUID(q)
+            clauses.append(or_(text_match, User.id == uid))
+        except ValueError:
+            clauses.append(text_match)
+    if username and (name := username.strip()):
+        clauses.append(User.full_name.ilike(f"%{name}%"))
+    if user_id is not None:
+        clauses.append(User.id == user_id)
+    if not clauses:
+        return None
+    return and_(*clauses) if len(clauses) > 1 else clauses[0]
+
+
 def list_users_stmt(
-    search: str | None, status: AccountStatus | None, role: UserRole | None
+    search: str | None,
+    status: AccountStatus | None,
+    role: UserRole | None,
+    *,
+    username: str | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> Select[tuple[User]]:
     stmt = select(User).where(User.role != UserRole.admin).order_by(User.created_at.desc())
     if role is not None:
         stmt = stmt.where(User.role == role)
-    if search:
-        pattern = f"%{search.strip()}%"
-        stmt = stmt.where(or_(User.full_name.ilike(pattern), User.email.ilike(pattern)))
+    clause = user_search_clause(search, username=username, user_id=user_id)
+    if clause is not None:
+        stmt = stmt.where(clause)
     if status == AccountStatus.suspended:
         stmt = stmt.where(
             or_(
@@ -110,6 +150,7 @@ async def build_list_read(session: AsyncSession, users: list[User]) -> list[User
             full_name=u.full_name,
             email=u.email,
             role=u.role,
+            user_type=u.role,
             country_of_residence=profiles[u.id].country_of_residence if u.id in profiles else None,
             status=compute_status(u),
             created_at=u.created_at,
@@ -132,6 +173,7 @@ async def get_user_detail(session: AsyncSession, user_id: uuid.UUID) -> UserDeta
         full_name=user.full_name,
         email=user.email,
         role=user.role,
+        user_type=user.role,
         country_of_residence=profile.country_of_residence if profile else None,
         status=compute_status(user),
         created_at=user.created_at,

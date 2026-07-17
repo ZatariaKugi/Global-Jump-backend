@@ -7,7 +7,7 @@ from __future__ import annotations
 import secrets
 import uuid
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -43,9 +43,9 @@ def list_seekers_stmt(
         stmt = stmt.join(SeekerProfile, SeekerProfile.user_id == User.id).where(
             func.lower(SeekerProfile.intended_visa_type) == effective.value
         )
-    if search:
-        pattern = f"%{search.strip()}%"
-        stmt = stmt.where(or_(User.full_name.ilike(pattern), User.email.ilike(pattern)))
+    clause = user_admin_service.user_search_clause(search)
+    if clause is not None:
+        stmt = stmt.where(clause)
     if status == AccountStatus.suspended:
         stmt = stmt.where(User.is_suspended.is_(True))
     elif status == AccountStatus.unverified:

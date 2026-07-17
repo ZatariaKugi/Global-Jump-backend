@@ -28,4 +28,6 @@ class BookmarkRead(BaseModel):
     status: Literal["active", "inactive"]
     public_profile_slug: str | None
     is_bookmarked: bool = True
+    # Existing chat thread with this advisor; null if none yet
+    conversation_id: uuid.UUID | None = None
     bookmarked_at: datetime
