@@ -2,7 +2,7 @@ UV ?= uv
 UV_RUN ?= $(UV) run
 APP ?= app.main:app
 HOST ?= 0.0.0.0
-PORT ?= 8000
+PORT ?= 8020
 MSG ?= new_migration
 
 .DEFAULT_GOAL := help
@@ -67,7 +67,7 @@ pre-commit: ## Run pre-commit hooks on all files
 secrets: ## Run detect-secrets hook manually
 	$(UV_RUN) pre-commit run detect-secrets --hook-stage manual --all-files
 
-docker-up: ## Start full stack with Docker
+docker-up: ## Start full stack with Docker (set API_PUBLISH_PORT / POSTGRES_PUBLISH_PORT if busy)
 	docker compose up --build
 
 docker-down: ## Stop and remove Docker stack

@@ -9,10 +9,18 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
+from app.core.visa_types import humanize_slug, visa_type_name
 from app.models.booking import Booking, BookingStatus, PaymentStatus
 from app.models.review import ModerationStatus, Review
+from app.models.seeker_profile import SeekerProfile
 from app.models.user import User
-from app.schemas.review import ReviewCreate, ReviewRead
+from app.models.visa_type import VisaType
+from app.schemas.review import (
+    AdvisorReviewSummaryRead,
+    RatingStarBreakdown,
+    ReviewCreate,
+    ReviewRead,
+)
 
 PUBLIC_STATUSES = (ModerationStatus.visible, ModerationStatus.flagged)
 
@@ -58,13 +66,28 @@ async def create(
     return review
 
 
-def list_public_stmt(advisor_id: uuid.UUID) -> Select[tuple[Review]]:
-    return (
-        select(Review)
-        .where(Review.advisor_id == advisor_id)
-        .where(Review.moderation_status.in_(PUBLIC_STATUSES))
-        .order_by(Review.created_at.desc())
-    )
+def list_public_stmt(
+    advisor_id: uuid.UUID,
+    *,
+    flagged: bool | None = None,
+    visa_type: VisaType | None = None,
+) -> Select[tuple[Review]]:
+    """Public (visible + flagged) reviews for an advisor.
+
+    When ``flagged=True``, restrict to moderation_status=flagged only
+    (admin Reviews tab filter). When ``visa_type`` is set, restrict to
+    seekers whose ``intended_visa_type`` matches the PRD enum value.
+    """
+    stmt = select(Review).where(Review.advisor_id == advisor_id)
+    if flagged is True:
+        stmt = stmt.where(Review.moderation_status == ModerationStatus.flagged)
+    else:
+        stmt = stmt.where(Review.moderation_status.in_(PUBLIC_STATUSES))
+    if visa_type is not None:
+        stmt = stmt.join(SeekerProfile, SeekerProfile.user_id == Review.seeker_id).where(
+            func.lower(SeekerProfile.intended_visa_type) == visa_type.value
+        )
+    return stmt.order_by(Review.created_at.desc())
 
 
 def list_flagged_stmt() -> Select[tuple[Review]]:
@@ -153,12 +176,20 @@ async def rating_summaries(
     return {row[0]: (round(float(row[1]), 2), int(row[2])) for row in result.all()}
 
 
-def build_read(review: Review, seeker: User | None) -> ReviewRead:
+def build_read(
+    review: Review,
+    seeker: User | None,
+    *,
+    seeker_photo_url: str | None = None,
+    seeker_subtitle: str | None = None,
+) -> ReviewRead:
     return ReviewRead(
         id=review.id,
         booking_id=review.booking_id,
         advisor_id=review.advisor_id,
         seeker_name=seeker.full_name if seeker else None,
+        seeker_photo_url=seeker_photo_url,
+        seeker_subtitle=seeker_subtitle,
         rating_expertise=review.rating_expertise,
         rating_communication=review.rating_communication,
         rating_professionalism=review.rating_professionalism,
@@ -170,3 +201,92 @@ def build_read(review: Review, seeker: User | None) -> ReviewRead:
         responded_at=review.responded_at,
         created_at=review.created_at,
     )
+
+
+async def build_tab_summary(
+    session: AsyncSession, advisor_id: uuid.UUID
+) -> AdvisorReviewSummaryRead:
+    """Overall + positive % + 1–5 star breakdown for the Reviews tab header card."""
+    rows = (
+        await session.execute(
+            select(Review.rating_overall)
+            .where(Review.advisor_id == advisor_id)
+            .where(Review.moderation_status.in_(PUBLIC_STATUSES))
+        )
+    ).scalars().all()
+    if not rows:
+        return AdvisorReviewSummaryRead(
+            overall=None,
+            review_count=0,
+            positive_percent=None,
+            breakdown=[RatingStarBreakdown(stars=s, count=0) for s in range(5, 0, -1)],
+        )
+
+    overalls = [float(r) for r in rows]
+    review_count = len(overalls)
+    overall = round(sum(overalls) / review_count, 2)
+    positive = sum(1 for v in overalls if v >= 4.0)
+    positive_percent = round((positive / review_count) * 100, 1)
+
+    star_counts = dict.fromkeys(range(1, 6), 0)
+    for v in overalls:
+        star = int(round(v))
+        star = min(5, max(1, star))
+        star_counts[star] += 1
+
+    return AdvisorReviewSummaryRead(
+        overall=overall,
+        review_count=review_count,
+        positive_percent=positive_percent,
+        breakdown=[RatingStarBreakdown(stars=s, count=star_counts[s]) for s in range(5, 0, -1)],
+    )
+
+
+async def build_enriched_reads(
+    session: AsyncSession, reviews: list[Review]
+) -> list[ReviewRead]:
+    """Bulk-enrich rows with seeker name/photo and a display subtitle for filters."""
+    if not reviews:
+        return []
+
+    seeker_ids = list({r.seeker_id for r in reviews})
+    booking_ids = list({r.booking_id for r in reviews})
+
+    seekers = {
+        u.id: u
+        for u in (
+            await session.execute(select(User).where(User.id.in_(seeker_ids)))
+        ).scalars().all()
+    }
+    profiles = {
+        p.user_id: p
+        for p in (
+            await session.execute(
+                select(SeekerProfile).where(SeekerProfile.user_id.in_(seeker_ids))
+            )
+        ).scalars().all()
+    }
+    service_by_booking = {
+        b.id: b.service_type
+        for b in (
+            await session.execute(select(Booking).where(Booking.id.in_(booking_ids)))
+        ).scalars().all()
+    }
+
+    return [
+        build_read(
+            r,
+            seekers.get(r.seeker_id),
+            seeker_photo_url=(
+                profiles[r.seeker_id].profile_photo_url if r.seeker_id in profiles else None
+            ),
+            # Prefer visa intent label for filter chips; else humanized service type.
+            seeker_subtitle=(
+                visa_type_name(
+                    profiles[r.seeker_id].intended_visa_type if r.seeker_id in profiles else None
+                )
+                or humanize_slug(service_by_booking.get(r.booking_id))
+            ),
+        )
+        for r in reviews
+    ]

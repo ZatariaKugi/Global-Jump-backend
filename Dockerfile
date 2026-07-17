@@ -10,14 +10,14 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 # Install dependencies first (cached layer), without the project itself.
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+    uv sync --frozen --no-install-project --no-dev --no-editable
 
 # Now copy the source and install the project.
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv sync --frozen --no-dev --no-editable
 
 
 FROM python:3.12-slim-bookworm AS runtime
@@ -31,6 +31,9 @@ RUN groupadd --system app && useradd --system --gid app --no-create-home appuser
 
 WORKDIR /app
 COPY --from=builder --chown=appuser:app /app /app
+
+# Writable upload dir for the non-root user (local disk fallback when S3 is unset).
+RUN mkdir -p /app/uploads && chown appuser:app /app/uploads
 
 USER appuser
 EXPOSE 8000

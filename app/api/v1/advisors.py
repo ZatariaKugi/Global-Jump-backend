@@ -21,6 +21,7 @@ from app.api.pagination import PaginationDep, page_meta, paginate
 from app.api.v1.bookings import _party_names, _read, _send_confirmations
 from app.core.exceptions import NotFoundError, PermissionDeniedError
 from app.core.file_storage import delete_file, resolve_url
+from app.core.visa_types import OptionalVisaType, visa_type_name
 from app.db.session import SessionDep
 from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorProfile
@@ -41,6 +42,7 @@ from app.schemas.advisor_profile import (
     AdvisorProfilePublicRead,
     AdvisorProfileRead,
     AdvisorProfileUpdate,
+    AdvisorVerificationResubmitRead,
 )
 from app.schemas.booking import AdvisorBookingCreate, BookingRead, ClientRead
 from app.schemas.payment import (
@@ -60,9 +62,11 @@ from app.schemas.seeker_document import (
 from app.services import (
     advisor_credential_service,
     advisor_lead_service,
+    advisor_matching_service,
     advisor_profile_service,
     advisor_search_service,
     booking_service,
+    bookmark_service,
     payment_service,
     payout_service,
     review_service,
@@ -73,6 +77,23 @@ from app.services.advisor_search_service import AdvisorSearchFilters, SortOption
 router = APIRouter(prefix="/advisors", tags=["advisors"])
 
 VerifiedAdvisorDep = Annotated[Principal, Depends(require_verified_advisor)]
+
+
+async def _seeker_match_context(
+    session: SessionDep, principal: Principal
+) -> tuple[str | None, str | None]:
+    """Destination/visa for match % — only when the caller is a local seeker."""
+    if principal.role != UserRole.seeker.value:
+        return None, None
+    return await advisor_matching_service.match_context_for_seeker(session, principal.id)
+
+
+async def _bookmarked_ids(
+    session: SessionDep, principal: Principal, advisor_ids: list[uuid.UUID]
+) -> set[uuid.UUID]:
+    if principal.role != UserRole.seeker.value or not advisor_ids:
+        return set()
+    return await bookmark_service.bookmarked_advisor_ids(session, principal.id, advisor_ids)
 
 
 @router.get(
@@ -130,16 +151,20 @@ async def _profiles_by_user(
 @router.get("", response_model=ResponseEnvelope[list[AdvisorListingCard]])
 async def list_advisors(
     params: PaginationDep,
-    _principal: CurrentPrincipal,
+    principal: CurrentPrincipal,
     session: SessionDep,
     request_id: RequestIdDep,
     q: Annotated[str | None, Query(max_length=100, description="Keyword search")] = None,
     country: Annotated[str | None, Query(max_length=2, description="Country expertise")] = None,
-    visa_type: Annotated[str | None, Query(max_length=50)] = None,
+    visa_type: Annotated[OptionalVisaType, Query()] = None,
     language: Annotated[str | None, Query(max_length=100)] = None,
     min_price: Annotated[float | None, Query(ge=0)] = None,
     max_price: Annotated[float | None, Query(ge=0)] = None,
     min_rating: Annotated[float | None, Query(ge=1, le=5)] = None,
+    recommended: Annotated[
+        bool,
+        Query(description="When true, AI-suggested (featured) advisors sort first"),
+    ] = False,
     sort: Annotated[SortOption, Query()] = "newest",
 ) -> ResponseEnvelope[list[AdvisorListingCard]]:
     filters = AdvisorSearchFilters(
@@ -150,17 +175,29 @@ async def list_advisors(
         min_price=min_price,
         max_price=max_price,
         min_rating=min_rating,
+        recommended=recommended,
         sort=sort,
     )
     stmt = advisor_search_service.build_search_stmt(filters)
     users, total = await paginate(session, stmt, params)
     profiles_by_user = await _profiles_by_user(session, users)
     ratings = await review_service.rating_summaries(session, [u.id for u in users])
+    destination, match_visa = await _seeker_match_context(session, principal)
+    bookmarked = await _bookmarked_ids(session, principal, [u.id for u in users])
 
     return ResponseEnvelope[list[AdvisorListingCard]](
         data=[
             advisor_profile_service.build_listing_card(
-                u, profiles_by_user.get(u.id), ratings.get(u.id)
+                u,
+                profiles_by_user.get(u.id),
+                ratings.get(u.id),
+                match_percentage=advisor_matching_service.match_percentage(
+                    profiles_by_user.get(u.id),
+                    destination,
+                    match_visa,
+                    (ratings.get(u.id) or (None, 0))[0],
+                ),
+                is_bookmarked=u.id in bookmarked,
             )
             for u in users
         ],
@@ -171,7 +208,7 @@ async def list_advisors(
 @router.get("/featured", response_model=ResponseEnvelope[list[AdvisorListingCard]])
 async def list_featured_advisors(
     params: PaginationDep,
-    _principal: CurrentPrincipal,
+    principal: CurrentPrincipal,
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[AdvisorListingCard]]:
@@ -179,11 +216,22 @@ async def list_featured_advisors(
     users, total = await paginate(session, stmt, params)
     profiles_by_user = await _profiles_by_user(session, users)
     ratings = await review_service.rating_summaries(session, [u.id for u in users])
+    destination, match_visa = await _seeker_match_context(session, principal)
+    bookmarked = await _bookmarked_ids(session, principal, [u.id for u in users])
 
     return ResponseEnvelope[list[AdvisorListingCard]](
         data=[
             advisor_profile_service.build_listing_card(
-                u, profiles_by_user.get(u.id), ratings.get(u.id)
+                u,
+                profiles_by_user.get(u.id),
+                ratings.get(u.id),
+                match_percentage=advisor_matching_service.match_percentage(
+                    profiles_by_user.get(u.id),
+                    destination,
+                    match_visa,
+                    (ratings.get(u.id) or (None, 0))[0],
+                ),
+                is_bookmarked=u.id in bookmarked,
             )
             for u in users
         ],
@@ -194,7 +242,7 @@ async def list_featured_advisors(
 @router.get("/slug/{slug}", response_model=ResponseEnvelope[AdvisorProfilePublicRead])
 async def get_advisor_by_slug(
     slug: str,
-    _principal: CurrentPrincipal,
+    principal: CurrentPrincipal,
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorProfilePublicRead]:
@@ -212,8 +260,18 @@ async def get_advisor_by_slug(
         or user.verification_status != VerificationStatus.approved
     ):
         raise NotFoundError("Advisor not found")
+    destination, match_visa = await _seeker_match_context(session, principal)
+    avg, _count = await review_service.rating_summary(session, user.id)
+    bookmarked = await _bookmarked_ids(session, principal, [user.id])
     return ResponseEnvelope[AdvisorProfilePublicRead](
-        data=advisor_profile_service.build_public_read(user, profile),
+        data=advisor_profile_service.build_public_read(
+            user,
+            profile,
+            match_percentage=advisor_matching_service.match_percentage(
+                profile, destination, match_visa, avg
+            ),
+            is_bookmarked=user.id in bookmarked,
+        ),
         meta=Meta(request_id=request_id),
     )
 
@@ -221,7 +279,7 @@ async def get_advisor_by_slug(
 @router.get("/{advisor_id}", response_model=ResponseEnvelope[AdvisorProfilePublicRead])
 async def get_advisor_public_profile(
     advisor_id: uuid.UUID,
-    _principal: CurrentPrincipal,
+    principal: CurrentPrincipal,
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorProfilePublicRead]:
@@ -232,8 +290,18 @@ async def get_advisor_public_profile(
         select(AdvisorProfile).where(AdvisorProfile.user_id == advisor_id)
     )
     profile = result.scalar_one_or_none()
+    destination, match_visa = await _seeker_match_context(session, principal)
+    avg, _count = await review_service.rating_summary(session, user.id)
+    bookmarked = await _bookmarked_ids(session, principal, [user.id])
     return ResponseEnvelope[AdvisorProfilePublicRead](
-        data=advisor_profile_service.build_public_read(user, profile),
+        data=advisor_profile_service.build_public_read(
+            user,
+            profile,
+            match_percentage=advisor_matching_service.match_percentage(
+                profile, destination, match_visa, avg
+            ),
+            is_bookmarked=user.id in bookmarked,
+        ),
         meta=Meta(request_id=request_id),
     )
 
@@ -330,6 +398,32 @@ async def complete_advisor_onboarding(
             **profile_data.model_dump(),
             verification_status=current_user.verification_status,
             onboarding_status=onboarding_status,
+        ),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.post(
+    "/me/verification/resubmit",
+    response_model=ResponseEnvelope[AdvisorVerificationResubmitRead],
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def resubmit_advisor_verification(
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[AdvisorVerificationResubmitRead]:
+    """Rejected advisor resubmits their account for admin review.
+
+    Sets ``verification_status`` back to ``under_review``. Login credentials
+    stay valid. Upload updated documents via ``POST /advisors/me/credentials``
+    (or re-run ``POST /advisors/me/onboarding``) so the admin verification
+    queue picks them up again.
+    """
+    user = await advisor_profile_service.resubmit_verification(session, current_user)
+    return ResponseEnvelope[AdvisorVerificationResubmitRead](
+        data=AdvisorVerificationResubmitRead(
+            verification_status=user.verification_status or VerificationStatus.under_review,
         ),
         meta=Meta(request_id=request_id),
     )
@@ -510,6 +604,7 @@ async def _build_lead_read(session: SessionDep, lead: AdvisorLead) -> AdvisorLea
         assessment_id=lead.assessment_id,
         destination_country=assessment.destination_country if assessment else "",
         visa_type=assessment.visa_type if assessment else "",
+        visa_type_name=visa_type_name(assessment.visa_type) if assessment else None,
         match_score=lead.match_score,
         match_reasons=lead.match_reasons,
         status=lead.status,

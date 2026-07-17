@@ -7,22 +7,37 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exceptions import AppError, PermissionDeniedError
+from app.core.visa_types import parse_visa_type
+from app.models.advisor_credential import AdvisorCredential, DocumentType
 from app.models.advisor_profile import (
     AdvisorCountryExpertise,
     AdvisorLanguage,
+    AdvisorOfferedService,
     AdvisorProfile,
     AdvisorService,
     AdvisorVisaSpecialization,
 )
-from app.models.user import User
+from app.models.user import User, UserRole, VerificationStatus
+from app.models.visa_type import VisaType
 from app.schemas.advisor_profile import (
     AdvisorListingCard,
+    AdvisorOnboardingStatusRead,
     AdvisorProfilePublicRead,
     AdvisorProfileRead,
     AdvisorProfileUpdate,
     LanguageEntry,
     ServiceOffering,
 )
+
+
+def _visa_specializations(profile: AdvisorProfile) -> list[VisaType]:
+    out: list[VisaType] = []
+    for row in profile.visa_specializations or []:
+        parsed = parse_visa_type(row.specialization)
+        if parsed is not None:
+            out.append(parsed)
+    return out
 
 
 async def get_by_user_id(session: AsyncSession, user_id: uuid.UUID) -> AdvisorProfile | None:
@@ -58,6 +73,13 @@ async def update(
         codes = fields.pop("country_expertise") or []
         profile.country_expertise = [
             AdvisorCountryExpertise(profile_id=profile.id, country_code=c) for c in codes
+        ]
+
+    if "offered_services" in fields:
+        fields.pop("offered_services")
+        profile.offered_services = [
+            AdvisorOfferedService(profile_id=profile.id, service_type=str(s))
+            for s in (data.offered_services or [])
         ]
 
     if "languages" in fields:
@@ -98,10 +120,13 @@ def _build_common(profile: AdvisorProfile) -> dict[str, object]:
         "title": profile.title,
         "bio": profile.bio,
         "profile_photo_url": profile.profile_photo_url,
+        "country_of_residence": profile.country_of_residence,
+        "expertise_description": profile.expertise_description,
         "years_of_experience": profile.years_of_experience,
         "successful_applications": profile.successful_applications,
         "successful_application_rate": profile.successful_application_rate,
-        "visa_specializations": [s.specialization for s in (profile.visa_specializations or [])],
+        "offered_services": [s.service_type for s in (profile.offered_services or [])],
+        "visa_specializations": _visa_specializations(profile),
         "country_expertise": [c.country_code for c in (profile.country_expertise or [])],
         "languages": [
             LanguageEntry(language=lang.language, proficiency=lang.proficiency)
@@ -134,15 +159,19 @@ def build_listing_card(
     user: User,
     profile: AdvisorProfile | None,
     rating: tuple[float, int] | None = None,
+    match_percentage: int | None = None,
+    is_bookmarked: bool = False,
 ) -> AdvisorListingCard:
     average_rating, review_count = rating if rating else (None, 0)
     if profile is None:
         return AdvisorListingCard(
             user_id=user.id,
             full_name=user.full_name,
+            email=user.email,
             title=None,
             profile_photo_url=None,
             years_of_experience=None,
+            offered_services=[],
             visa_specializations=[],
             country_expertise=[],
             languages=[],
@@ -151,15 +180,19 @@ def build_listing_card(
             review_count=review_count,
             is_featured=False,
             public_profile_slug=None,
+            match_percentage=match_percentage,
+            is_bookmarked=is_bookmarked,
         )
     prices = [s.price_usd for s in (profile.services or [])]
     return AdvisorListingCard(
         user_id=user.id,
         full_name=user.full_name,
+        email=user.email,
         title=profile.title,
         profile_photo_url=profile.profile_photo_url,
         years_of_experience=profile.years_of_experience,
-        visa_specializations=[s.specialization for s in (profile.visa_specializations or [])],
+        offered_services=[s.service_type for s in (profile.offered_services or [])],
+        visa_specializations=_visa_specializations(profile),
         country_expertise=[c.country_code for c in (profile.country_expertise or [])],
         languages=[lang.language for lang in (profile.languages or [])],
         starting_price_usd=min(prices) if prices else None,
@@ -167,14 +200,23 @@ def build_listing_card(
         review_count=review_count,
         is_featured=profile.is_featured,
         public_profile_slug=profile.public_profile_slug,
+        match_percentage=match_percentage,
+        is_bookmarked=is_bookmarked,
     )
 
 
-def build_public_read(user: User, profile: AdvisorProfile | None) -> AdvisorProfilePublicRead:
+def build_public_read(
+    user: User,
+    profile: AdvisorProfile | None,
+    match_percentage: int | None = None,
+    is_bookmarked: bool = False,
+) -> AdvisorProfilePublicRead:
     if profile is not None:
         return AdvisorProfilePublicRead(
             user_id=user.id,
             full_name=user.full_name,
+            match_percentage=match_percentage,
+            is_bookmarked=is_bookmarked,
             **_build_common(profile),
         )
     return AdvisorProfilePublicRead(
@@ -183,13 +225,89 @@ def build_public_read(user: User, profile: AdvisorProfile | None) -> AdvisorProf
         title=None,
         bio=None,
         profile_photo_url=None,
+        country_of_residence=None,
+        expertise_description=None,
         years_of_experience=None,
         successful_applications=None,
         successful_application_rate=None,
+        offered_services=[],
         visa_specializations=[],
         country_expertise=[],
         languages=[],
         services=[],
         is_featured=False,
         public_profile_slug=None,
+        match_percentage=match_percentage,
+        is_bookmarked=is_bookmarked,
     )
+
+
+async def build_onboarding_status(
+    session: AsyncSession,
+    user: User,
+    profile: AdvisorProfile,
+) -> AdvisorOnboardingStatusRead:
+    """Checklist for the Approval Pending / Status Tracking screen."""
+    result = await session.execute(
+        select(AdvisorCredential).where(
+            AdvisorCredential.user_id == user.id,
+            AdvisorCredential.is_archived.is_(False),
+        )
+    )
+    credentials = list(result.scalars().all())
+    doc_types = {c.document_type for c in credentials}
+    # Treat legacy immigration_license as license for the checklist.
+    has_license = DocumentType.license in doc_types or DocumentType.immigration_license in doc_types
+
+    profile_completed = bool(
+        (profile.bio and profile.bio.strip()) or profile.years_of_experience is not None
+    )
+    area_of_expertise_completed = bool(profile.visa_specializations) or bool(
+        profile.expertise_description and profile.expertise_description.strip()
+    )
+
+    return AdvisorOnboardingStatusRead(
+        verification_status=user.verification_status,
+        area_of_expertise_completed=area_of_expertise_completed,
+        profile_completed=profile_completed,
+        government_id_uploaded=DocumentType.government_id in doc_types,
+        license_uploaded=has_license,
+        certification_uploaded=DocumentType.certification in doc_types,
+    )
+
+
+async def mark_under_review(session: AsyncSession, user: User) -> User:
+    """Move advisor to ``under_review`` after onboarding submit or resubmit.
+
+    Allowed from ``pending`` (first submit) or ``rejected`` (re-application).
+    Keeps login credentials valid.
+    """
+    if user.verification_status in (
+        None,
+        VerificationStatus.pending,
+        VerificationStatus.rejected,
+    ):
+        user.verification_status = VerificationStatus.under_review
+        user.is_active = True
+        user.updated_by = user.id
+        session.add(user)
+        await session.flush()
+        await session.refresh(user)
+    return user
+
+
+async def resubmit_verification(session: AsyncSession, user: User) -> User:
+    """Rejected advisor re-applies for account review → ``under_review``.
+
+    Does not change password or revoke tokens. Advisor should upload any
+    updated credentials via ``POST /advisors/me/credentials`` (or re-run
+    onboarding) so they reappear on the admin verification queue.
+    """
+    if user.role != UserRole.advisor:
+        raise PermissionDeniedError("Advisor account required")
+    if user.verification_status != VerificationStatus.rejected:
+        raise AppError(
+            "Only a rejected application can be resubmitted",
+            code="invalid_verification_state",
+        )
+    return await mark_under_review(session, user)

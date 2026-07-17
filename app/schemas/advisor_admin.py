@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from app.models.user import VerificationStatus
 from app.schemas.advisor_profile import LanguageEntry
+from app.schemas.booking import BookingRead
 
 
 class AdvisorStatus(StrEnum):
@@ -62,6 +63,30 @@ class AdvisorManagementDetailRead(AdvisorManagementListRead):
     credentials_verified_count: int
 
 
+class AdvisorSessionRead(BookingRead):
+    """Session History tab row — BookingRead plus seeker country + consultation count."""
+
+    country_code: str | None  # seeker country_of_residence ISO-3166 alpha-2
+    country_name: str | None  # display name (e.g. "United Kingdom")
+    consultation_count: int  # total bookings between this seeker and this advisor
+
+
+class AdvisorEarningRowRead(BaseModel):
+    """One row for the advisor Earnings tab table."""
+
+    appointment_id: str
+    booking_id: uuid.UUID
+    seeker_name: str | None
+    seeker_email: str | None
+    seeker_photo_url: str | None
+    created_at: datetime
+    amount_paid: float
+    platform_fee: float
+    advisor_earnings: float
+    # Mirrors payment_service.display_status (paid/pending/refunded/failed).
+    status: Literal["pending", "paid", "refunded", "failed"]
+
+
 class AdvisorEarningsSummaryRead(BaseModel):
     total_earned_usd: float
     total_commission_paid_usd: float
@@ -69,12 +94,17 @@ class AdvisorEarningsSummaryRead(BaseModel):
     total_payouts_usd: float
     pending_payout_usd: float
     transaction_count: int
+    items: list[AdvisorEarningRowRead]
 
 
 class VerificationQueueRead(BaseModel):
-    """One row per advisor with >=1 pending AdvisorCredential. No status field —
-    the list query's own membership filter means every row is pending by
-    construction; a fully-resolved advisor simply drops off the list."""
+    """One row per advisor with >=1 pending AdvisorCredential.
+
+    ``status`` is always ``pending`` for members of this list (fully resolved
+    advisors drop off). ``ai_score`` / ``verification_result`` are a package-
+    completeness heuristic over the three required onboarding document types
+    (government_id, license, certification) — not a separate ML model.
+    """
 
     advisor_id: uuid.UUID
     full_name: str | None
@@ -83,6 +113,9 @@ class VerificationQueueRead(BaseModel):
     pending_document_count: int
     earliest_submitted_at: datetime
     latest_submitted_at: datetime
+    ai_score: float  # 0–100, % of required document types uploaded
+    verification_result: Literal["all_passed", "needs_review"]
+    status: Literal["pending", "verified", "rejected"]
 
 
 class BulkCredentialReview(BaseModel):

@@ -3,12 +3,25 @@
 from __future__ import annotations
 
 import uuid
+from enum import StrEnum
 
 from sqlalchemy import Float, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 from app.db.base_model import BaseModel
+
+
+class AdvisorServiceType(StrEnum):
+    """Service categories from the Global Jump advisor onboarding wizard."""
+
+    household_goods_transport = "household_goods_transport"
+    pet_transport = "pet_transport"
+    recruiter = "recruiter"
+    career_coach = "career_coach"
+    immigration_specialist = "immigration_specialist"
+    resume_writer = "resume_writer"
+    realtor = "realtor"
 
 
 class AdvisorVisaSpecialization(Base):
@@ -26,7 +39,7 @@ class AdvisorVisaSpecialization(Base):
 
 
 class AdvisorCountryExpertise(Base):
-    """One row per country an advisor has expertise in."""
+    """One row per country an advisor serves / has expertise in."""
 
     __tablename__ = "advisor_country_expertise"
 
@@ -54,8 +67,22 @@ class AdvisorLanguage(Base):
     proficiency: Mapped[str] = mapped_column(String(20), nullable=False)
 
 
+class AdvisorOfferedService(Base):
+    """One row per service category selected during advisor onboarding."""
+
+    __tablename__ = "advisor_offered_services"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("advisor_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    service_type: Mapped[str] = mapped_column(String(50), nullable=False)
+
+
 class AdvisorService(Base):
-    """One row per service offering an advisor provides."""
+    """One row per bookable service offering (duration + price) an advisor provides."""
 
     __tablename__ = "advisor_services"
 
@@ -85,10 +112,14 @@ class AdvisorProfile(BaseModel):
     bio: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     profile_photo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
+    # Onboarding location + free-text expertise description
+    country_of_residence: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    expertise_description: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+
     # Expertise
     years_of_experience: Mapped[int | None] = mapped_column(nullable=True)
     successful_applications: Mapped[int | None] = mapped_column(nullable=True)
-    # Self-reported career success rate (0–100).
+    # Self-reported career success rate (0–100). Independent of the count above.
     successful_application_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Normalised into child tables
@@ -100,6 +131,9 @@ class AdvisorProfile(BaseModel):
     )
     languages: Mapped[list[AdvisorLanguage]] = relationship(
         "AdvisorLanguage", cascade="all, delete-orphan", lazy="selectin"
+    )
+    offered_services: Mapped[list[AdvisorOfferedService]] = relationship(
+        "AdvisorOfferedService", cascade="all, delete-orphan", lazy="selectin"
     )
     services: Mapped[list[AdvisorService]] = relationship(
         "AdvisorService", cascade="all, delete-orphan", lazy="selectin"

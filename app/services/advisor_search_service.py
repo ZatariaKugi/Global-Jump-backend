@@ -19,6 +19,7 @@ from app.models.advisor_profile import (
 )
 from app.models.review import ModerationStatus, Review
 from app.models.user import User, UserRole, VerificationStatus
+from app.models.visa_type import VisaType
 
 SortOption = Literal["newest", "price_asc", "price_desc", "experience", "rating", "review_count"]
 
@@ -27,12 +28,13 @@ SortOption = Literal["newest", "price_asc", "price_desc", "experience", "rating"
 class AdvisorSearchFilters:
     q: str | None = None
     country: str | None = None
-    visa_type: str | None = None
+    visa_type: VisaType | None = None
     language: str | None = None
     min_price: float | None = None
     max_price: float | None = None
     min_rating: float | None = None
     featured_only: bool = False
+    recommended: bool = False
     sort: SortOption = "newest"
 
 
@@ -111,7 +113,7 @@ def build_search_stmt(filters: AdvisorSearchFilters) -> Select[tuple[User]]:
         stmt = stmt.where(
             exists().where(
                 AdvisorVisaSpecialization.profile_id == AdvisorProfile.id,
-                func.lower(AdvisorVisaSpecialization.specialization) == filters.visa_type.lower(),
+                func.lower(AdvisorVisaSpecialization.specialization) == filters.visa_type.value,
             )
         )
 
@@ -137,20 +139,38 @@ def build_search_stmt(filters: AdvisorSearchFilters) -> Select[tuple[User]]:
     if filters.featured_only:
         stmt = stmt.where(AdvisorProfile.is_featured.is_(True))
 
-    if filters.sort == "price_asc":
-        stmt = stmt.order_by(_min_price_subquery().asc().nulls_last())
-    elif filters.sort == "price_desc":
-        stmt = stmt.order_by(_min_price_subquery().desc().nulls_last())
-    elif filters.sort == "experience":
-        stmt = stmt.order_by(AdvisorProfile.years_of_experience.desc().nulls_last())
-    elif filters.sort == "rating":
-        stmt = stmt.order_by(_avg_rating_subquery().desc().nulls_last())
-    elif filters.sort == "review_count":
-        stmt = stmt.order_by(_review_count_subquery().desc())
-    else:  # newest
-        stmt = stmt.order_by(User.created_at.desc())
+    return stmt.order_by(*advisor_order_by(sort=filters.sort, recommended=filters.recommended))
 
-    return stmt
+
+def advisor_order_by(
+    *,
+    sort: SortOption = "newest",
+    recommended: bool = False,
+) -> list[Any]:
+    """Shared sort clauses for advisor discovery and bookmarked-advisor lists.
+
+    Requires ``User`` and ``AdvisorProfile`` to be in the FROM/JOIN clause
+    (``AdvisorProfile`` may be OUTER JOIN'd).
+    """
+    order_by: list[Any] = []
+    if recommended:
+        # AI-suggested / featured advisors float to the top; secondary sort still applies.
+        order_by.append(func.coalesce(AdvisorProfile.is_featured, False).desc())
+
+    if sort == "price_asc":
+        order_by.append(_min_price_subquery().asc().nulls_last())
+    elif sort == "price_desc":
+        order_by.append(_min_price_subquery().desc().nulls_last())
+    elif sort == "experience":
+        order_by.append(AdvisorProfile.years_of_experience.desc().nulls_last())
+    elif sort == "rating":
+        order_by.append(_avg_rating_subquery().desc().nulls_last())
+    elif sort == "review_count":
+        order_by.append(_review_count_subquery().desc())
+    else:  # newest
+        order_by.append(User.created_at.desc())
+
+    return order_by
 
 
 # ── Public profile slug ──────────────────────────────────────────────────────

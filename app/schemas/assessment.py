@@ -5,8 +5,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
+from app.core.visa_types import OptionalVisaType, RequiredVisaType
 from app.models.assessment import AssessmentStatus, EligibilityTier, QuestionCategory
 
 # ── Questionnaire ────────────────────────────────────────────────────────────
@@ -43,12 +44,20 @@ class QuestionCreate(BaseModel):
     description: str | None = Field(default=None, max_length=1000)
     category: QuestionCategory
     country_code: str | None = Field(default=None, min_length=2, max_length=2)
-    visa_type: str | None = Field(default=None, max_length=50)
+    visa_type: OptionalVisaType = None
     weight: float = Field(default=1.0, gt=0, le=10)
+    # UI "Weightage %" (0–100) — preferred; converts to ``weight`` = pct / 10.
+    weightage_pct: float | None = Field(default=None, ge=0, le=100)
     display_order: int = 0
     is_active: bool = True
     depends_on_option_id: uuid.UUID | None = None
     options: list[QuestionOptionInput] = Field(min_length=2)
+
+    @model_validator(mode="after")
+    def _apply_weightage_pct(self) -> QuestionCreate:
+        if self.weightage_pct is not None:
+            self.weight = max(0.1, round(self.weightage_pct / 10.0, 2))
+        return self
 
 
 class QuestionUpdate(BaseModel):
@@ -56,12 +65,19 @@ class QuestionUpdate(BaseModel):
     description: str | None = Field(default=None, max_length=1000)
     category: QuestionCategory | None = None
     country_code: str | None = Field(default=None, min_length=2, max_length=2)
-    visa_type: str | None = Field(default=None, max_length=50)
+    visa_type: OptionalVisaType = None
     weight: float | None = Field(default=None, gt=0, le=10)
+    weightage_pct: float | None = Field(default=None, ge=0, le=100)
     display_order: int | None = None
     is_active: bool | None = None
     depends_on_option_id: uuid.UUID | None = None
     options: list[QuestionOptionInput] | None = None
+
+    @model_validator(mode="after")
+    def _apply_weightage_pct(self) -> QuestionUpdate:
+        if self.weightage_pct is not None:
+            self.weight = max(0.1, round(self.weightage_pct / 10.0, 2))
+        return self
 
 
 class QuestionOptionAdminRead(BaseModel):
@@ -78,8 +94,9 @@ class QuestionAdminRead(BaseModel):
     description: str | None
     category: QuestionCategory
     country_code: str | None
-    visa_type: str | None
+    visa_type: OptionalVisaType
     weight: float
+    weightage_pct: float
     display_order: int
     is_active: bool
     depends_on_option_id: uuid.UUID | None
@@ -91,7 +108,7 @@ class QuestionAdminRead(BaseModel):
 
 class AssessmentCreate(BaseModel):
     destination_country: str = Field(min_length=2, max_length=2)
-    visa_type: str = Field(min_length=1, max_length=50)
+    visa_type: RequiredVisaType
 
 
 class AnswerInput(BaseModel):
@@ -101,6 +118,8 @@ class AnswerInput(BaseModel):
 
 class AnswersSubmit(BaseModel):
     answers: list[AnswerInput] = Field(min_length=1)
+    # False = save progress only (enables drop-off-by-question analytics).
+    complete: bool = True
 
 
 class CategoryScoreRead(BaseModel):
@@ -121,7 +140,7 @@ class AdvisorMatchRead(BaseModel):
 class AssessmentRead(BaseModel):
     id: uuid.UUID
     destination_country: str
-    visa_type: str
+    visa_type: RequiredVisaType
     status: AssessmentStatus
     score: float | None
     tier: EligibilityTier | None
@@ -142,7 +161,7 @@ class AssessmentSummaryRead(BaseModel):
 
     id: uuid.UUID
     destination_country: str
-    visa_type: str
+    visa_type: RequiredVisaType
     status: AssessmentStatus
     score: float | None
     tier: EligibilityTier | None
@@ -158,6 +177,12 @@ class AssessmentVolumePoint(BaseModel):
     count: int
 
 
+class AssessmentDropOffPoint(BaseModel):
+    question_id: uuid.UUID | None
+    label: str
+    count: int
+
+
 class AssessmentAnalyticsRead(BaseModel):
     window_days: int
     total_started: int
@@ -165,8 +190,6 @@ class AssessmentAnalyticsRead(BaseModel):
     volume: list[AssessmentVolumePoint]
     pass_rate: float
     fail_rate: float
-    # Assessments started but never completed, within the window — a coarse
-    # proxy for "drop off": there's no incremental per-question save today, so
-    # this can't say *which* question someone abandoned on, only that they did.
     drop_off_count: int
     drop_off_rate: float
+    drop_off_points: list[AssessmentDropOffPoint]

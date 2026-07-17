@@ -18,6 +18,7 @@ async def create(
     rule = EligibilityRule(
         name=data.name,
         description=data.description,
+        category=data.category,
         country_code=data.country_code.upper() if data.country_code else None,
         visa_type=data.visa_type.lower() if data.visa_type else None,
         points=data.points,

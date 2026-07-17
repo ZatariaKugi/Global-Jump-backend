@@ -22,7 +22,7 @@ from app.core.security import (
     hash_token,
 )
 from app.models.token import RefreshToken, TokenPurpose, UserToken
-from app.models.user import User
+from app.models.user import User, UserRole, VerificationStatus
 
 # ---------------------------------------------------------------------------
 # Refresh-token pair
@@ -67,7 +67,20 @@ async def rotate_refresh_token(
     session.add(record)
 
     user = await session.get(User, record.user_id)
-    if user is None or not user.is_active:
+    if user is None:
+        raise AuthenticationError("User not found or inactive")
+    if user.role == UserRole.advisor and user.verification_status == VerificationStatus.rejected:
+        raise AuthenticationError(
+            "Your account was rejected by an admin. Please contact support."
+        )
+    if not user.is_active and not (
+        user.role == UserRole.advisor
+        and user.verification_status
+        in (
+            VerificationStatus.pending,
+            VerificationStatus.under_review,
+        )
+    ):
         raise AuthenticationError("User not found or inactive")
 
     access_token, raw_refresh = await create_token_pair(session, user, settings)

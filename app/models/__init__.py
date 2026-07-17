@@ -9,11 +9,14 @@ from app.models.advisor_availability import (
     AdvisorAvailabilityOverride,
     AdvisorWeeklySlot,
 )
+from app.models.advisor_bookmark import AdvisorBookmark
 from app.models.advisor_credential import AdvisorCredential
 from app.models.advisor_lead import AdvisorLead
+from app.models.advisor_matching_weights import AdvisorMatchingWeights
 from app.models.advisor_profile import (
     AdvisorCountryExpertise,
     AdvisorLanguage,
+    AdvisorOfferedService,
     AdvisorProfile,
     AdvisorService,
     AdvisorVisaSpecialization,
@@ -27,6 +30,7 @@ from app.models.assessment import (
     AssessmentQuestionOption,
     AssessmentTip,
 )
+from app.models.assessment_ab_variant import AssessmentAbVariant
 from app.models.assessment_threshold import AssessmentThreshold
 from app.models.booking import Booking
 from app.models.booking_document_request import BookingDocumentRequest
@@ -48,9 +52,11 @@ from app.models.token import RefreshToken, UserToken
 from app.models.transaction import Transaction
 from app.models.transaction_event import TransactionEvent
 from app.models.user import User
+from app.models.visa_type import VisaType
 
 __all__ = [
     "User",
+    "VisaType",
     "ActivityLog",
     "RefreshToken",
     "UserToken",
@@ -61,9 +67,12 @@ __all__ = [
     "AdvisorVisaSpecialization",
     "AdvisorCountryExpertise",
     "AdvisorLanguage",
+    "AdvisorOfferedService",
     "AdvisorService",
     "AdvisorCredential",
+    "AdvisorBookmark",
     "AdvisorLead",
+    "AdvisorMatchingWeights",
     "Assessment",
     "AssessmentAnswer",
     "AssessmentCategoryScore",
@@ -71,6 +80,7 @@ __all__ = [
     "AssessmentQuestion",
     "AssessmentQuestionOption",
     "AssessmentTip",
+    "AssessmentAbVariant",
     "AssessmentThreshold",
     "AdvisorWeeklySlot",
     "AdvisorAvailabilityOverride",

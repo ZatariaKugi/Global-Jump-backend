@@ -51,6 +51,24 @@ def _deliverability_headers(settings: Settings, *, reply_to: str | None = None) 
     return headers
 
 
+def _build_message(**kwargs: object) -> MessageSchema | None:
+    """Build a MessageSchema, or ``None`` when the recipient fails email validation.
+
+    Reserved TLDs used in seed data (e.g. ``*.test``) raise pydantic
+    ``ValidationError`` on ``recipients`` — callers must treat that as a
+    soft skip so account mutations never 500 on mail construction.
+    """
+    try:
+        return MessageSchema(**kwargs)
+    except ValidationError as exc:
+        logger.warning(
+            "email_skipped_invalid_recipient",
+            recipients=kwargs.get("recipients"),
+            error=str(exc),
+        )
+        return None
+
+
 def _make_connection(settings: Settings) -> ConnectionConfig:
     return ConnectionConfig(
         MAIL_USERNAME=settings.SMTP_USER or "",
@@ -93,7 +111,7 @@ async def send_verification_email(
     html_body = _render("verify_email.html", ctx)
     text_body = _render("verify_email.txt", ctx)
 
-    message = MessageSchema(
+    message = _build_message(
         subject=f"Verify your email address – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
         body=html_body,
@@ -107,6 +125,8 @@ async def send_verification_email(
             **_deliverability_headers(settings),
         },
     )
+    if message is None:
+        return
 
     try:
         fm = FastMail(_make_connection(settings))
@@ -143,7 +163,7 @@ async def send_advisor_welcome_email(
         )
         return
 
-    message = MessageSchema(
+    message = _build_message(
         subject=f"Welcome to {settings.EMAILS_FROM_NAME} — you're approved!",
         recipients=[to],
         body=_render("advisor_welcome.html", ctx),
@@ -156,6 +176,8 @@ async def send_advisor_welcome_email(
             **_deliverability_headers(settings),
         },
     )
+    if message is None:
+        return
 
     try:
         fm = FastMail(_make_connection(settings))
@@ -195,7 +217,7 @@ async def send_advisor_rejected_email(
         )
         return
 
-    message = MessageSchema(
+    message = _build_message(
         subject=f"Your {settings.EMAILS_FROM_NAME} advisor application",
         recipients=[to],
         body=_render("advisor_rejected.html", ctx),
@@ -208,6 +230,8 @@ async def send_advisor_rejected_email(
             **_deliverability_headers(settings),
         },
     )
+    if message is None:
+        return
 
     try:
         fm = FastMail(_make_connection(settings))
@@ -243,7 +267,7 @@ async def send_advisor_pending_email(
         )
         return
 
-    message = MessageSchema(
+    message = _build_message(
         subject=f"Your {settings.EMAILS_FROM_NAME} application is pending review",
         recipients=[to],
         body=_render("advisor_pending.html", ctx),
@@ -256,6 +280,8 @@ async def send_advisor_pending_email(
             **_deliverability_headers(settings),
         },
     )
+    if message is None:
+        return
 
     try:
         fm = FastMail(_make_connection(settings))
@@ -296,7 +322,7 @@ async def send_password_reset_email(
     html_body = _render("reset_password.html", ctx)
     text_body = _render("reset_password.txt", ctx)
 
-    message = MessageSchema(
+    message = _build_message(
         subject=f"Reset your {settings.EMAILS_FROM_NAME} password",
         recipients=[to],
         body=html_body,
@@ -309,6 +335,8 @@ async def send_password_reset_email(
             **_deliverability_headers(settings),
         },
     )
+    if message is None:
+        return
 
     try:
         fm = FastMail(_make_connection(settings))
@@ -351,27 +379,19 @@ async def send_payment_receipt_email(
         )
         return
 
-    try:
-        message = MessageSchema(
-            subject=f"Payment receipt – {settings.EMAILS_FROM_NAME}",
-            recipients=[to],
-            body=_render("payment_receipt.html", ctx),
-            subtype=MessageType.html,
-            alternative_body=_render("payment_receipt.txt", ctx),
-            headers={
-                "X-Priority": "3",
-                "X-Mailer": settings.EMAILS_FROM_NAME,
-                **_deliverability_headers(settings),
-            },
-        )
-    except ValidationError as exc:
-        # Reserved TLDs (e.g. .test seed data) fail pydantic email validation.
-        logger.warning(
-            "payment_receipt_failed_invalid_recipient",
-            to=to,
-            invoice_number=invoice_number,
-            error=str(exc),
-        )
+    message = _build_message(
+        subject=f"Payment receipt – {settings.EMAILS_FROM_NAME}",
+        recipients=[to],
+        body=_render("payment_receipt.html", ctx),
+        subtype=MessageType.html,
+        alternative_body=_render("payment_receipt.txt", ctx),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
         return
 
     try:
@@ -466,7 +486,7 @@ async def send_booking_confirmation_email(
         headers=Headers({"content-type": "text/calendar"}),
     )
 
-    message = MessageSchema(
+    message = _build_message(
         subject=f"Booking confirmed – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
         body=_render("booking_confirmation.html", ctx),
@@ -488,6 +508,8 @@ async def send_booking_confirmation_email(
             **_deliverability_headers(settings),
         },
     )
+    if message is None:
+        return
 
     try:
         fm = FastMail(_make_connection(settings))
@@ -530,7 +552,7 @@ async def send_new_consultation_request_email(
         )
         return
 
-    message = MessageSchema(
+    message = _build_message(
         subject=f"New consultation request – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
         body=_render("new_consultation_request.html", ctx),
@@ -542,6 +564,8 @@ async def send_new_consultation_request_email(
             **_deliverability_headers(settings),
         },
     )
+    if message is None:
+        return
 
     try:
         fm = FastMail(_make_connection(settings))
@@ -586,7 +610,7 @@ async def send_booking_rejected_email(
         )
         return
 
-    message = MessageSchema(
+    message = _build_message(
         subject=f"Consultation request declined – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
         body=_render("booking_rejected.html", ctx),
@@ -598,6 +622,8 @@ async def send_booking_rejected_email(
             **_deliverability_headers(settings),
         },
     )
+    if message is None:
+        return
 
     try:
         fm = FastMail(_make_connection(settings))

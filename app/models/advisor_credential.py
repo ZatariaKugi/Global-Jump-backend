@@ -15,10 +15,11 @@ from app.db.base_model import BaseModel
 
 
 class DocumentType(StrEnum):
-    immigration_license = "immigration_license"
-    bar_membership = "bar_membership"
-    certification = "certification"
     government_id = "government_id"
+    license = "license"
+    certification = "certification"
+    immigration_license = "immigration_license"  # legacy alias; prefer ``license``
+    bar_membership = "bar_membership"
     other = "other"
 
 

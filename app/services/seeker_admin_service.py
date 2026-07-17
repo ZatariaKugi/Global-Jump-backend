@@ -14,51 +14,34 @@ from app.core.config import Settings
 from app.core.countries import country_name
 from app.core.exceptions import ConflictError, NotFoundError
 from app.core.security import hash_password
+from app.core.visa_types import parse_visa_type, visa_type_name
 from app.models.assessment import Assessment
 from app.models.booking import Booking
 from app.models.seeker_profile import SeekerProfile
 from app.models.user import User, UserRole
+from app.models.visa_type import VisaType
 from app.schemas.seeker_admin import SeekerCreate, SeekerDetailRead, SeekerListRead
 from app.schemas.user_admin import AccountStatus
 from app.services import auth_service, seeker_profile_service, user_admin_service, user_service
 from app.services.email_service import send_password_reset_email
-
-# Maps the frontend's human-readable visa_type filter options to the raw
-# keyword seekers actually type into intended_visa_type during onboarding.
-_VISA_TYPE_FILTER_MAP: dict[str, str] = {
-    "study visa": "study",
-    "work visa": "work",
-    "tourist visa": "tourist",
-    "permanent residency": "permanent_residency",
-    "family sponsorship": "family",
-}
-
-
-def _normalize_visa_type(value: str) -> str:
-    normalized = value.strip().casefold()
-    return _VISA_TYPE_FILTER_MAP.get(normalized, normalized)
 
 
 def list_seekers_stmt(
     search: str | None,
     status: AccountStatus | None,
     study_visa: str | None,
-    visa_type: str | None = None,
+    visa_type: VisaType | None = None,
 ) -> Select[tuple[User]]:
-    """Same filter shape as user_admin_service.list_users_stmt, scoped to
-    seekers. study_visa/visa_type need a join since intended_visa_type lives
-    on SeekerProfile. visa_type additionally accepts the frontend's
-    human-readable filter labels (e.g. "Study Visa") via _normalize_visa_type;
-    study_visa remains an exact-match alias for backward compatibility."""
+    """Same filter shape as user_admin_service.list_users_stmt, scoped to seekers.
+
+    ``visa_type`` is the PRD enum. ``study_visa`` remains a legacy alias that
+    resolves via ``parse_visa_type`` (e.g. ``study`` → ``student``).
+    """
     stmt = select(User).where(User.role == UserRole.seeker).order_by(User.created_at.desc())
-    if study_visa:
+    effective = visa_type or parse_visa_type(study_visa)
+    if effective is not None:
         stmt = stmt.join(SeekerProfile, SeekerProfile.user_id == User.id).where(
-            SeekerProfile.intended_visa_type == study_visa
-        )
-    elif visa_type:
-        keyword = _normalize_visa_type(visa_type)
-        stmt = stmt.join(SeekerProfile, SeekerProfile.user_id == User.id).where(
-            func.lower(SeekerProfile.intended_visa_type) == keyword
+            func.lower(SeekerProfile.intended_visa_type) == effective.value
         )
     if search:
         pattern = f"%{search.strip()}%"
@@ -126,6 +109,9 @@ async def build_list_read(session: AsyncSession, users: list[User]) -> list[Seek
                 country_of_residence=residence,
                 country_of_residence_name=country_name(residence),
                 intended_visa_type=profiles[u.id].intended_visa_type if u.id in profiles else None,
+                intended_visa_type_name=visa_type_name(
+                    profiles[u.id].intended_visa_type if u.id in profiles else None
+                ),
                 status=user_admin_service.compute_status(u),
                 ai_assessment_count=ai_counts.get(u.id, 0),
                 total_bookings=booking_counts.get(u.id, 0),
@@ -161,6 +147,7 @@ async def get_seeker_detail(session: AsyncSession, user_id: uuid.UUID) -> Seeker
         country_of_residence=profile.country_of_residence,
         country_of_residence_name=country_name(profile.country_of_residence),
         intended_visa_type=profile.intended_visa_type,
+        intended_visa_type_name=visa_type_name(profile.intended_visa_type),
         status=user_admin_service.compute_status(user),
         ai_assessment_count=ai_count,
         total_bookings=total_bookings,

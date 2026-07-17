@@ -8,6 +8,8 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from app.models.booking import BookingStatus, PaymentStatus
+from app.schemas.booking_document_request import DocumentRequestRead
+from app.schemas.booking_note import BookingNoteRead
 
 
 class BookingCreate(BaseModel):
@@ -56,9 +58,11 @@ class BookingInterpreterUpdate(BaseModel):
 
 class BookingRead(BaseModel):
     id: uuid.UUID
+    appointment_id: str
     seeker_id: uuid.UUID
     advisor_id: uuid.UUID
     seeker_name: str | None
+    seeker_email: str | None
     advisor_name: str | None
     service_type: str
     duration_minutes: int
@@ -69,8 +73,64 @@ class BookingRead(BaseModel):
     payment_status: PaymentStatus
     cancellation_reason: str | None
     seeker_note: str | None
+    deal_later_at: datetime | None
     is_important: bool
     interpreter_name: str | None
     interpreter_contact: str | None
     interpreter_language: str | None
     created_at: datetime
+
+
+class BookingHistoryRead(BaseModel):
+    """Consultation History screen — booking summary plus notes and document requests."""
+
+    id: uuid.UUID
+    appointment_id: str
+    seeker_id: uuid.UUID
+    advisor_id: uuid.UUID
+    seeker_name: str | None
+    seeker_email: str | None
+    advisor_name: str | None
+    service_type: str
+    scheduled_start: datetime
+    scheduled_end: datetime
+    status: BookingStatus
+    seeker_note: str | None
+    is_important: bool
+    deal_later_at: datetime | None
+    notes: list[BookingNoteRead]
+    document_requests: list[DocumentRequestRead]
+    created_at: datetime
+
+
+class BookingAttachmentRead(BaseModel):
+    id: uuid.UUID
+    title: str
+    format: str
+    size: int
+
+
+class BookingMeetingRead(BaseModel):
+    label: str
+    time_range: str
+    date: str
+
+
+class BookingAiSuggestionRead(BaseModel):
+    id: uuid.UUID
+    message: str
+
+
+class BookingDetailsRead(BaseModel):
+    """View Booking Details drawer — required + optional presentation fields."""
+
+    appointment_id: str
+    seeker_name: str | None
+    service_type: str
+    scheduled_start: datetime
+    duration_minutes: int
+    amount_paid: float
+    description: str
+    attachments: list[BookingAttachmentRead] = Field(default_factory=list)
+    meeting: BookingMeetingRead | None = None
+    ai_suggestions: list[BookingAiSuggestionRead] = Field(default_factory=list)

@@ -484,12 +484,7 @@ async def get_advisor_earnings(
     session: AsyncSession,
     advisor_user_id: uuid.UUID,
 ) -> dict[str, object]:
-    result = await session.execute(
-        select(Transaction)
-        .join(Booking, Booking.id == Transaction.booking_id)
-        .where(Booking.advisor_id == advisor_user_id)
-        .order_by(Transaction.created_at.desc())
-    )
+    result = await session.execute(list_for_advisor_stmt(advisor_user_id))
     txns = list(result.scalars().all())
 
     total_earned = sum(
@@ -509,7 +504,7 @@ async def get_advisor_earnings(
 
 
 def list_for_advisor_stmt(advisor_id: uuid.UUID) -> Select[tuple[Transaction]]:
-    """Transactions for the advisor's "Payment of customers" list."""
+    """Non-archived transactions for an advisor's bookings (earnings / payments lists)."""
     return (
         select(Transaction)
         .join(Booking, Booking.id == Transaction.booking_id)

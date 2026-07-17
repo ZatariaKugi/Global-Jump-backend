@@ -1,12 +1,14 @@
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: app_db
+    # Override if host port 5432 is already taken, e.g. POSTGRES_PUBLISH_PORT=5433
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PUBLISH_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -17,15 +19,32 @@ services:
 
   api:
     build: .
+    restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
     environment:
       ENVIRONMENT: local
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/app_db
-      JWT_SECRET: dev-secret-change-me
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      JWT_ISSUER: ${JWT_ISSUER:-globlejump}
+    # Override if host port 8000 is already taken, e.g. API_PUBLISH_PORT=8001
     ports:
-      - "8000:8000"
+      - "${API_PUBLISH_PORT:-8000}:8000"
+    volumes:
+      - api_uploads:/app/uploads
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     # Run migrations then start the server.
     command: >
       sh -c "alembic upgrade head &&
@@ -33,3 +52,4 @@ services:
 
 volumes:
   pgdata:
+  api_uploads:

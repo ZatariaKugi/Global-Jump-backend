@@ -62,7 +62,7 @@ async def list_advisor_reviews(
 ) -> ResponseEnvelope[list[ReviewRead]]:
     stmt = review_service.list_public_stmt(advisor_id)
     reviews, total = await paginate(session, stmt, params)
-    data = [await _read_with_seeker(session, r) for r in reviews]
+    data = await review_service.build_enriched_reads(session, reviews)
     return ResponseEnvelope[list[ReviewRead]](
         data=data,
         meta=page_meta(params, total, request_id),

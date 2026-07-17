@@ -6,25 +6,28 @@ from __future__ import annotations
 import uuid
 from typing import Literal, cast
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.countries import country_name
 from app.core.exceptions import NotFoundError
 from app.models.advisor_credential import AdvisorCredential, CredentialStatus
-from app.models.advisor_profile import AdvisorProfile
+from app.models.advisor_profile import AdvisorProfile, AdvisorVisaSpecialization
 from app.models.booking import Booking, BookingStatus
 from app.models.payout_request import PayoutRequest, PayoutStatus
+from app.models.seeker_profile import SeekerProfile
 from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User, UserRole, VerificationStatus
+from app.models.visa_type import VisaType
 from app.schemas.advisor_admin import (
+    AdvisorEarningRowRead,
     AdvisorEarningsSummaryRead,
     AdvisorManagementDetailRead,
     AdvisorManagementListRead,
+    AdvisorSessionRead,
     AdvisorStatus,
 )
 from app.schemas.advisor_profile import LanguageEntry
-from app.schemas.booking import BookingRead
 from app.services import (
     advisor_profile_service,
     booking_service,
@@ -48,15 +51,28 @@ def advisor_display_status(user: User) -> AdvisorStatus:
 
 
 def list_advisors_stmt(
-    search: str | None, status: VerificationStatus | None
+    search: str | None,
+    status: VerificationStatus | None,
+    visa_type: VisaType | None = None,
 ) -> Select[tuple[User]]:
-    """Same shape as seeker_admin_service.list_seekers_stmt, scoped to advisors."""
+    """Same shape as seeker_admin_service.list_seekers_stmt, scoped to advisors.
+
+    ``visa_type`` filters against ``advisor_visa_specializations`` (PRD enum only).
+    """
     stmt = select(User).where(User.role == UserRole.advisor).order_by(User.created_at.desc())
     if status is not None:
         stmt = stmt.where(User.verification_status == status)
     if search:
         pattern = f"%{search.strip()}%"
         stmt = stmt.where(or_(User.full_name.ilike(pattern), User.email.ilike(pattern)))
+    if visa_type is not None:
+        stmt = stmt.where(
+            exists().where(
+                AdvisorProfile.user_id == User.id,
+                AdvisorVisaSpecialization.profile_id == AdvisorProfile.id,
+                func.lower(AdvisorVisaSpecialization.specialization) == visa_type.value,
+            )
+        )
     return stmt
 
 
@@ -219,26 +235,60 @@ async def get_advisor_detail(
         credentials_verified_count=cred_counts.get(CredentialStatus.verified, 0),
     )
 
-async def build_session_reads(session: AsyncSession, bookings: list[Booking]) -> list[BookingRead]:
-    """Session History tab — bulk seeker-name enrichment (not N+1)."""
-    seeker_ids = [b.seeker_id for b in bookings]
+
+async def build_session_reads(
+    session: AsyncSession, bookings: list[Booking]
+) -> list[AdvisorSessionRead]:
+    """Session History tab — bulk seeker name + consultation counts (not N+1)."""
+    if not bookings:
+        return []
+
+    seeker_ids = list({b.seeker_id for b in bookings})
+    advisor_id = bookings[0].advisor_id
+
     seekers: dict[uuid.UUID, User] = {}
-    if seeker_ids:
-        rows = (await session.execute(select(User).where(User.id.in_(seeker_ids)))).scalars().all()
-        seekers = {u.id: u for u in rows}
-    return [
-        booking_service.build_read(
-            b,
-            seekers.get(b.seeker_id),
-            None,
+    rows = (await session.execute(select(User).where(User.id.in_(seeker_ids)))).scalars().all()
+    seekers = {u.id: u for u in rows}
+
+    count_rows = (
+        await session.execute(
+            select(Booking.seeker_id, func.count())
+            .where(
+                Booking.advisor_id == advisor_id,
+                Booking.seeker_id.in_(seeker_ids),
+            )
+            .group_by(Booking.seeker_id)
         )
-        for b in bookings
-    ]
+    ).all()
+    consultation_counts: dict[uuid.UUID, int] = {}
+    for seeker_id, count in count_rows:
+        consultation_counts[seeker_id] = count
+
+    # Seeded country values for Session History UI until seeker profiles are populated.
+    _SEED_COUNTRY_CODE = "GB"
+    _SEED_COUNTRY_NAME = "United Kingdom"
+
+    out: list[AdvisorSessionRead] = []
+    for b in bookings:
+        base = booking_service.build_read(b, seekers.get(b.seeker_id), None)
+        out.append(
+            AdvisorSessionRead(
+                **base.model_dump(),
+                country_code=_SEED_COUNTRY_CODE,
+                country_name=_SEED_COUNTRY_NAME,
+                consultation_count=consultation_counts.get(b.seeker_id, 0),
+            )
+        )
+    return out
 
 
 async def get_earnings_summary(
     session: AsyncSession, advisor_id: uuid.UUID
 ) -> AdvisorEarningsSummaryRead:
+    advisor = await session.get(User, advisor_id)
+    if advisor is None or advisor.role != UserRole.advisor:
+        raise NotFoundError("Advisor not found")
+
     earnings = await payment_service.get_advisor_earnings(session, advisor_id)
     available = await payout_service.get_available_balance(session, advisor_id)
 
@@ -257,11 +307,70 @@ async def get_earnings_summary(
     total_commission_paid_usd = float(earnings["total_commission_paid_usd"])  # type: ignore[arg-type]
     transactions = earnings["transactions"]
     assert isinstance(transactions, list)
+    items = await _build_earning_rows(session, cast(list[Transaction], transactions))
     return AdvisorEarningsSummaryRead(
         total_earned_usd=total_earned_usd,
         total_commission_paid_usd=total_commission_paid_usd,
         available_balance_usd=available,
         total_payouts_usd=round(payout_totals.get(PayoutStatus.completed, 0.0), 2),
         pending_payout_usd=round(payout_totals.get(PayoutStatus.pending, 0.0), 2),
-        transaction_count=len(transactions),
+        transaction_count=len(items),
+        items=items,
     )
+
+
+async def _build_earning_rows(
+    session: AsyncSession, transactions: list[Transaction]
+) -> list[AdvisorEarningRowRead]:
+    """Bulk-enrich transactions into Earnings-tab table rows (not N+1)."""
+    if not transactions:
+        return []
+
+    booking_ids = [t.booking_id for t in transactions]
+    bookings = (
+        (await session.execute(select(Booking).where(Booking.id.in_(booking_ids))))
+        .scalars()
+        .all()
+    )
+    booking_by_id = {b.id: b for b in bookings}
+
+    seeker_ids = list({b.seeker_id for b in bookings})
+    seekers: dict[uuid.UUID, User] = {}
+    photos: dict[uuid.UUID, str | None] = {}
+    if seeker_ids:
+        seeker_rows = (
+            (await session.execute(select(User).where(User.id.in_(seeker_ids)))).scalars().all()
+        )
+        seekers = {u.id: u for u in seeker_rows}
+        profile_rows = (
+            (
+                await session.execute(
+                    select(SeekerProfile).where(SeekerProfile.user_id.in_(seeker_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        photos = {p.user_id: p.profile_photo_url for p in profile_rows}
+
+    rows: list[AdvisorEarningRowRead] = []
+    for txn in transactions:
+        booking = booking_by_id.get(txn.booking_id)
+        if booking is None:
+            continue
+        seeker = seekers.get(booking.seeker_id)
+        rows.append(
+            AdvisorEarningRowRead(
+                appointment_id=payment_service.format_appointment_id(booking.appointment_number),
+                booking_id=txn.booking_id,
+                seeker_name=seeker.full_name if seeker else None,
+                seeker_email=seeker.email if seeker else None,
+                seeker_photo_url=photos.get(booking.seeker_id),
+                created_at=txn.created_at,
+                amount_paid=round(float(txn.amount_usd), 2),
+                platform_fee=round(float(txn.commission_usd), 2),
+                advisor_earnings=round(float(txn.advisor_payout_usd), 2),
+                status=payment_service.display_status(txn),
+            )
+        )
+    return rows

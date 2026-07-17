@@ -7,6 +7,7 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
+from app.core.visa_types import OptionalVisaType
 from app.models.advisor_lead import AdvisorLeadStatus
 
 
@@ -17,7 +18,8 @@ class AdvisorLeadRead(BaseModel):
     seeker_email: str
     assessment_id: uuid.UUID
     destination_country: str
-    visa_type: str
+    visa_type: OptionalVisaType
+    visa_type_name: str | None = None
     match_score: float
     match_reasons: str
     status: AdvisorLeadStatus

@@ -19,6 +19,8 @@ from app.models.user import User
 from app.schemas.booking import (
     BookingCancel,
     BookingCreate,
+    BookingDetailsRead,
+    BookingHistoryRead,
     BookingImportantUpdate,
     BookingInterpreterUpdate,
     BookingRead,
@@ -51,27 +53,7 @@ async def _party_names(session: SessionDep, booking: Booking) -> tuple[User | No
 
 
 def _read(booking: Booking, seeker: User | None, advisor: User | None) -> BookingRead:
-    return BookingRead(
-        id=booking.id,
-        seeker_id=booking.seeker_id,
-        advisor_id=booking.advisor_id,
-        seeker_name=seeker.full_name if seeker else None,
-        advisor_name=advisor.full_name if advisor else None,
-        service_type=booking.service_type,
-        duration_minutes=booking.duration_minutes,
-        price_usd=booking.price_usd,
-        scheduled_start=as_utc(booking.scheduled_start),
-        scheduled_end=as_utc(booking.scheduled_end),
-        status=booking.status,
-        payment_status=booking.payment_status,
-        cancellation_reason=booking.cancellation_reason,
-        seeker_note=booking.seeker_note,
-        is_important=booking.is_important,
-        interpreter_name=booking.interpreter_name,
-        interpreter_contact=booking.interpreter_contact,
-        interpreter_language=booking.interpreter_language,
-        created_at=booking.created_at,
-    )
+    return booking_service.build_read(booking, seeker, advisor)
 
 
 async def _send_confirmations(session: SessionDep, booking: Booking, settings: SettingsDep) -> None:
@@ -158,10 +140,14 @@ async def list_my_bookings(
     date_from: date | None = None,
     date_to: date | None = None,
     service_type: Annotated[list[str] | None, Query()] = None,
+    q: Annotated[
+        str | None,
+        Query(max_length=100, description="Search appointment ID, client name/email, type"),
+    ] = None,
 ) -> ResponseEnvelope[list[BookingRead]]:
     role = current_user.role
     stmt = booking_service.list_for_user_stmt(
-        current_user.id, role, status, seeker_id, date_from, date_to, service_type
+        current_user.id, role, status, seeker_id, date_from, date_to, service_type, q
     )
     bookings, total = await paginate(session, stmt, params)
 
@@ -191,6 +177,20 @@ async def get_booking(
         data=_read(booking, seeker, advisor),
         meta=Meta(request_id=request_id),
     )
+
+
+@router.get("/{booking_id}/details", response_model=ResponseEnvelope[BookingDetailsRead])
+async def get_booking_details(
+    booking_id: uuid.UUID,
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[BookingDetailsRead]:
+    """View Booking Details drawer (customer, service, payment, attachments, meeting)."""
+    booking = await booking_service.get_for_party(session, booking_id, current_user.id)
+    seeker, _advisor = await _party_names(session, booking)
+    data = await booking_service.build_details(session, booking, seeker)
+    return ResponseEnvelope[BookingDetailsRead](data=data, meta=Meta(request_id=request_id))
 
 
 @router.post("/{booking_id}/accept", response_model=ResponseEnvelope[BookingRead])
@@ -226,6 +226,40 @@ async def reject_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=_read(booking, seeker, advisor),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.post("/{booking_id}/deal-later", response_model=ResponseEnvelope[BookingRead])
+async def deal_later_booking(
+    booking_id: uuid.UUID,
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[BookingRead]:
+    """Defer Accept/Reject on a pending consultation request (Booking Detail "Deal Later")."""
+    booking = await booking_service.get_for_party(session, booking_id, current_user.id)
+    booking = await booking_service.deal_later(session, booking, current_user.id)
+    seeker, advisor = await _party_names(session, booking)
+    return ResponseEnvelope[BookingRead](
+        data=_read(booking, seeker, advisor),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.get("/{booking_id}/history", response_model=ResponseEnvelope[BookingHistoryRead])
+async def get_booking_history(
+    booking_id: uuid.UUID,
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[BookingHistoryRead]:
+    """Consultation History screen — summary plus notes and document requests."""
+    booking = await booking_service.get_for_party(session, booking_id, current_user.id)
+    seeker, advisor = await _party_names(session, booking)
+    return ResponseEnvelope[BookingHistoryRead](
+        data=await booking_service.build_history(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
