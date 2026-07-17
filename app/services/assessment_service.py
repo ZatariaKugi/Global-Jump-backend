@@ -33,13 +33,14 @@ from app.schemas.assessment import (
     AnswerInput,
     AssessmentAnalyticsRead,
     AssessmentCreate,
+    AssessmentDropOffPoint,
     AssessmentVolumePoint,
     QuestionCreate,
     QuestionOptionInput,
     QuestionUpdate,
 )
 from app.schemas.assessment_threshold import AssessmentThresholdUpsert
-from app.services import ai_insight_service
+from app.services import ab_variant_service, ai_insight_service
 
 # Tips are surfaced for answers scoring below this threshold.
 TIP_SCORE_THRESHOLD = 60.0
@@ -122,10 +123,14 @@ async def list_questions(
 
 
 async def start(session: AsyncSession, user_id: uuid.UUID, data: AssessmentCreate) -> Assessment:
+    country = data.destination_country.upper()
+    visa = data.visa_type.lower()
+    variant = await ab_variant_service.pick_for_scope(session, country, visa)
     assessment = Assessment(
         user_id=user_id,
-        destination_country=data.destination_country.upper(),
-        visa_type=data.visa_type.lower(),
+        destination_country=country,
+        visa_type=visa,
+        ab_variant_id=variant.id if variant else None,
         created_by=user_id,
     )
     session.add(assessment)
@@ -155,16 +160,45 @@ def _applicable(
     ]
 
 
+async def _persist_answers(
+    session: AsyncSession,
+    assessment: Assessment,
+    answers: list[AnswerInput],
+    questions_by_id: dict[uuid.UUID, AssessmentQuestion],
+) -> list[AssessmentAnswer]:
+    answer_rows: list[AssessmentAnswer] = []
+    for answer in answers:
+        question = questions_by_id.get(answer.question_id)
+        if question is None:
+            raise AppError("Unknown question submitted", code="invalid_answer")
+        option = next((o for o in question.options if o.id == answer.option_id), None)
+        if option is None:
+            raise AppError("Option does not belong to its question", code="invalid_answer")
+        answer_rows.append(
+            AssessmentAnswer(
+                assessment_id=assessment.id,
+                question_id=answer.question_id,
+                option_id=answer.option_id,
+            )
+        )
+    assessment.answers = answer_rows
+    session.add(assessment)
+    await session.flush()
+    return answer_rows
+
+
 async def submit_answers(
     session: AsyncSession,
     assessment: Assessment,
     answers: list[AnswerInput],
     settings: Settings,
+    *,
+    complete: bool = True,
 ) -> Assessment:
     """Score the assessment from the submitted answers and mark it completed.
 
-    Scoring is fully deterministic; after it, AI narrative insights are
-    generated best-effort — an OpenAI failure never blocks completion.
+    When ``complete`` is False, answers are saved as progress only (status stays
+    in_progress) so drop-off analytics can attribute abandonments to a question.
     """
     if assessment.status == AssessmentStatus.completed:
         raise AppError("Assessment already completed", code="assessment_completed")
@@ -173,6 +207,11 @@ async def submit_answers(
     if not questions:
         raise AppError("No questionnaire configured", code="no_questions")
     questions_by_id = {q.id: q for q in questions}
+
+    if not complete:
+        await _persist_answers(session, assessment, answers, questions_by_id)
+        await session.refresh(assessment)
+        return assessment
 
     answer_by_question: dict[uuid.UUID, AnswerInput] = {}
     for answer in answers:
@@ -335,6 +374,7 @@ async def update_question(
     admin_id: uuid.UUID,
 ) -> AssessmentQuestion:
     fields = data.model_dump(exclude_unset=True)
+    fields.pop("weightage_pct", None)
     if "options" in fields:
         fields.pop("options")
         question.options = _build_options(data.options or [])
@@ -450,6 +490,8 @@ async def get_analytics(
         volume_counts[a.created_at.date().isoformat()] += 1
     volume = [AssessmentVolumePoint(date=d, count=c) for d, c in sorted(volume_counts.items())]
 
+    drop_off_points = await _drop_off_points(session, started, country, visa_type)
+
     return AssessmentAnalyticsRead(
         window_days=days,
         total_started=total_started,
@@ -459,4 +501,55 @@ async def get_analytics(
         fail_rate=fail_rate,
         drop_off_count=in_progress,
         drop_off_rate=drop_off_rate,
+        drop_off_points=drop_off_points,
     )
+
+
+async def _drop_off_points(
+    session: AsyncSession,
+    started: list[Assessment],
+    country: str | None,
+    visa_type: str | None,
+) -> list[AssessmentDropOffPoint]:
+    """Attribute each abandoned assessment to the next unanswered question."""
+    abandoned = [a for a in started if a.status == AssessmentStatus.in_progress]
+    if not abandoned:
+        return []
+
+    # Load questions for the most common abandoned scope (or filter scope).
+    scope_country = country.upper() if country else None
+    scope_visa = visa_type.lower() if visa_type else None
+    if scope_country is None and abandoned:
+        scope_country = abandoned[0].destination_country
+    if scope_visa is None and abandoned:
+        scope_visa = abandoned[0].visa_type
+
+    questions = await list_questions(
+        session, scope_country or "US", scope_visa or "tourist"
+    )
+    if not questions:
+        return [
+            AssessmentDropOffPoint(
+                question_id=None, label="Before first question", count=len(abandoned)
+            )
+        ]
+
+    counts: dict[uuid.UUID | None, int] = defaultdict(int)
+    labels: dict[uuid.UUID | None, str] = {None: "Before first question"}
+    for q in questions:
+        labels[q.id] = q.text[:80]
+
+    for assessment in abandoned:
+        answered_ids = {a.question_id for a in (assessment.answers or [])}
+        drop_qid: uuid.UUID | None = None
+        for q in questions:
+            if q.id not in answered_ids:
+                drop_qid = q.id
+                break
+        counts[drop_qid] += 1
+
+    return [
+        AssessmentDropOffPoint(question_id=qid, label=labels.get(qid, "Unknown"), count=c)
+        for qid, c in counts.items()
+        if c > 0
+    ]

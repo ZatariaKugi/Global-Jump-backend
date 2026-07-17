@@ -74,6 +74,9 @@ async def update_status(
     if data.status == CredentialStatus.verified:
         credential.verified_at = datetime.now(UTC)
         credential.verified_by = admin_id
+    elif data.status == CredentialStatus.pending:
+        credential.verified_at = None
+        credential.verified_by = None
     session.add(credential)
     await session.flush()
     await session.refresh(credential)
@@ -107,9 +110,54 @@ async def bulk_update_status(
     place — per-advisor pending volume is a handful of documents, not worth
     the duplication risk of a second code path.
     """
+    updated = await resolve_pending(
+        session,
+        advisor_id,
+        CredentialStatus.verified if body.action == "approve" else CredentialStatus.rejected,
+        admin_id,
+        admin_note=body.admin_note,
+    )
+    if not updated:
+        raise NotFoundError("No pending credentials for this advisor")
+    return updated
+
+
+async def resolve_pending(
+    session: AsyncSession,
+    advisor_id: uuid.UUID,
+    target: CredentialStatus,
+    admin_id: uuid.UUID,
+    *,
+    admin_note: str | None = None,
+) -> list[AdvisorCredential]:
+    """Mark every pending credential for ``advisor_id`` as ``target``.
+
+    Returns an empty list when there is nothing pending (unlike
+    :func:`bulk_update_status`, which raises). Used by account-level
+    approve/reject so the verification queue empties in the same request.
+    """
     pending = await get_for_advisor_admin(session, advisor_id, status=CredentialStatus.pending)
     if not pending:
-        raise NotFoundError("No pending credentials for this advisor")
-    target = CredentialStatus.verified if body.action == "approve" else CredentialStatus.rejected
-    update_body = CredentialStatusUpdate(status=target, admin_note=body.admin_note)
+        return []
+    update_body = CredentialStatusUpdate(status=target, admin_note=admin_note)
     return [await update_status(session, c, update_body, admin_id) for c in pending]
+
+
+async def reopen_for_review(
+    session: AsyncSession,
+    advisor_id: uuid.UUID,
+    admin_id: uuid.UUID,
+    *,
+    admin_note: str | None = None,
+) -> list[AdvisorCredential]:
+    """Set every non-pending credential back to pending (queue re-entry).
+
+    Used when an admin moves the account to ``pending`` / ``under_review``
+    after a prior approve/reject.
+    """
+    credentials = await get_for_advisor_admin(session, advisor_id)
+    to_reopen = [c for c in credentials if c.status != CredentialStatus.pending]
+    if not to_reopen:
+        return []
+    update_body = CredentialStatusUpdate(status=CredentialStatus.pending, admin_note=admin_note)
+    return [await update_status(session, c, update_body, admin_id) for c in to_reopen]

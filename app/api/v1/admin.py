@@ -6,11 +6,11 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
 
 from app.api.deps import CurrentPrincipal, RequestIdDep, SettingsDep, require_role
 from app.api.pagination import PaginationDep, page_meta, paginate
 from app.core.file_storage import resolve_url
+from app.core.visa_types import OptionalVisaType
 from app.db.session import SessionDep
 from app.models.advisor_credential import CredentialStatus
 from app.models.assessment import AssessmentQuestion
@@ -19,16 +19,18 @@ from app.models.booking import BookingStatus
 from app.models.eligibility_rule import EligibilityRule
 from app.models.payout_request import PayoutStatus
 from app.models.review import Review
-from app.models.support_ticket import TicketCategory, TicketPriority, TicketStatus
+from app.models.support_ticket import TicketCategory, TicketPriority
 from app.models.ticket_message import TicketMessageAttachment
 from app.models.transaction import TransactionStatus
 from app.models.user import User, UserRole, VerificationStatus
+from app.schemas.ab_variant import AbVariantCreate, AbVariantRead, AbVariantUpdate
 from app.schemas.admin import FeatureFlagUpdate, VerificationStatusUpdate
 from app.schemas.advisor import AdvisorRead
 from app.schemas.advisor_admin import (
     AdvisorEarningsSummaryRead,
     AdvisorManagementDetailRead,
     AdvisorManagementListRead,
+    AdvisorSessionRead,
     BulkCredentialReview,
     VerificationQueueRead,
 )
@@ -49,7 +51,7 @@ from app.schemas.assessment import (
     QuestionUpdate,
 )
 from app.schemas.assessment_threshold import AssessmentThresholdRead, AssessmentThresholdUpsert
-from app.schemas.booking import BookingRead
+from app.schemas.booking import BookingDetailsRead
 from app.schemas.conversation import FlaggedMessageRead
 from app.schemas.dashboard import ActivityFeedItemRead, DashboardSummaryRead
 from app.schemas.eligibility_rule import (
@@ -57,7 +59,9 @@ from app.schemas.eligibility_rule import (
     EligibilityRuleRead,
     EligibilityRuleUpdate,
 )
+from app.schemas.engine_settings import EngineSettingsRead
 from app.schemas.impersonation import ImpersonationRead
+from app.schemas.matching_weights import MatchingWeightsRead, MatchingWeightsUpdate
 from app.schemas.payment import (
     InvoiceRead,
     PaymentSummaryRead,
@@ -66,7 +70,11 @@ from app.schemas.payment import (
 )
 from app.schemas.payout import PayoutDecision, PayoutRequestRead
 from app.schemas.response import Meta, ResponseEnvelope
-from app.schemas.review import ModerationDecision, ReviewAdminRead, ReviewRead
+from app.schemas.review import (
+    AdvisorReviewsTabRead,
+    ModerationDecision,
+    ReviewAdminRead,
+)
 from app.schemas.seeker_admin import SeekerCreate, SeekerDetailRead, SeekerListRead
 from app.schemas.seeker_document import SeekerDocumentRead, SeekerDocumentStatusUpdate
 from app.schemas.support_ticket import TicketCreate, TicketRead, TicketUpdate
@@ -74,6 +82,7 @@ from app.schemas.ticket_message import TicketMessageRead, TicketMessageSend
 from app.schemas.transaction_event import TransactionEventRead
 from app.schemas.user_admin import AccountStatus, UserDetailRead, UserListRead
 from app.services import (
+    ab_variant_service,
     advisor_admin_service,
     advisor_credential_service,
     advisor_profile_service,
@@ -84,6 +93,7 @@ from app.services import (
     dashboard_service,
     eligibility_rule_service,
     impersonation_service,
+    matching_weights_service,
     payment_service,
     payout_service,
     review_service,
@@ -109,10 +119,11 @@ async def list_advisors(
     request_id: RequestIdDep,
     status: VerificationStatus | None = None,
     search: str | None = None,
+    visa_type: OptionalVisaType = None,
 ) -> ResponseEnvelope[list[AdvisorManagementListRead]]:
     """Advisor Management list: Advisor, Expertise, Status, Registration Date,
-    Sessions, Rating."""
-    stmt = advisor_admin_service.list_advisors_stmt(search, status)
+    Sessions, Rating. Optional ``visa_type`` filters by PRD specialization enum."""
+    stmt = advisor_admin_service.list_advisors_stmt(search, status, visa_type)
     advisors, total = await paginate(session, stmt, params)
     return ResponseEnvelope[list[AdvisorManagementListRead]](
         data=await advisor_admin_service.build_list_read(session, advisors),
@@ -124,18 +135,24 @@ async def list_advisors(
 async def update_advisor_verification(
     advisor_id: uuid.UUID,
     body: VerificationStatusUpdate,
+    admin_principal: CurrentPrincipal,
     session: SessionDep,
     request_id: RequestIdDep,
     settings: SettingsDep,
 ) -> ResponseEnvelope[AdvisorRead]:
     """Update an advisor's verification status.
 
-    Setting status to ``approved`` also activates the account (``is_active=True``)
-    and sends a welcome email. Setting to ``rejected`` or ``pending`` deactivates
-    the account and sends the corresponding status email. All status emails link
-    to the frontend ``/login`` page.
+    Setting status to ``approved`` activates the account (``is_active=True``),
+    marks any pending credential documents as verified (so the advisor leaves
+    ``GET /admin/verification-queue``), and sends a welcome email. Setting to
+    ``rejected`` rejects any still-pending documents and blocks subsequent
+    login/refresh with a contact-support message. Setting to ``pending`` /
+    ``under_review`` leaves onboarding inactive and reopens credential
+    documents to ``pending`` so the advisor returns to the verification queue.
+    Rejection emails include an optional ``reason``.
     """
     from app.core.exceptions import NotFoundError
+    from app.services import advisor_credential_service
     from app.services.email_service import (
         send_advisor_pending_email,
         send_advisor_rejected_email,
@@ -148,10 +165,35 @@ async def update_advisor_verification(
 
     previous_status = advisor.verification_status
     advisor.verification_status = body.status
-    advisor.is_active = body.status == VerificationStatus.approved
     if body.status == VerificationStatus.approved:
+        advisor.is_active = True
         advisor.is_suspended = False
         advisor.pre_suspend_verification_status = None
+        await advisor_credential_service.resolve_pending(
+            session,
+            advisor_id,
+            CredentialStatus.verified,
+            admin_principal.id,
+            admin_note=body.reason,
+        )
+    elif body.status == VerificationStatus.rejected:
+        # Keep password / refresh credentials usable after rejection email.
+        advisor.is_active = True
+        await advisor_credential_service.resolve_pending(
+            session,
+            advisor_id,
+            CredentialStatus.rejected,
+            admin_principal.id,
+            admin_note=body.reason,
+        )
+    elif body.status in (VerificationStatus.pending, VerificationStatus.under_review):
+        advisor.is_active = False
+        await advisor_credential_service.reopen_for_review(
+            session,
+            advisor_id,
+            admin_principal.id,
+            admin_note=body.reason,
+        )
     session.add(advisor)
     await session.flush()
     await session.refresh(advisor)
@@ -413,7 +455,7 @@ async def get_advisor_detail(
 
 @router.get(
     "/advisors/{advisor_id}/sessions",
-    response_model=ResponseEnvelope[list[BookingRead]],
+    response_model=ResponseEnvelope[list[AdvisorSessionRead]],
 )
 async def list_advisor_sessions(
     advisor_id: uuid.UUID,
@@ -421,12 +463,14 @@ async def list_advisor_sessions(
     session: SessionDep,
     request_id: RequestIdDep,
     status: BookingStatus | None = None,
-) -> ResponseEnvelope[list[BookingRead]]:
+) -> ResponseEnvelope[list[AdvisorSessionRead]]:
     """Detail page's Session History tab."""
     stmt = booking_service.list_for_user_stmt(advisor_id, UserRole.advisor, status=status)
     bookings, total = await paginate(session, stmt, params)
     data = await advisor_admin_service.build_session_reads(session, bookings)
-    return ResponseEnvelope[list[BookingRead]](data=data, meta=page_meta(params, total, request_id))
+    return ResponseEnvelope[list[AdvisorSessionRead]](
+        data=data, meta=page_meta(params, total, request_id)
+    )
 
 
 @router.get(
@@ -438,7 +482,7 @@ async def get_advisor_earnings_summary(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorEarningsSummaryRead]:
-    """Detail page's Earnings tab header stats."""
+    """Detail page's Earnings tab — summary cards + table rows."""
     data = await advisor_admin_service.get_earnings_summary(session, advisor_id)
     return ResponseEnvelope[AdvisorEarningsSummaryRead](data=data, meta=Meta(request_id=request_id))
 
@@ -484,24 +528,52 @@ async def list_advisor_earnings_payouts(
 
 @router.get(
     "/advisors/{advisor_id}/reviews",
-    response_model=ResponseEnvelope[list[ReviewRead]],
+    response_model=ResponseEnvelope[AdvisorReviewsTabRead],
 )
 async def list_advisor_reviews(
     advisor_id: uuid.UUID,
     params: PaginationDep,
     session: SessionDep,
     request_id: RequestIdDep,
-) -> ResponseEnvelope[list[ReviewRead]]:
-    """Detail page's Reviews tab."""
-    stmt = review_service.list_public_stmt(advisor_id)
+    flagged: bool | None = None,
+    visa_type: OptionalVisaType = None,
+) -> ResponseEnvelope[AdvisorReviewsTabRead]:
+    """Detail page's Reviews tab — rating summary + paginated review rows.
+
+    Pass ``flagged=true`` to return only reviews awaiting moderation.
+    Pass ``visa_type`` (PRD enum) to filter by the seeker's intended visa type.
+    """
+    stmt = review_service.list_public_stmt(
+        advisor_id, flagged=flagged, visa_type=visa_type
+    )
     reviews, total = await paginate(session, stmt, params)
-    seeker_ids = [r.seeker_id for r in reviews]
-    seekers: dict[uuid.UUID, User] = {}
-    if seeker_ids:
-        rows = (await session.execute(select(User).where(User.id.in_(seeker_ids)))).scalars().all()
-        seekers = {u.id: u for u in rows}
-    data = [review_service.build_read(r, seekers.get(r.seeker_id)) for r in reviews]
-    return ResponseEnvelope[list[ReviewRead]](data=data, meta=page_meta(params, total, request_id))
+    items = await review_service.build_enriched_reads(session, reviews)
+    summary = await review_service.build_tab_summary(session, advisor_id)
+    return ResponseEnvelope[AdvisorReviewsTabRead](
+        data=AdvisorReviewsTabRead(summary=summary, items=items),
+        meta=page_meta(params, total, request_id),
+    )
+
+
+@router.get(
+    "/bookings/{booking_id}/details",
+    response_model=ResponseEnvelope[BookingDetailsRead],
+)
+async def get_booking_details_admin(
+    booking_id: uuid.UUID,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[BookingDetailsRead]:
+    """View Booking Details — used from admin Earnings / Session History drawers."""
+    from app.core.exceptions import NotFoundError
+    from app.models.booking import Booking
+
+    booking = await session.get(Booking, booking_id)
+    if booking is None:
+        raise NotFoundError("Booking not found")
+    seeker = await session.get(User, booking.seeker_id)
+    data = await booking_service.build_details(session, booking, seeker)
+    return ResponseEnvelope[BookingDetailsRead](data=data, meta=Meta(request_id=request_id))
 
 
 # ── Advisor Verification Queue (Screen B) ────────────────────────────────────
@@ -536,7 +608,7 @@ async def list_seekers(
     search: str | None = None,
     status: AccountStatus | None = None,
     study_visa: str | None = None,
-    visa_type: str | None = None,
+    visa_type: OptionalVisaType = None,
 ) -> ResponseEnvelope[list[SeekerListRead]]:
     stmt = seeker_admin_service.list_seekers_stmt(search, status, study_visa, visa_type)
     users, total = await paginate(session, stmt, params)
@@ -635,6 +707,7 @@ def _question_admin_read(question: AssessmentQuestion) -> QuestionAdminRead:
         country_code=question.country_code,
         visa_type=question.visa_type,
         weight=question.weight,
+        weightage_pct=round(question.weight * 10.0, 1),
         display_order=question.display_order,
         is_active=question.is_active,
         depends_on_option_id=question.depends_on_option_id,
@@ -678,7 +751,7 @@ async def list_assessment_questions(
     session: SessionDep,
     request_id: RequestIdDep,
     country: str | None = None,
-    visa_type: str | None = None,
+    visa_type: OptionalVisaType = None,
 ) -> ResponseEnvelope[list[QuestionAdminRead]]:
     stmt = assessment_service.list_questions_admin_stmt(country, visa_type)
     questions, total = await paginate(session, stmt, params)
@@ -732,6 +805,7 @@ def _eligibility_rule_read(rule: EligibilityRule) -> EligibilityRuleRead:
         id=rule.id,
         name=rule.name,
         description=rule.description,
+        category=rule.category,
         country_code=rule.country_code,
         visa_type=rule.visa_type,
         points=rule.points,
@@ -767,7 +841,7 @@ async def list_eligibility_rules(
     session: SessionDep,
     request_id: RequestIdDep,
     country: str | None = None,
-    visa_type: str | None = None,
+    visa_type: OptionalVisaType = None,
 ) -> ResponseEnvelope[list[EligibilityRuleRead]]:
     stmt = eligibility_rule_service.list_stmt(country, visa_type)
     rules, total = await paginate(session, stmt, params)
@@ -836,7 +910,7 @@ async def get_assessment_threshold(
     session: SessionDep,
     request_id: RequestIdDep,
     country: str | None = None,
-    visa_type: str | None = None,
+    visa_type: OptionalVisaType = None,
 ) -> ResponseEnvelope[AssessmentThresholdRead | None]:
     """The exact-scope threshold config, or null if this scope falls back to the
     global default (or the hardcoded 80/60/40 if no config exists at all)."""
@@ -872,7 +946,7 @@ async def get_assessment_analytics(
     session: SessionDep,
     request_id: RequestIdDep,
     country: str | None = None,
-    visa_type: str | None = None,
+    visa_type: OptionalVisaType = None,
     days: int = 30,
 ) -> ResponseEnvelope[AssessmentAnalyticsRead]:
     analytics = await assessment_service.get_analytics(session, country, visa_type, days)
@@ -880,6 +954,106 @@ async def get_assessment_analytics(
         data=analytics,
         meta=Meta(request_id=request_id),
     )
+
+
+# ── Matching weights / A/B / engine settings (AI Engine Management) ───────────
+
+
+@router.get("/matching-weights", response_model=ResponseEnvelope[MatchingWeightsRead])
+async def get_matching_weights(
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[MatchingWeightsRead]:
+    data = await matching_weights_service.get_read(session)
+    return ResponseEnvelope[MatchingWeightsRead](data=data, meta=Meta(request_id=request_id))
+
+
+@router.put("/matching-weights", response_model=ResponseEnvelope[MatchingWeightsRead])
+async def upsert_matching_weights(
+    body: MatchingWeightsUpdate,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[MatchingWeightsRead]:
+    data = await matching_weights_service.upsert(session, body, principal.id)
+    return ResponseEnvelope[MatchingWeightsRead](data=data, meta=Meta(request_id=request_id))
+
+
+@router.get("/engine-settings", response_model=ResponseEnvelope[EngineSettingsRead])
+async def get_engine_settings(
+    session: SessionDep,
+    request_id: RequestIdDep,
+    country: str | None = None,
+    visa_type: OptionalVisaType = None,
+) -> ResponseEnvelope[EngineSettingsRead]:
+    """Dashboard bootstrap: thresholds for scope + global matching weights."""
+    threshold = await assessment_service.get_threshold(session, country, visa_type)
+    weights = await matching_weights_service.get_read(session)
+    return ResponseEnvelope[EngineSettingsRead](
+        data=EngineSettingsRead(
+            thresholds=_threshold_read(threshold) if threshold else None,
+            matching_weights=weights,
+        ),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.post(
+    "/ab-variants",
+    status_code=201,
+    response_model=ResponseEnvelope[AbVariantRead],
+)
+async def create_ab_variant(
+    body: AbVariantCreate,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[AbVariantRead]:
+    row = await ab_variant_service.create(session, body, principal.id)
+    data = (await ab_variant_service.build_reads(session, [row]))[0]
+    return ResponseEnvelope[AbVariantRead](data=data, meta=Meta(request_id=request_id))
+
+
+@router.get("/ab-variants", response_model=ResponseEnvelope[list[AbVariantRead]])
+async def list_ab_variants(
+    params: PaginationDep,
+    session: SessionDep,
+    request_id: RequestIdDep,
+    country: str | None = None,
+    visa_type: OptionalVisaType = None,
+) -> ResponseEnvelope[list[AbVariantRead]]:
+    stmt = ab_variant_service.list_stmt(country, visa_type)
+    rows, total = await paginate(session, stmt, params)
+    data = await ab_variant_service.build_reads(session, rows)
+    return ResponseEnvelope[list[AbVariantRead]](
+        data=data, meta=page_meta(params, total, request_id)
+    )
+
+
+@router.patch(
+    "/ab-variants/{variant_id}",
+    response_model=ResponseEnvelope[AbVariantRead],
+)
+async def update_ab_variant(
+    variant_id: uuid.UUID,
+    body: AbVariantUpdate,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[AbVariantRead]:
+    row = await ab_variant_service.get_by_id(session, variant_id)
+    row = await ab_variant_service.update(session, row, body, principal.id)
+    data = (await ab_variant_service.build_reads(session, [row]))[0]
+    return ResponseEnvelope[AbVariantRead](data=data, meta=Meta(request_id=request_id))
+
+
+@router.delete("/ab-variants/{variant_id}", status_code=204)
+async def delete_ab_variant(
+    variant_id: uuid.UUID,
+    session: SessionDep,
+) -> None:
+    row = await ab_variant_service.get_by_id(session, variant_id)
+    await ab_variant_service.delete(session, row)
 
 
 # ── Review moderation (PRD §3.9) ─────────────────────────────────────────────
@@ -1196,11 +1370,12 @@ async def create_support_ticket(
     body: TicketCreate,
     principal: CurrentPrincipal,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[TicketRead]:
     ticket = await support_ticket_service.create(session, body, principal.id)
     return ResponseEnvelope[TicketRead](
-        data=await support_ticket_service.ticket_read(session, ticket),
+        data=await support_ticket_service.ticket_read(session, ticket, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -1209,15 +1384,29 @@ async def create_support_ticket(
 async def list_support_tickets(
     params: PaginationDep,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
-    status: TicketStatus | None = None,
+    status: str | None = None,
     priority: TicketPriority | None = None,
     category: TicketCategory | None = None,
     search: str | None = None,
 ) -> ResponseEnvelope[list[TicketRead]]:
-    stmt = support_ticket_service.list_stmt(status, priority, category, search)
+    """List support tickets.
+
+    ``status`` accepts canonical values (``open``, ``in_progress``, ``resolved``,
+    ``closed``) plus FE aliases ``pending``→open, ``inprogress``/``escalated``→
+    in_progress. Conversation thread: ``GET/POST .../{id}/messages``.
+    """
+    from app.core.exceptions import AppError
+
+    try:
+        status_filter = support_ticket_service.coerce_status_filter(status)
+    except ValueError as exc:
+        raise AppError(str(exc), code="invalid_status") from exc
+
+    stmt = support_ticket_service.list_stmt(status_filter, priority, category, search)
     tickets, total = await paginate(session, stmt, params)
-    data = [await support_ticket_service.ticket_read(session, t) for t in tickets]
+    data = await support_ticket_service.build_list_reads(session, tickets, settings)
     return ResponseEnvelope[list[TicketRead]](data=data, meta=page_meta(params, total, request_id))
 
 
@@ -1225,11 +1414,13 @@ async def list_support_tickets(
 async def get_support_ticket(
     ticket_id: uuid.UUID,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[TicketRead]:
+    """Ticket detail. Messages: ``GET /support-tickets/{id}/messages``."""
     ticket = await support_ticket_service.get_by_id(session, ticket_id)
     return ResponseEnvelope[TicketRead](
-        data=await support_ticket_service.ticket_read(session, ticket),
+        data=await support_ticket_service.ticket_read(session, ticket, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -1240,12 +1431,13 @@ async def update_support_ticket(
     body: TicketUpdate,
     principal: CurrentPrincipal,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[TicketRead]:
     ticket = await support_ticket_service.get_by_id(session, ticket_id)
     ticket = await support_ticket_service.update(session, ticket, body, principal.id)
     return ResponseEnvelope[TicketRead](
-        data=await support_ticket_service.ticket_read(session, ticket),
+        data=await support_ticket_service.ticket_read(session, ticket, settings),
         meta=Meta(request_id=request_id),
     )
 

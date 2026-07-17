@@ -4,14 +4,36 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Form, UploadFile
+from fastapi import APIRouter, Form, Response, UploadFile
 
 from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
-from app.core.file_storage import resolve_url, save_upload
+from app.core.exceptions import AppError, PermissionDeniedError
+from app.core.file_storage import (
+    delete_file,
+    get_upload_by_key,
+    normalize_file_key,
+    resolve_url,
+    save_upload,
+)
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.upload import UploadCategory, UploadResult
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
+
+
+def _category_from_key(file_key: str) -> UploadCategory:
+    segment = file_key.split("/", 1)[0]
+    try:
+        return UploadCategory(segment)
+    except ValueError as exc:
+        raise AppError("Unknown upload category in file key", code="invalid_file_key") from exc
+
+
+def _assert_owns_file_key(file_key: str, user_id: object) -> None:
+    """Keys are stored as ``{category}/{user_id}/{uuid}{ext}``."""
+    parts = file_key.split("/")
+    if len(parts) < 3 or parts[1] != str(user_id):
+        raise PermissionDeniedError("You can only delete your own uploads")
 
 
 @router.post("", status_code=201, response_model=ResponseEnvelope[UploadResult])
@@ -68,3 +90,46 @@ async def upload_file(
         ),
         meta=Meta(request_id=request_id),
     )
+
+
+@router.get("/{file_key:path}", response_model=ResponseEnvelope[UploadResult])
+async def get_upload_by_file_key(
+    file_key: str,
+    _current_user: CurrentUser,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[UploadResult]:
+    """Resolve a previously uploaded ``file_key`` to a fresh ``file_url`` + metadata.
+
+    Useful when a client stored only the key and needs a (possibly refreshed
+    S3-presigned) URL for preview or download.
+    """
+    key = normalize_file_key(file_key)
+    url_path, size = get_upload_by_key(key, settings)
+    return ResponseEnvelope[UploadResult](
+        data=UploadResult(
+            file_key=key,
+            file_url=resolve_url(url_path, settings),
+            category=_category_from_key(key),
+            file_size_bytes=size,
+        ),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.delete("/{file_key:path}", status_code=204)
+async def delete_upload_by_file_key(
+    file_key: str,
+    current_user: CurrentUser,
+    settings: SettingsDep,
+) -> Response:
+    """Delete a previously uploaded file owned by the current user.
+
+    Keys follow ``{category}/{user_id}/{uuid}{ext}``; callers may only delete
+    their own uploads. Missing keys return 404.
+    """
+    key = normalize_file_key(file_key)
+    _assert_owns_file_key(key, current_user.id)
+    url_path, _size = get_upload_by_key(key, settings)
+    delete_file(url_path, settings)
+    return Response(status_code=204)

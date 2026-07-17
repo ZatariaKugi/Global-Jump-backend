@@ -61,7 +61,7 @@ ADVISORS = [
         "country_of_residence": "CA",
         "years_of_experience": 11,
         "successful_applications": 340,
-        "specializations": ["work", "student", "permanent_residency"],
+        "specializations": ["work", "student", "pr"],
         "countries": ["CA", "US"],
         "languages": [("English", "native"), ("French", "fluent")],
         "services": [
@@ -131,7 +131,7 @@ ADVISORS = [
         "country_of_residence": "AU",
         "years_of_experience": 13,
         "successful_applications": 400,
-        "specializations": ["work", "permanent_residency", "family"],
+        "specializations": ["work", "pr", "family"],
         "countries": ["AU"],
         "languages": [("English", "native")],
         "services": [

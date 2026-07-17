@@ -27,8 +27,8 @@ class UserUpdate(BaseModel):
 
 
 class UserRead(BaseModel):
-    """Response schema — email is str so reserved TLDs (e.g. .test seed accounts)
-    stored in the DB can be returned without EmailStr rejection.
+    """Response schema — ``email`` is ``str`` so reserved TLDs (e.g. ``.test``
+    seed accounts) stored in the DB can be returned without EmailStr rejection.
     """
 
     model_config = ConfigDict(from_attributes=True)

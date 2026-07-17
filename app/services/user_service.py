@@ -93,14 +93,18 @@ async def authenticate(session: AsyncSession, email: str, password: str) -> User
         user.verification_status == VerificationStatus.suspended
     ):
         raise AuthenticationError("Account is suspended")
+    if user.role == UserRole.advisor and user.verification_status == VerificationStatus.rejected:
+        raise AuthenticationError(
+            "Your account was rejected by an admin. Please contact support."
+        )
     if not user.is_active:
         if user.role == UserRole.advisor and user.verification_status in (
             VerificationStatus.pending,
             VerificationStatus.under_review,
         ):
             # Pending / under-review advisors can log in to complete onboarding
-            # and view Approval Pending, but remain gated by require_verified_advisor
-            # on externally-facing actions (bookings, availability, etc.).
+            # or view Approval Pending. Marketplace actions stay gated by
+            # require_verified_advisor.
             return user
         if user.role == UserRole.advisor:
             raise AuthenticationError("Advisor account pending verification")

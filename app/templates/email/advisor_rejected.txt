@@ -7,8 +7,8 @@ review, we are unable to approve your application at this time.
 Reason: {{ reason }}
 {% endif %}
 
-If you believe this was a mistake or would like to reapply with updated
-credentials, please reply to this email and our team will be happy to help.
+You can log in with the same credentials, update your documents if needed,
+and resubmit your application for another review from your dashboard.
 
 Log in here:
 {{ login_url }}

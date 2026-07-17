@@ -10,6 +10,7 @@ from fastapi import APIRouter, Query
 from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.api.pagination import PaginationDep, page_meta, paginate
 from app.core.exceptions import PermissionDeniedError
+from app.core.visa_types import RequiredVisaType
 from app.db.session import SessionDep
 from app.models.assessment import Assessment, AssessmentStatus, InsightKind
 from app.models.user import User, UserRole
@@ -78,7 +79,7 @@ async def list_questions(
     session: SessionDep,
     request_id: RequestIdDep,
     country: Annotated[str, Query(min_length=2, max_length=2)],
-    visa_type: Annotated[str, Query(min_length=1, max_length=50)],
+    visa_type: Annotated[RequiredVisaType, Query()],
 ) -> ResponseEnvelope[list[QuestionRead]]:
     _require_seeker(current_user)
     questions = await assessment_service.list_questions(session, country, visa_type)
@@ -129,7 +130,7 @@ async def submit_answers(
     _require_seeker(current_user)
     assessment = await assessment_service.get_for_user(session, assessment_id, current_user.id)
     assessment = await assessment_service.submit_answers(
-        session, assessment, data.answers, settings
+        session, assessment, data.answers, settings, complete=data.complete
     )
     return ResponseEnvelope[AssessmentRead](
         data=await _build_read(session, assessment),

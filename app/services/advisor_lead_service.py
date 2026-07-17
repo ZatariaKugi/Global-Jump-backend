@@ -17,6 +17,7 @@ from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError
+from app.core.visa_types import parse_visa_type, visa_type_name
 from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import Assessment
@@ -36,9 +37,15 @@ def _build_reasons(
     if destination.upper() in countries:
         reasons.append(f"Specializes in {destination.upper()} immigration")
 
-    specializations = {s.specialization.lower() for s in (profile.visa_specializations or [])}
-    if visa_type.lower() in specializations:
-        reasons.append(f"Specializes in {visa_type} visas")
+    specializations = {
+        parsed
+        for s in (profile.visa_specializations or [])
+        if (parsed := parse_visa_type(s.specialization)) is not None
+    }
+    target = parse_visa_type(visa_type)
+    if target is not None and target in specializations:
+        label = visa_type_name(target) or target.value
+        reasons.append(f"Specializes in {label}")
 
     if profile.years_of_experience:
         reasons.append(f"{profile.years_of_experience} years of experience")

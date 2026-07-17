@@ -6,11 +6,14 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base_model import BaseModel
+
+# Human-readable appointment IDs (Consultation Requests List) start near the mock style.
+APPOINTMENT_NUMBER_START = 3_520_000_000
 
 
 class BookingStatus(StrEnum):
@@ -40,6 +43,9 @@ class Booking(BaseModel):
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
 
+    # Human-readable Appointment ID shown in the Consultations list (e.g. "3520145678").
+    appointment_number: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+
     # Service snapshot — copied from the advisor's offering at booking time so
     # later price/duration changes don't rewrite history.
     service_type: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -64,6 +70,9 @@ class Booking(BaseModel):
     cancellation_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     cancelled_by: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     seeker_note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+    # Set when the advisor chooses "Deal Later" on a pending request.
+    deal_later_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     is_important: Mapped[bool] = mapped_column(
         default=False, server_default="false", nullable=False

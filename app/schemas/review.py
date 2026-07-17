@@ -35,6 +35,8 @@ class ReviewRead(BaseModel):
     booking_id: uuid.UUID
     advisor_id: uuid.UUID
     seeker_name: str | None
+    seeker_photo_url: str | None = None
+    seeker_subtitle: str | None = None  # display label, e.g. "Study Visa"
     rating_expertise: int
     rating_communication: int
     rating_professionalism: int
@@ -56,3 +58,24 @@ class ReviewAdminRead(ReviewRead):
 class AdvisorRatingSummary(BaseModel):
     average_rating: float | None
     review_count: int
+
+
+class RatingStarBreakdown(BaseModel):
+    stars: int  # 1–5
+    count: int
+
+
+class AdvisorReviewSummaryRead(BaseModel):
+    """Top RatingSummaryCard for the admin/advisor Reviews tab."""
+
+    overall: float | None
+    review_count: int
+    positive_percent: float | None  # % with overall >= 4.0
+    breakdown: list[RatingStarBreakdown]
+
+
+class AdvisorReviewsTabRead(BaseModel):
+    """Reviews tab payload — summary cards + paginated rows."""
+
+    summary: AdvisorReviewSummaryRead
+    items: list[ReviewRead]
