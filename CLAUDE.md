@@ -98,6 +98,7 @@ Every endpoint returns `ResponseEnvelope[T]` — `{success: true, data: T, meta:
 | `AdvisorProfile` | `advisor_visa_specializations` | `visa_specializations` |
 | `AdvisorProfile` | `advisor_country_expertise` | `country_expertise` |
 | `AdvisorProfile` | `advisor_languages` | `languages` |
+| `AdvisorProfile` | `advisor_offered_services` | `offered_services` |
 | `AdvisorProfile` | `advisor_services` | `services` |
 
 All relationships use `cascade="all, delete-orphan"`. Services replace the entire child collection on update (reassigning the relationship list; delete-orphan cascade removes the old rows).
@@ -116,7 +117,7 @@ Advisor availability is stored as weekly recurring slots (`advisor_weekly_slots`
 
 ### In-platform messaging
 
-`Conversation` is one thread per (customer, advisor) pair (`UniqueConstraint("customer_id", "advisor_id")`), created via `conversation_service.get_or_create()` which requires an existing `Booking` between the two users (any status) — otherwise `PermissionDeniedError`. `Message` belongs to a conversation, has an optional `body` (String(5000)) and/or `MessageAttachment` child rows (plain `Base`, no audit columns); a message must have a body or at least one attachment. `Message.created_at` is set explicitly in `send_message()` (not left to the DB `server_default`) so ordering/"last message" lookups are unambiguous even at SQLite's one-second timestamp resolution.
+`Conversation` is one thread per (seeker, advisor) pair (`UniqueConstraint("seeker_id", "advisor_id")`), created via `conversation_service.get_or_create()` — chat is allowed before booking. `Message` belongs to a conversation, has an optional `body` (String(5000)) and/or `MessageAttachment` child rows (plain `Base`, no audit columns); a message must have a body or at least one attachment. `Message.created_at` is set explicitly in `send_message()` (not left to the DB `server_default`) so ordering/"last message" lookups are unambiguous even at SQLite's one-second timestamp resolution.
 
 Messages reuse the `moderation_status` enum/column pattern from reviews (`ModerationStatus`: `visible`/`flagged`/`removed`, `app/models/review.py`) — the messaging migration sets `create_type=False` since the Postgres enum type already exists. `PUBLIC_STATUSES = (visible, flagged)` controls what's returned from `list_messages_stmt`; a `removed` message disappears from the conversation. Reporting (`POST /messages/{id}/report`) sets `flagged` + `flag_reason` + `flagged_by`; admin moderation (`GET /admin/messages/flagged`, `PATCH /admin/messages/{id}/moderation`) mirrors the reviews endpoints and reuses `ModerationDecision` from `app.schemas.review`.
 

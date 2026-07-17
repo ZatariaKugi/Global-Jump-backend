@@ -40,19 +40,30 @@ class ServiceOffering(BaseModel):
 
 
 class AdvisorProfileUpdate(BaseModel):
+    """Editable advisor profile fields.
+
+    ``successful_applications`` is GET-only (not accepted here). Upload headshots
+    via ``POST /uploads`` (``category=profile_photo``), then set ``profile_photo_url``.
+    """
+
     title: str | None = Field(default=None, max_length=100)
-    bio: str | None = Field(default=None, max_length=1000)
+    bio: str | None = Field(default=None, max_length=800)
     profile_photo_url: str | None = None
     country_of_residence: CountryCode | None = None
     expertise_description: str | None = Field(default=None, max_length=2000)
     years_of_experience: int | None = Field(default=None, ge=0, le=60)
-    successful_applications: int | None = Field(default=None, ge=0)
     successful_application_rate: float | None = Field(default=None, ge=0, le=100)
     visa_specializations: list[RequiredVisaType] | None = None
     country_expertise: list[CountryCode] | None = None
     offered_services: list[AdvisorServiceType] | None = None
     languages: list[LanguageEntry] | None = None
     services: list[ServiceOffering] | None = None
+    public_profile_slug: str | None = Field(
+        default=None,
+        min_length=2,
+        max_length=100,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
 
 
 class AdvisorProfileRead(BaseModel):
@@ -73,6 +84,12 @@ class AdvisorProfileRead(BaseModel):
     services: list[ServiceOffering]
     is_featured: bool
     public_profile_slug: str | None
+    # Read-only / derived
+    average_rating: float | None = None
+    review_count: int = 0
+    avg_response_time_hours: float | None = None
+    verification_status: VerificationStatus | None = None
+    match_percentage: int | None = None  # seeker-context only; null on /me/profile
     created_at: datetime
     updated_at: datetime
 
@@ -97,6 +114,8 @@ class AdvisorListingCard(BaseModel):
     public_profile_slug: str | None
     match_percentage: int | None = None  # 0–100 for seeker; null without destination/visa context
     is_bookmarked: bool = False  # true when the current seeker has bookmarked this advisor
+    # Existing chat thread with the current seeker; null if none / caller is not a seeker
+    conversation_id: uuid.UUID | None = None
 
 
 class DocumentUploadResult(BaseModel):
@@ -161,7 +180,7 @@ class AdvisorOnboardingSubmit(BaseModel):
     country_of_residence: CountryCode | None = None
     countries_you_serve: list[CountryCode] = Field(default_factory=list, max_length=50)
     # Step 5
-    bio: str | None = Field(default=None, max_length=1000)
+    bio: str | None = Field(default=None, max_length=800)
     years_of_experience: int | None = Field(default=None, ge=0, le=60)
     # Step 6
     documents: list[OnboardingDocumentRef] = Field(default_factory=list, max_length=20)
@@ -188,7 +207,6 @@ class AdvisorVerificationResubmitRead(BaseModel):
 class AdvisorOnboardingCompleteRead(AdvisorProfileRead):
     """Onboarding submit response — profile plus approval-pending checklist."""
 
-    verification_status: VerificationStatus | None
     onboarding_status: AdvisorOnboardingStatusRead
 
 

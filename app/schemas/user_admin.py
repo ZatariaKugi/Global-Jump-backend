@@ -22,6 +22,7 @@ class UserListRead(BaseModel):
     full_name: str | None
     email: str
     role: UserRole
+    user_type: UserRole  # same as role — seeker | advisor (FE picker key)
     country_of_residence: str | None  # seeker-only; None for advisors/others
     status: AccountStatus
     created_at: datetime

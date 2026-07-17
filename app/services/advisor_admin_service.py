@@ -6,7 +6,7 @@ from __future__ import annotations
 import uuid
 from typing import Literal, cast
 
-from sqlalchemy import Select, exists, func, or_, select
+from sqlalchemy import Select, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.countries import country_name
@@ -34,6 +34,7 @@ from app.services import (
     payment_service,
     payout_service,
     review_service,
+    user_admin_service,
 )
 
 _LanguageProficiency = Literal["basic", "conversational", "fluent", "native"]
@@ -62,9 +63,9 @@ def list_advisors_stmt(
     stmt = select(User).where(User.role == UserRole.advisor).order_by(User.created_at.desc())
     if status is not None:
         stmt = stmt.where(User.verification_status == status)
-    if search:
-        pattern = f"%{search.strip()}%"
-        stmt = stmt.where(or_(User.full_name.ilike(pattern), User.email.ilike(pattern)))
+    clause = user_admin_service.user_search_clause(search)
+    if clause is not None:
+        stmt = stmt.where(clause)
     if visa_type is not None:
         stmt = stmt.where(
             exists().where(

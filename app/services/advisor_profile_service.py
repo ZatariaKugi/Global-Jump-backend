@@ -7,7 +7,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import AppError, PermissionDeniedError
+from app.core.exceptions import AppError, ConflictError, PermissionDeniedError
 from app.core.visa_types import parse_visa_type
 from app.models.advisor_credential import AdvisorCredential, DocumentType
 from app.models.advisor_profile import (
@@ -18,6 +18,9 @@ from app.models.advisor_profile import (
     AdvisorService,
     AdvisorVisaSpecialization,
 )
+from app.models.conversation import Conversation
+from app.models.message import Message
+from app.models.review import ModerationStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.models.visa_type import VisaType
 from app.schemas.advisor_profile import (
@@ -29,6 +32,7 @@ from app.schemas.advisor_profile import (
     LanguageEntry,
     ServiceOffering,
 )
+from app.services import review_service
 
 
 def _visa_specializations(profile: AdvisorProfile) -> list[VisaType]:
@@ -61,6 +65,21 @@ async def update(
     data: AdvisorProfileUpdate,
 ) -> AdvisorProfile:
     fields = data.model_dump(exclude_unset=True)
+
+    if "public_profile_slug" in fields:
+        slug = fields["public_profile_slug"]
+        if slug is None:
+            # Explicit null means "leave unchanged", not clear the slug.
+            fields.pop("public_profile_slug")
+        else:
+            taken = await session.scalar(
+                select(AdvisorProfile.id).where(
+                    AdvisorProfile.public_profile_slug == slug,
+                    AdvisorProfile.id != profile.id,
+                )
+            )
+            if taken is not None:
+                raise ConflictError("Public profile slug is already taken")
 
     if "visa_specializations" in fields:
         fields.pop("visa_specializations")
@@ -145,13 +164,92 @@ def _build_common(profile: AdvisorProfile) -> dict[str, object]:
     }
 
 
-def build_read(profile: AdvisorProfile) -> AdvisorProfileRead:
+async def compute_avg_response_time_hours(
+    session: AsyncSession, advisor_id: uuid.UUID
+) -> float | None:
+    """Mean hours from a seeker message to the next advisor reply across threads.
+
+    Returns ``None`` when there are no measurable seeker→advisor reply pairs.
+    """
+    conv_ids = (
+        await session.execute(
+            select(Conversation.id, Conversation.seeker_id).where(
+                Conversation.advisor_id == advisor_id
+            )
+        )
+    ).all()
+    if not conv_ids:
+        return None
+
+    seeker_by_conv = {row[0]: row[1] for row in conv_ids}
+    messages = (
+        await session.execute(
+            select(Message)
+            .where(Message.conversation_id.in_(seeker_by_conv.keys()))
+            .where(Message.deleted_at.is_(None))
+            .where(Message.moderation_status != ModerationStatus.removed)
+            .order_by(Message.conversation_id, Message.created_at)
+        )
+    ).scalars().all()
+
+    gaps: list[float] = []
+    prev_by_conv: dict[uuid.UUID, Message] = {}
+    for msg in messages:
+        prev = prev_by_conv.get(msg.conversation_id)
+        seeker_id = seeker_by_conv[msg.conversation_id]
+        if (
+            prev is not None
+            and prev.sender_id == seeker_id
+            and msg.sender_id == advisor_id
+        ):
+            gaps.append((msg.created_at - prev.created_at).total_seconds() / 3600.0)
+        prev_by_conv[msg.conversation_id] = msg
+
+    if not gaps:
+        return None
+    return round(sum(gaps) / len(gaps), 2)
+
+
+def build_read(
+    profile: AdvisorProfile,
+    *,
+    user: User | None = None,
+    average_rating: float | None = None,
+    review_count: int = 0,
+    avg_response_time_hours: float | None = None,
+    match_percentage: int | None = None,
+) -> AdvisorProfileRead:
     return AdvisorProfileRead(
         id=profile.id,
         user_id=profile.user_id,
         created_at=profile.created_at,
         updated_at=profile.updated_at,
+        average_rating=average_rating,
+        review_count=review_count,
+        avg_response_time_hours=avg_response_time_hours,
+        verification_status=user.verification_status if user is not None else None,
+        match_percentage=match_percentage,
         **_build_common(profile),
+    )
+
+
+async def build_enriched_read(
+    session: AsyncSession,
+    profile: AdvisorProfile,
+    user: User,
+    *,
+    match_percentage: int | None = None,
+) -> AdvisorProfileRead:
+    """Profile read with rating, response-time, and verification badges."""
+    average_rating, review_count = await review_service.rating_summary(session, profile.user_id)
+    response_hours = await compute_avg_response_time_hours(session, profile.user_id)
+    return build_read(
+        profile,
+        user=user,
+        average_rating=average_rating,
+        review_count=review_count,
+        avg_response_time_hours=response_hours,
+        match_percentage=match_percentage,
     )
 
 
@@ -161,6 +259,7 @@ def build_listing_card(
     rating: tuple[float, int] | None = None,
     match_percentage: int | None = None,
     is_bookmarked: bool = False,
+    conversation_id: uuid.UUID | None = None,
 ) -> AdvisorListingCard:
     average_rating, review_count = rating if rating else (None, 0)
     if profile is None:
@@ -182,6 +281,7 @@ def build_listing_card(
             public_profile_slug=None,
             match_percentage=match_percentage,
             is_bookmarked=is_bookmarked,
+            conversation_id=conversation_id,
         )
     prices = [s.price_usd for s in (profile.services or [])]
     return AdvisorListingCard(
@@ -202,6 +302,7 @@ def build_listing_card(
         public_profile_slug=profile.public_profile_slug,
         match_percentage=match_percentage,
         is_bookmarked=is_bookmarked,
+        conversation_id=conversation_id,
     )
 
 
