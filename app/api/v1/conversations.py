@@ -12,7 +12,7 @@ from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.api.pagination import PaginationDep, page_meta, paginate
 from app.core.config import Settings
 from app.core.exceptions import AppError, PermissionDeniedError
-from app.core.file_storage import resolve_url
+from app.core.file_storage import storage_path_from_key
 from app.core.security import decode_token
 from app.db.session import SessionDep
 from app.models.message import Message, MessageAttachment
@@ -126,10 +126,11 @@ async def send_message(
     for ref in data.attachments:
         if not ref.file_key.startswith(expected_prefix):
             raise PermissionDeniedError("Invalid attachment key")
-        file_url = resolve_url(f"/uploads/{ref.file_key}", settings)
+        # Persist the short storage path — never a long S3 presigned URL
+        # (those exceed message_attachments.file_url length and expire).
         attachments.append(
             MessageAttachment(
-                file_url=file_url,
+                file_url=storage_path_from_key(ref.file_key),
                 file_name=ref.file_name,
                 file_size=ref.file_size_bytes,
                 content_type=ref.content_type,

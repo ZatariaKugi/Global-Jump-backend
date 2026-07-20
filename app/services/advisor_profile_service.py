@@ -7,7 +7,9 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.core.exceptions import AppError, ConflictError, PermissionDeniedError
+from app.core.file_storage import resolve_media_url
 from app.core.visa_types import parse_visa_type
 from app.models.advisor_credential import AdvisorCredential, DocumentType
 from app.models.advisor_profile import (
@@ -33,6 +35,23 @@ from app.schemas.advisor_profile import (
     ServiceOffering,
 )
 from app.services import review_service
+
+
+def offered_service_types(profile: AdvisorProfile) -> list[str]:
+    """Service-type strings for booking dropdowns.
+
+    Prefer bookable ``AdvisorService`` types (what ``POST /bookings`` resolves),
+    then any onboarding ``offered_services`` categories, de-duplicated.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in [s.service_type for s in (profile.services or [])] + [
+        s.service_type for s in (profile.offered_services or [])
+    ]:
+        if raw not in seen:
+            seen.add(raw)
+            out.append(raw)
+    return out
 
 
 def _visa_specializations(profile: AdvisorProfile) -> list[VisaType]:
@@ -134,17 +153,18 @@ async def update(
     return profile
 
 
-def _build_common(profile: AdvisorProfile) -> dict[str, object]:
+def _build_common(profile: AdvisorProfile, settings: Settings) -> dict[str, object]:
     return {
         "title": profile.title,
         "bio": profile.bio,
-        "profile_photo_url": profile.profile_photo_url,
+        "profile_photo_url": resolve_media_url(profile.profile_photo_url, settings),
+        "banner_url": resolve_media_url(profile.banner_url, settings),
         "country_of_residence": profile.country_of_residence,
         "expertise_description": profile.expertise_description,
         "years_of_experience": profile.years_of_experience,
         "successful_applications": profile.successful_applications,
         "successful_application_rate": profile.successful_application_rate,
-        "offered_services": [s.service_type for s in (profile.offered_services or [])],
+        "offered_services": offered_service_types(profile),
         "visa_specializations": _visa_specializations(profile),
         "country_expertise": [c.country_code for c in (profile.country_expertise or [])],
         "languages": [
@@ -212,6 +232,7 @@ async def compute_avg_response_time_hours(
 
 def build_read(
     profile: AdvisorProfile,
+    settings: Settings,
     *,
     user: User | None = None,
     average_rating: float | None = None,
@@ -229,7 +250,7 @@ def build_read(
         avg_response_time_hours=avg_response_time_hours,
         verification_status=user.verification_status if user is not None else None,
         match_percentage=match_percentage,
-        **_build_common(profile),
+        **_build_common(profile, settings),
     )
 
 
@@ -237,6 +258,7 @@ async def build_enriched_read(
     session: AsyncSession,
     profile: AdvisorProfile,
     user: User,
+    settings: Settings,
     *,
     match_percentage: int | None = None,
 ) -> AdvisorProfileRead:
@@ -245,6 +267,7 @@ async def build_enriched_read(
     response_hours = await compute_avg_response_time_hours(session, profile.user_id)
     return build_read(
         profile,
+        settings,
         user=user,
         average_rating=average_rating,
         review_count=review_count,
@@ -256,6 +279,7 @@ async def build_enriched_read(
 def build_listing_card(
     user: User,
     profile: AdvisorProfile | None,
+    settings: Settings,
     rating: tuple[float, int] | None = None,
     match_percentage: int | None = None,
     is_bookmarked: bool = False,
@@ -289,9 +313,9 @@ def build_listing_card(
         full_name=user.full_name,
         email=user.email,
         title=profile.title,
-        profile_photo_url=profile.profile_photo_url,
+        profile_photo_url=resolve_media_url(profile.profile_photo_url, settings),
         years_of_experience=profile.years_of_experience,
-        offered_services=[s.service_type for s in (profile.offered_services or [])],
+        offered_services=offered_service_types(profile),
         visa_specializations=_visa_specializations(profile),
         country_expertise=[c.country_code for c in (profile.country_expertise or [])],
         languages=[lang.language for lang in (profile.languages or [])],
@@ -309,6 +333,7 @@ def build_listing_card(
 def build_public_read(
     user: User,
     profile: AdvisorProfile | None,
+    settings: Settings,
     match_percentage: int | None = None,
     is_bookmarked: bool = False,
 ) -> AdvisorProfilePublicRead:
@@ -318,7 +343,7 @@ def build_public_read(
             full_name=user.full_name,
             match_percentage=match_percentage,
             is_bookmarked=is_bookmarked,
-            **_build_common(profile),
+            **_build_common(profile, settings),
         )
     return AdvisorProfilePublicRead(
         user_id=user.id,
@@ -326,6 +351,7 @@ def build_public_read(
         title=None,
         bio=None,
         profile_photo_url=None,
+        banner_url=None,
         country_of_residence=None,
         expertise_description=None,
         years_of_experience=None,

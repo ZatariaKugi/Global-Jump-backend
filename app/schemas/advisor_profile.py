@@ -44,11 +44,13 @@ class AdvisorProfileUpdate(BaseModel):
 
     ``successful_applications`` is GET-only (not accepted here). Upload headshots
     via ``POST /uploads`` (``category=profile_photo``), then set ``profile_photo_url``.
+    Upload banners via ``category=profile_banner``, then set ``banner_url``.
     """
 
     title: str | None = Field(default=None, max_length=100)
     bio: str | None = Field(default=None, max_length=800)
     profile_photo_url: str | None = None
+    banner_url: str | None = None
     country_of_residence: CountryCode | None = None
     expertise_description: str | None = Field(default=None, max_length=2000)
     years_of_experience: int | None = Field(default=None, ge=0, le=60)
@@ -72,6 +74,7 @@ class AdvisorProfileRead(BaseModel):
     title: str | None
     bio: str | None
     profile_photo_url: str | None
+    banner_url: str | None
     country_of_residence: str | None
     expertise_description: str | None
     years_of_experience: int | None
@@ -216,6 +219,7 @@ class AdvisorProfilePublicRead(BaseModel):
     title: str | None
     bio: str | None
     profile_photo_url: str | None
+    banner_url: str | None
     country_of_residence: str | None
     expertise_description: str | None
     years_of_experience: int | None

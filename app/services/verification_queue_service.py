@@ -10,6 +10,8 @@ from typing import Literal
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
+from app.core.file_storage import resolve_media_url
 from app.models.advisor_credential import AdvisorCredential, CredentialStatus, DocumentType
 from app.models.advisor_profile import AdvisorProfile
 from app.models.user import User, UserRole, VerificationStatus
@@ -83,7 +85,7 @@ def _package_score(doc_types: set[DocumentType]) -> tuple[float, _VerificationRe
 
 
 async def build_list_read(
-    session: AsyncSession, advisors: list[User]
+    session: AsyncSession, advisors: list[User], settings: Settings
 ) -> list[VerificationQueueRead]:
     ids = [a.id for a in advisors]
     if not ids:
@@ -93,7 +95,9 @@ async def build_list_read(
         .scalars()
         .all()
     )
-    photos = {p.user_id: p.profile_photo_url for p in profile_rows}
+    photos = {
+        p.user_id: resolve_media_url(p.profile_photo_url, settings) for p in profile_rows
+    }
 
     agg_rows = (
         await session.execute(
