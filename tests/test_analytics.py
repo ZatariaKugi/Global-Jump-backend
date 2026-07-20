@@ -9,7 +9,6 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.security import hash_password
-from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.assessment import Assessment, AssessmentStatus, EligibilityTier
 from app.models.booking import Booking, BookingStatus
 from app.models.conversation import Conversation
@@ -152,48 +151,6 @@ async def _seed_payout(
                 net_amount_usd=amount_usd,
                 status=PayoutStatus.completed,
                 processed_at=processed_at,
-            )
-        )
-        await session.commit()
-
-
-async def _seed_assessment(engine, seeker_id: uuid.UUID, completed_at: datetime) -> uuid.UUID:
-    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with session_factory() as session:
-        assessment = Assessment(
-            user_id=seeker_id,
-            destination_country="GB",
-            visa_type="work",
-            status=AssessmentStatus.completed,
-            score=80.0,
-            tier=EligibilityTier.highly_eligible,
-            confidence=0.9,
-            completed_at=completed_at,
-        )
-        session.add(assessment)
-        await session.commit()
-        await session.refresh(assessment)
-        return assessment.id
-
-
-async def _seed_lead(
-    engine,
-    seeker_id: uuid.UUID,
-    advisor_id: uuid.UUID,
-    assessment_id: uuid.UUID,
-    match_score: float,
-    status: AdvisorLeadStatus,
-) -> None:
-    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with session_factory() as session:
-        session.add(
-            AdvisorLead(
-                seeker_id=seeker_id,
-                advisor_id=advisor_id,
-                assessment_id=assessment_id,
-                match_score=match_score,
-                match_reasons="test match",
-                status=status,
             )
         )
         await session.commit()
@@ -386,43 +343,75 @@ async def test_finance_analytics_revenue_and_refunds(
 # ── AI Analytics ─────────────────────────────────────────────────────────────
 
 
-async def test_ai_analytics_effectiveness_and_match_score(
+async def test_ai_analytics_pass_fail_volume_and_drop_off(
     client: AsyncClient, admin_token: str, engine
 ) -> None:
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
     seeker_id = await _seed_user(engine, "seeker-ai@test.com", "Seeker", UserRole.seeker)
-    advisor_id = await _seed_user(
-        engine,
-        "advisor-ai@test.com",
-        "Advisor",
-        UserRole.advisor,
-        is_active=True,
-        verification_status=VerificationStatus.approved,
-    )
     now = datetime.now(UTC)
 
-    leads = [
-        (10.0, AdvisorLeadStatus.new),
-        (55.0, AdvisorLeadStatus.viewed),
-        (95.0, AdvisorLeadStatus.contacted),
-    ]
-    for score, status in leads:
-        assessment_id = await _seed_assessment(engine, seeker_id, now)
-        await _seed_lead(engine, seeker_id, advisor_id, assessment_id, score, status)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        session.add_all(
+            [
+                Assessment(
+                    user_id=seeker_id,
+                    destination_country="GB",
+                    visa_type="work",
+                    status=AssessmentStatus.completed,
+                    score=90.0,
+                    tier=EligibilityTier.highly_eligible,
+                    confidence=0.9,
+                    completed_at=now,
+                    created_at=now,
+                ),
+                Assessment(
+                    user_id=seeker_id,
+                    destination_country="GB",
+                    visa_type="work",
+                    status=AssessmentStatus.completed,
+                    score=40.0,
+                    tier=EligibilityTier.low_eligibility,
+                    confidence=0.8,
+                    completed_at=now,
+                    created_at=now,
+                ),
+                Assessment(
+                    user_id=seeker_id,
+                    destination_country="GB",
+                    visa_type="work",
+                    status=AssessmentStatus.in_progress,
+                    created_at=now,
+                ),
+            ]
+        )
+        await session.commit()
 
     resp = await client.get(f"{ANALYTICS}/ai", headers=admin_headers)
     assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
 
-    effectiveness = {p["label"]: p["count"] for p in data["recommendation_effectiveness"]}
-    assert effectiveness["new"] == 1
-    assert effectiveness["viewed"] == 1
-    assert effectiveness["contacted"] == 1
+    assert set(data.keys()) >= {
+        "window_days",
+        "pass_rate",
+        "fail_rate",
+        "assessment_volume",
+        "drop_off_points",
+    }
+    assert "recommendation_effectiveness" not in data
+    assert "match_score_distribution" not in data
+    assert "session_duration_distribution" not in data
+    assert "eligibility_assessments_trend" not in data
 
-    buckets = {p["label"]: p["count"] for p in data["match_score_distribution"]}
-    assert buckets["0-20"] == 1
-    assert buckets["40-60"] == 1
-    assert buckets["80-100"] == 1
+    assert data["pass_rate"] == 50.0
+    assert data["fail_rate"] == 50.0
+    assert len(data["assessment_volume"]) == 1
+    assert data["assessment_volume"][0]["month"] == now.strftime("%b")
+    assert data["assessment_volume"][0]["value"] == 3
+    # Abandoned with no questions → Before Q1; value is % of started (1/3 ≈ 33.3)
+    assert data["drop_off_points"]
+    assert data["drop_off_points"][0]["stage"] == "Before Q1"
+    assert data["drop_off_points"][0]["value"] == 33.3
 
 
 # ── Engagement Analytics ─────────────────────────────────────────────────────

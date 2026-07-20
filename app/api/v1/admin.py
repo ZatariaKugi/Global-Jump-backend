@@ -116,6 +116,7 @@ router = APIRouter(
 async def list_advisors(
     params: PaginationDep,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     status: VerificationStatus | None = None,
     search: str | None = None,
@@ -126,7 +127,7 @@ async def list_advisors(
     stmt = advisor_admin_service.list_advisors_stmt(search, status, visa_type)
     advisors, total = await paginate(session, stmt, params)
     return ResponseEnvelope[list[AdvisorManagementListRead]](
-        data=await advisor_admin_service.build_list_read(session, advisors),
+        data=await advisor_admin_service.build_list_read(session, advisors, settings),
         meta=page_meta(params, total, request_id),
     )
 
@@ -241,6 +242,7 @@ async def update_advisor_featured(
     advisor_id: uuid.UUID,
     body: FeatureFlagUpdate,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorProfileRead]:
     """Feature or un-feature an advisor on the homepage (admin-curated, PRD §3.5)."""
@@ -256,7 +258,9 @@ async def update_advisor_featured(
     await session.flush()
     await session.refresh(profile)
     return ResponseEnvelope[AdvisorProfileRead](
-        data=await advisor_profile_service.build_enriched_read(session, profile, advisor),
+        data=await advisor_profile_service.build_enriched_read(
+            session, profile, advisor, settings
+        ),
         meta=Meta(request_id=request_id),
     )
 
@@ -444,10 +448,11 @@ async def activate_user(
 async def get_advisor_detail(
     advisor_id: uuid.UUID,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorManagementDetailRead]:
     """Detail page's Overview tab."""
-    data = await advisor_admin_service.get_advisor_detail(session, advisor_id)
+    data = await advisor_admin_service.get_advisor_detail(session, advisor_id, settings)
     return ResponseEnvelope[AdvisorManagementDetailRead](
         data=data, meta=Meta(request_id=request_id)
     )
@@ -586,12 +591,13 @@ async def get_booking_details_admin(
 async def list_verification_queue(
     params: PaginationDep,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[VerificationQueueRead]]:
     """Global, cross-advisor list of advisors with pending credential documents."""
     stmt = verification_queue_service.list_stmt()
     advisors, total = await paginate(session, stmt, params)
-    data = await verification_queue_service.build_list_read(session, advisors)
+    data = await verification_queue_service.build_list_read(session, advisors, settings)
     return ResponseEnvelope[list[VerificationQueueRead]](
         data=data, meta=page_meta(params, total, request_id)
     )
@@ -1582,8 +1588,9 @@ async def get_finance_analytics(
 
 @router.get("/analytics/ai", response_model=ResponseEnvelope[AIAnalyticsRead])
 async def get_ai_analytics(
-    session: SessionDep, request_id: RequestIdDep, days: int = 30
+    session: SessionDep, request_id: RequestIdDep, days: int = 270
 ) -> ResponseEnvelope[AIAnalyticsRead]:
+    """Default window ~9 months so seeded 8-month volume appears on the panel."""
     data = await analytics_service.get_ai_analytics(session, days)
     return ResponseEnvelope[AIAnalyticsRead](data=data, meta=Meta(request_id=request_id))
 
