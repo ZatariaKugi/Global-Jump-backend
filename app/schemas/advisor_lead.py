@@ -17,6 +17,10 @@ class AdvisorLeadRead(BaseModel):
     seeker_name: str | None
     seeker_email: str
     assessment_id: uuid.UUID
+    # Human-readable booking appointment id when this seeker/advisor pair already
+    # has a booking; null until a consultation is booked (leads are match-only).
+    appointment_id: str | None = None
+    booking_id: uuid.UUID | None = None
     destination_country: str
     visa_type: OptionalVisaType
     visa_type_name: str | None = None

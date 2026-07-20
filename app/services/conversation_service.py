@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
-from app.core.file_storage import resolve_url
+from app.core.file_storage import resolve_media_url
 from app.models.conversation import Conversation
 from app.models.message import Message, MessageAttachment
 from app.models.review import ModerationStatus
@@ -121,7 +121,8 @@ def list_messages_stmt(conversation_id: uuid.UUID) -> Select[tuple[Message]]:
         .where(Message.conversation_id == conversation_id)
         .where(Message.moderation_status.in_(PUBLIC_STATUSES))
         .where(Message.deleted_at.is_(None))
-        .order_by(Message.created_at.asc())
+        # Newest first so page 1 = latest messages (FE loads older pages on scroll-up).
+        .order_by(Message.created_at.desc())
     )
 
 
@@ -297,7 +298,7 @@ def build_message_read(message: Message, sender: User | None, settings: Settings
         attachments=[
             AttachmentRead(
                 id=a.id,
-                file_url=resolve_url(a.file_url, settings),
+                file_url=resolve_media_url(a.file_url, settings) or a.file_url,
                 file_name=a.file_name,
                 file_size=a.file_size,
                 content_type=a.content_type,

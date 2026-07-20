@@ -111,6 +111,7 @@ class AdvisorProfile(BaseModel):
     title: Mapped[str | None] = mapped_column(String(100), nullable=True)
     bio: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     profile_photo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    banner_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     # Onboarding location + free-text expertise description
     country_of_residence: Mapped[str | None] = mapped_column(String(2), nullable=True)

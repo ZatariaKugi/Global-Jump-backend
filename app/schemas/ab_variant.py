@@ -12,6 +12,7 @@ from app.core.visa_types import OptionalVisaType
 class AbVariantCreate(BaseModel):
     label: str = Field(min_length=1, max_length=8)
     name: str = Field(min_length=1, max_length=255)
+    question: str = Field(min_length=1, max_length=500)
     description: str | None = Field(default=None, max_length=1000)
     country_code: str | None = Field(default=None, min_length=2, max_length=2)
     visa_type: OptionalVisaType = None
@@ -21,6 +22,7 @@ class AbVariantCreate(BaseModel):
 class AbVariantUpdate(BaseModel):
     label: str | None = Field(default=None, min_length=1, max_length=8)
     name: str | None = Field(default=None, min_length=1, max_length=255)
+    question: str | None = Field(default=None, min_length=1, max_length=500)
     description: str | None = Field(default=None, max_length=1000)
     country_code: str | None = Field(default=None, min_length=2, max_length=2)
     visa_type: OptionalVisaType = None
@@ -31,6 +33,7 @@ class AbVariantRead(BaseModel):
     id: uuid.UUID
     label: str
     name: str
+    question: str
     description: str | None
     country_code: str | None
     visa_type: OptionalVisaType

@@ -41,6 +41,7 @@ async def create(
     row = AssessmentAbVariant(
         label=data.label.upper(),
         name=data.name,
+        question=data.question,
         description=data.description,
         country_code=data.country_code.upper() if data.country_code else None,
         visa_type=data.visa_type.lower() if data.visa_type else None,
@@ -149,6 +150,7 @@ async def build_reads(
                 id=v.id,
                 label=v.label,
                 name=v.name,
+                question=v.question,
                 description=v.description,
                 country_code=v.country_code,
                 visa_type=v.visa_type,

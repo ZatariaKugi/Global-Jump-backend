@@ -21,6 +21,7 @@ from app.core.visa_types import parse_visa_type, visa_type_name
 from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import Assessment
+from app.models.booking import Booking
 from app.models.user import User, UserRole, VerificationStatus
 from app.services import review_service
 from app.services.advisor_matching_service import score_advisor_for_assessment
@@ -147,3 +148,16 @@ async def dismiss(session: AsyncSession, lead: AdvisorLead, actor_id: uuid.UUID)
     await session.flush()
     await session.refresh(lead)
     return lead
+
+
+async def latest_booking_for_pair(
+    session: AsyncSession, seeker_id: uuid.UUID, advisor_id: uuid.UUID
+) -> Booking | None:
+    """Most recent booking between this seeker and advisor, if any."""
+    result = await session.execute(
+        select(Booking)
+        .where(Booking.seeker_id == seeker_id, Booking.advisor_id == advisor_id)
+        .order_by(Booking.created_at.desc())
+        .limit(1)
+    )
+    return result.scalars().first()

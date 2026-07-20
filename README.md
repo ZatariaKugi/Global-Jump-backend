@@ -174,4 +174,12 @@ async def list_things(params: PaginationDep, session: SessionDep, request_id: Re
 docker compose up --build
 ```
 
-This starts PostgreSQL, runs `alembic upgrade head`, then serves the API on port 8000.
+This starts PostgreSQL, runs a one-shot **`migrate`** service (`alembic upgrade head`),
+then serves the API on port 8000.
+
+Standalone image runs (Kubernetes / `docker run`) also auto-migrate via the
+image entrypoint (`scripts/docker-entrypoint.sh`) unless you set
+`RUN_MIGRATIONS=false`.
+
+> Migrations are **not** applied during `docker build` — there is no database
+> at build time. They apply on container start / CI deploy, same as Rails/Django.
