@@ -19,6 +19,7 @@ class Environment(StrEnum):
     local = "local"
     staging = "staging"
     production = "production"
+    test = "test"  # CI / automated runs
 
 
 class Settings(BaseSettings):
