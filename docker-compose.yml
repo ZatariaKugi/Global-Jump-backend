@@ -5,17 +5,32 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: app_db
+      POSTGRES_DB: jump_db
     # Override if host port 5432 is already taken, e.g. POSTGRES_PUBLISH_PORT=5433
     ports:
       - "${POSTGRES_PUBLISH_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d app_db"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d jump_db"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # One-shot migration job — runs before the API starts (CI/local compose).
+  migrate:
+    build: .
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: local
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/jump_db
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      JWT_ISSUER: ${JWT_ISSUER:-globlejump}
+      RUN_MIGRATIONS: "false"
+    entrypoint: ["alembic", "upgrade", "head"]
 
   api:
     build: .
@@ -23,11 +38,15 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       ENVIRONMENT: local
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/app_db
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/jump_db
       JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
       JWT_ISSUER: ${JWT_ISSUER:-globlejump}
+      # migrate service already applied schema; skip duplicate on API start.
+      RUN_MIGRATIONS: "false"
     # Override if host port 8000 is already taken, e.g. API_PUBLISH_PORT=8001
     ports:
       - "${API_PUBLISH_PORT:-8000}:8000"
@@ -45,10 +64,6 @@ services:
       timeout: 5s
       retries: 6
       start_period: 20s
-    # Run migrations then start the server.
-    command: >
-      sh -c "alembic upgrade head &&
-             uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
 volumes:
   pgdata:

@@ -15,6 +15,8 @@ class AssessmentAbVariant(BaseModel):
 
     label: Mapped[str] = mapped_column(String(8), nullable=False)  # A, B, C, D
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Card body copy on the A/B Testing admin panel (the experiment question).
+    question: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     description: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     country_code: Mapped[str | None] = mapped_column(String(2), nullable=True, index=True)
     visa_type: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
