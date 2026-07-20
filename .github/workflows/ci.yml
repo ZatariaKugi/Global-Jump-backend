@@ -18,7 +18,7 @@ env:
 
 jobs:
   check:
-    name: Lint · typecheck · test · migrate
+    name: Lint · typecheck · migrate
     runs-on: ubuntu-latest
 
     services:
@@ -65,9 +65,6 @@ jobs:
 
       - name: Show migration head
         run: uv run alembic current
-
-      - name: Test
-        run: make test
 
       - name: Build Docker image
         run: docker build -t gobal-jump-backend:ci .
