@@ -37,6 +37,7 @@ from app.schemas.assessment import (
     AssessmentVolumePoint,
     QuestionCreate,
     QuestionOptionInput,
+    QuestionOptionPatchInput,
     QuestionUpdate,
 )
 from app.schemas.assessment_threshold import AssessmentThresholdUpsert
@@ -345,6 +346,47 @@ def _build_options(data: list[QuestionOptionInput]) -> list[AssessmentQuestionOp
     ]
 
 
+def _merge_options(
+    question: AssessmentQuestion, incoming: list[QuestionOptionPatchInput]
+) -> None:
+    """Update by id, create when id absent, delete when an existing id is omitted."""
+    if len(incoming) < 2:
+        raise AppError(
+            "A question must keep at least two options",
+            code="too_few_options",
+        )
+
+    existing_by_id = {opt.id: opt for opt in question.options}
+    merged: list[AssessmentQuestionOption] = []
+    seen: set[uuid.UUID] = set()
+
+    for item in incoming:
+        if item.id is not None:
+            current = existing_by_id.get(item.id)
+            if current is None:
+                raise NotFoundError("Option not found on this question")
+            if item.id in seen:
+                raise AppError("Duplicate option id in patch", code="duplicate_option_id")
+            seen.add(item.id)
+            patch = item.model_dump(exclude_unset=True, exclude={"id"})
+            for field, value in patch.items():
+                setattr(current, field, value)
+            merged.append(current)
+        else:
+            assert item.text is not None  # validated by QuestionOptionPatchInput
+            merged.append(
+                AssessmentQuestionOption(
+                    text=item.text,
+                    score=0.0 if item.score is None else item.score,
+                    improvement_tip=item.improvement_tip,
+                    display_order=0 if item.display_order is None else item.display_order,
+                )
+            )
+
+    # Reassign so delete-orphan drops options not present in the patch list.
+    question.options = merged
+
+
 async def create_question(
     session: AsyncSession, data: QuestionCreate, admin_id: uuid.UUID
 ) -> AssessmentQuestion:
@@ -377,7 +419,7 @@ async def update_question(
     fields.pop("weightage_pct", None)
     if "options" in fields:
         fields.pop("options")
-        question.options = _build_options(data.options or [])
+        _merge_options(question, data.options or [])
     if "country_code" in fields:
         code = fields.pop("country_code")
         question.country_code = code.upper() if code else None

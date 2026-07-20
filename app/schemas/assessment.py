@@ -39,6 +39,22 @@ class QuestionOptionInput(BaseModel):
     display_order: int = 0
 
 
+class QuestionOptionPatchInput(BaseModel):
+    """PATCH option row — merge by ``id`` when present; create when omitted."""
+
+    id: uuid.UUID | None = None
+    text: str | None = Field(default=None, min_length=1, max_length=255)
+    score: float | None = Field(default=None, ge=0, le=100)
+    improvement_tip: str | None = Field(default=None, max_length=500)
+    display_order: int | None = None
+
+    @model_validator(mode="after")
+    def _create_requires_text(self) -> QuestionOptionPatchInput:
+        if self.id is None and self.text is None:
+            raise ValueError("text is required when creating a new option (id omitted)")
+        return self
+
+
 class QuestionCreate(BaseModel):
     text: str = Field(min_length=1, max_length=500)
     description: str | None = Field(default=None, max_length=1000)
@@ -71,7 +87,8 @@ class QuestionUpdate(BaseModel):
     display_order: int | None = None
     is_active: bool | None = None
     depends_on_option_id: uuid.UUID | None = None
-    options: list[QuestionOptionInput] | None = None
+    # Merge semantics: update by id, create when id absent, delete when omitted.
+    options: list[QuestionOptionPatchInput] | None = None
 
     @model_validator(mode="after")
     def _apply_weightage_pct(self) -> QuestionUpdate:
