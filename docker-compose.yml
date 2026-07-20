@@ -15,9 +15,10 @@ services:
       test: ["CMD-SHELL", "pg_isready -U postgres -d jump_db"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 20
+      start_period: 10s
 
-  # One-shot migration job — runs before the API starts (CI/local compose).
+  # One-shot migration job — waits for DB, retries alembic, then exits.
   migrate:
     build: .
     restart: "no"
@@ -30,7 +31,10 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
       JWT_ISSUER: ${JWT_ISSUER:-globlejump}
       RUN_MIGRATIONS: "false"
-    entrypoint: ["alembic", "upgrade", "head"]
+      DB_WAIT_ATTEMPTS: "60"
+      MIGRATE_ATTEMPTS: "10"
+    entrypoint: ["/app/scripts/migrate.sh"]
+    command: []
 
   api:
     build: .
@@ -47,11 +51,15 @@ services:
       JWT_ISSUER: ${JWT_ISSUER:-globlejump}
       # migrate service already applied schema; skip duplicate on API start.
       RUN_MIGRATIONS: "false"
+      DB_WAIT_ATTEMPTS: "60"
     # Override if host port 8000 is already taken, e.g. API_PUBLISH_PORT=8001
     ports:
       - "${API_PUBLISH_PORT:-8000}:8000"
     volumes:
       - api_uploads:/app/uploads
+    # Explicit so Compose never drops the process args.
+    command:
+      ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     healthcheck:
       test:
         [
@@ -62,8 +70,8 @@ services:
         ]
       interval: 10s
       timeout: 5s
-      retries: 6
-      start_period: 20s
+      retries: 12
+      start_period: 40s
 
 volumes:
   pgdata:
