@@ -9,7 +9,7 @@ MSG ?= new_migration
 
 .PHONY: help install env db-up db-down db-logs migrate migrate-create migrate-downgrade \
 	run run-prod lint format format-check typecheck test check pre-commit secrets \
-	docker-up docker-down clean
+	docker-up docker-migrate docker-down clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*##"; print "Available targets:"} /^[a-zA-Z0-9_.-]+:.*##/ {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -67,8 +67,11 @@ pre-commit: ## Run pre-commit hooks on all files
 secrets: ## Run detect-secrets hook manually
 	$(UV_RUN) pre-commit run detect-secrets --hook-stage manual --all-files
 
-docker-up: ## Start full stack with Docker (set API_PUBLISH_PORT / POSTGRES_PUBLISH_PORT if busy)
+docker-up: ## Start full stack (db → migrate → api). Ports: API_PUBLISH_PORT / POSTGRES_PUBLISH_PORT
 	docker compose up --build
+
+docker-migrate: ## Run alembic upgrade head inside Compose (against the db service)
+	docker compose run --rm migrate
 
 docker-down: ## Stop and remove Docker stack
 	docker compose down

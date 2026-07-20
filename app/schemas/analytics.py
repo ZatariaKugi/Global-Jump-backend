@@ -29,12 +29,6 @@ class RetentionPoint(BaseModel):
     retention_pct: float
 
 
-class EligibilityTierMonthPoint(BaseModel):
-    month: str
-    tier: str
-    count: int
-
-
 # ── Overview ─────────────────────────────────────────────────────────────────
 
 
@@ -91,12 +85,22 @@ class FinanceAnalyticsRead(BaseModel):
 # ── AI Analytics ─────────────────────────────────────────────────────────────
 
 
+class AssessmentVolumePoint(BaseModel):
+    month: str  # axis label, e.g. "Jan"
+    value: int  # assessment count for that month
+
+
+class DropOffStagePoint(BaseModel):
+    stage: str  # e.g. "Q1"
+    value: float  # drop-off percentage (0–100) of assessments started
+
+
 class AIAnalyticsRead(BaseModel):
     window_days: int
-    recommendation_effectiveness: list[LabeledCountPoint]  # AdvisorLead.status distribution
-    match_score_distribution: list[LabeledCountPoint]  # bucketed match_score
-    session_duration_distribution: list[LabeledCountPoint]  # bucketed duration_minutes
-    eligibility_assessments_trend: list[EligibilityTierMonthPoint]
+    pass_rate: float  # 0–100, % of completed assessments in pass tiers
+    fail_rate: float  # 0–100, % of completed assessments in fail tiers
+    assessment_volume: list[AssessmentVolumePoint]
+    drop_off_points: list[DropOffStagePoint]
 
 
 # ── Engagement Analytics ─────────────────────────────────────────────────────
