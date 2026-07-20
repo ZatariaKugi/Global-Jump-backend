@@ -116,6 +116,7 @@ async def _conversation_ids(
 async def get_my_advisor_profile(
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorProfileRead]:
     """Own profile including read-only stats (rating, response time, verification).
@@ -126,7 +127,9 @@ async def get_my_advisor_profile(
     """
     profile = await advisor_profile_service.get_or_create(session, current_user.id)
     return ResponseEnvelope[AdvisorProfileRead](
-        data=await advisor_profile_service.build_enriched_read(session, profile, current_user),
+        data=await advisor_profile_service.build_enriched_read(
+            session, profile, current_user, settings
+        ),
         meta=Meta(request_id=request_id),
     )
 
@@ -140,6 +143,7 @@ async def update_my_advisor_profile(
     data: AdvisorProfileUpdate,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorProfileRead]:
     """Update editable profile fields. ``successful_applications`` is not accepted."""
@@ -150,7 +154,9 @@ async def update_my_advisor_profile(
         )
     profile = await advisor_profile_service.update(session, profile, data)
     return ResponseEnvelope[AdvisorProfileRead](
-        data=await advisor_profile_service.build_enriched_read(session, profile, current_user),
+        data=await advisor_profile_service.build_enriched_read(
+            session, profile, current_user, settings
+        ),
         meta=Meta(request_id=request_id),
     )
 
@@ -172,6 +178,7 @@ async def list_advisors(
     params: PaginationDep,
     principal: CurrentPrincipal,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     q: Annotated[str | None, Query(max_length=100, description="Keyword search")] = None,
     country: Annotated[str | None, Query(max_length=2, description="Country expertise")] = None,
@@ -210,6 +217,7 @@ async def list_advisors(
             advisor_profile_service.build_listing_card(
                 u,
                 profiles_by_user.get(u.id),
+                settings,
                 ratings.get(u.id),
                 match_percentage=advisor_matching_service.match_percentage(
                     profiles_by_user.get(u.id),
@@ -231,6 +239,7 @@ async def list_featured_advisors(
     params: PaginationDep,
     principal: CurrentPrincipal,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[AdvisorListingCard]]:
     stmt = advisor_search_service.build_search_stmt(AdvisorSearchFilters(featured_only=True))
@@ -246,6 +255,7 @@ async def list_featured_advisors(
             advisor_profile_service.build_listing_card(
                 u,
                 profiles_by_user.get(u.id),
+                settings,
                 ratings.get(u.id),
                 match_percentage=advisor_matching_service.match_percentage(
                     profiles_by_user.get(u.id),
@@ -267,6 +277,7 @@ async def get_advisor_by_slug(
     slug: str,
     principal: CurrentPrincipal,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorProfilePublicRead]:
     result = await session.execute(
@@ -290,6 +301,7 @@ async def get_advisor_by_slug(
         data=advisor_profile_service.build_public_read(
             user,
             profile,
+            settings,
             match_percentage=advisor_matching_service.match_percentage(
                 profile, destination, match_visa, avg
             ),
@@ -304,6 +316,7 @@ async def get_advisor_public_profile(
     advisor_id: uuid.UUID,
     principal: CurrentPrincipal,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorProfilePublicRead]:
     user = await session.get(User, advisor_id)
@@ -320,6 +333,7 @@ async def get_advisor_public_profile(
         data=advisor_profile_service.build_public_read(
             user,
             profile,
+            settings,
             match_percentage=advisor_matching_service.match_percentage(
                 profile, destination, match_visa, avg
             ),
@@ -361,6 +375,7 @@ async def complete_advisor_onboarding(
     data: AdvisorOnboardingSubmit,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorOnboardingCompleteRead]:
     """Accept the complete advisor onboarding wizard payload in one shot.
@@ -415,7 +430,7 @@ async def complete_advisor_onboarding(
         session, current_user, profile
     )
     profile_data = await advisor_profile_service.build_enriched_read(
-        session, profile, current_user
+        session, profile, current_user, settings
     )
 
     return ResponseEnvelope[AdvisorOnboardingCompleteRead](
@@ -620,12 +635,17 @@ async def delete_credential(
 async def _build_lead_read(session: SessionDep, lead: AdvisorLead) -> AdvisorLeadRead:
     seeker = await session.get(User, lead.seeker_id)
     assessment = await session.get(Assessment, lead.assessment_id)
+    booking = await advisor_lead_service.latest_booking_for_pair(
+        session, lead.seeker_id, lead.advisor_id
+    )
     return AdvisorLeadRead(
         id=lead.id,
         seeker_id=lead.seeker_id,
         seeker_name=seeker.full_name if seeker else None,
         seeker_email=seeker.email if seeker else "",
         assessment_id=lead.assessment_id,
+        appointment_id=booking_service.appointment_id_str(booking) if booking else None,
+        booking_id=booking.id if booking else None,
         destination_country=assessment.destination_country if assessment else "",
         visa_type=assessment.visa_type if assessment else "",
         visa_type_name=visa_type_name(assessment.visa_type) if assessment else None,

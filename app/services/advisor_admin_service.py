@@ -9,8 +9,10 @@ from typing import Literal, cast
 from sqlalchemy import Select, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.core.countries import country_name
 from app.core.exceptions import NotFoundError
+from app.core.file_storage import resolve_media_url
 from app.models.advisor_credential import AdvisorCredential, CredentialStatus
 from app.models.advisor_profile import AdvisorProfile, AdvisorVisaSpecialization
 from app.models.booking import Booking, BookingStatus
@@ -91,7 +93,7 @@ async def _profiles_by_user(
 
 
 async def build_list_read(
-    session: AsyncSession, advisors: list[User]
+    session: AsyncSession, advisors: list[User], settings: Settings
 ) -> list[AdvisorManagementListRead]:
     """Bulk-enrich one page: profiles + Sessions count + Rating, each a
     single grouped query keyed by the page's user ids — not N+1."""
@@ -141,7 +143,9 @@ async def build_list_read(
                 id=a.id,
                 full_name=a.full_name,
                 email=a.email,
-                profile_photo_url=profile.profile_photo_url if profile else None,
+                profile_photo_url=(
+                    resolve_media_url(profile.profile_photo_url, settings) if profile else None
+                ),
                 country_code=residence_code,
                 country=country_name(residence_code),
                 expertise=(
@@ -162,7 +166,7 @@ async def build_list_read(
 
 
 async def get_advisor_detail(
-    session: AsyncSession, advisor_id: uuid.UUID
+    session: AsyncSession, advisor_id: uuid.UUID, settings: Settings
 ) -> AdvisorManagementDetailRead:
     advisor = await session.get(User, advisor_id)
     if advisor is None or advisor.role != UserRole.advisor:
@@ -202,7 +206,7 @@ async def get_advisor_detail(
         id=advisor.id,
         full_name=advisor.full_name,
         email=advisor.email,
-        profile_photo_url=profile.profile_photo_url,
+        profile_photo_url=resolve_media_url(profile.profile_photo_url, settings),
         country_code=profile.country_of_residence,
         country=country_name(profile.country_of_residence),
         expertise=[s.specialization for s in profile.visa_specializations],

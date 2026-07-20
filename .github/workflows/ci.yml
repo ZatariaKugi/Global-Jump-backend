@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  POSTGRES_DB: jump_db
+
+jobs:
+  check:
+    name: Lint · typecheck · test · migrate
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d jump_db"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/jump_db
+      JWT_SECRET: ci-test-secret
+      JWT_ISSUER: globlejump
+      ENVIRONMENT: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Lint
+        run: make lint
+
+      - name: Typecheck
+        run: make typecheck
+
+      - name: Apply migrations (verify alembic against Postgres)
+        run: uv run alembic upgrade head
+
+      - name: Show migration head
+        run: uv run alembic current
+
+      - name: Test
+        run: make test
+
+      - name: Build Docker image
+        run: docker build -t gobal-jump-backend:ci .
+
+  deploy:
+    name: Deploy (migrate then restart)
+    needs: check
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+    runs-on: ubuntu-latest
+    # Uses repository secrets (DATABASE_URL, JWT_*, optional Docker/SSH).
+    # Create GitHub Environments named "dev"/"main" later if you want per-branch secrets.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --frozen --no-dev
+
+      - name: Apply production migrations
+        # Set repository/environment secret DATABASE_URL for the target DB.
+        # alembic upgrade head is idempotent — safe on every deploy.
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          JWT_ISSUER: ${{ secrets.JWT_ISSUER }}
+          ENVIRONMENT: ${{ secrets.ENVIRONMENT }}
+        run: |
+          export JWT_ISSUER="${JWT_ISSUER:-globlejump}"
+          export ENVIRONMENT="${ENVIRONMENT:-production}"
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "DATABASE_URL secret is not set — skipping remote migrate."
+            echo "Add secrets.DATABASE_URL (and JWT_*) to enable auto-migrate on deploy."
+            exit 0
+          fi
+          if [ -z "${JWT_SECRET:-}" ]; then
+            export JWT_SECRET="ci-placeholder"
+          fi
+          echo "Applying alembic migrations to target database..."
+          uv run alembic upgrade head
+          uv run alembic current
+
+      - name: Build and push image (optional registry)
+        env:
+          REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+          IMAGE: ${{ secrets.DOCKER_IMAGE }}
+          USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          if [ -z "${REGISTRY:-}" ] || [ -z "${USERNAME:-}" ] || [ -z "${PASSWORD:-}" ]; then
+            echo "Docker registry secrets not set — skipping image push."
+            exit 0
+          fi
+          IMAGE_NAME="${IMAGE:-gobal-jump-backend}"
+          echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
+          TAG="${REGISTRY}/${IMAGE_NAME}:${GITHUB_SHA}"
+          LATEST="${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          docker build -t "$TAG" -t "$LATEST" .
+          docker push "$TAG"
+          docker push "$LATEST"
+          echo "Pushed $TAG"
+
+      - name: Remote deploy hook (optional)
+        env:
+          DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_COMMAND: ${{ secrets.DEPLOY_SSH_COMMAND }}
+        run: |
+          if [ -n "${DEPLOY_WEBHOOK_URL:-}" ]; then
+            curl -fsS -X POST "$DEPLOY_WEBHOOK_URL"
+            echo "Webhook triggered."
+            exit 0
+          fi
+          if [ -n "${DEPLOY_SSH_HOST:-}" ] && [ -n "${DEPLOY_SSH_KEY:-}" ]; then
+            mkdir -p ~/.ssh
+            printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+            chmod 600 ~/.ssh/deploy_key
+            USER="${DEPLOY_SSH_USER:-deploy}"
+            CMD="${DEPLOY_SSH_COMMAND:-cd /opt/gobal-jump-backend && docker compose pull && docker compose up -d}"
+            ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+              "${USER}@${DEPLOY_SSH_HOST}" \
+              "$CMD"
+            echo "Remote deploy finished."
+            exit 0
+          fi
+          echo "No deploy hook configured (optional). Migrations already applied when DATABASE_URL is set."

@@ -11,7 +11,6 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.activity_log import ActivityLog
-from app.models.advisor_lead import AdvisorLead
 from app.models.assessment import Assessment, AssessmentStatus
 from app.models.booking import Booking, BookingStatus
 from app.models.message import Message
@@ -22,7 +21,8 @@ from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.analytics import (
     AdvisorAnalyticsRead,
     AIAnalyticsRead,
-    EligibilityTierMonthPoint,
+    AssessmentVolumePoint,
+    DropOffStagePoint,
     EngagementAnalyticsRead,
     FinanceAnalyticsRead,
     LabeledCountPoint,
@@ -34,30 +34,16 @@ from app.schemas.analytics import (
     TopAdvisorRead,
 )
 from app.services import review_service
-
-_MATCH_SCORE_BUCKETS = ["0-20", "20-40", "40-60", "60-80", "80-100"]
-_DURATION_BUCKETS = ["<30m", "30-60m", "60-90m", "90m+"]
+from app.services.assessment_service import FAIL_TIERS, PASS_TIERS, list_questions
 
 
 def _month_key(dt: datetime) -> str:
     return dt.strftime("%Y-%m")
 
 
-def _bucket_match_score(score: float) -> str:
-    if score >= 100:
-        return "80-100"
-    index = min(int(score // 20), 4)
-    return _MATCH_SCORE_BUCKETS[index]
-
-
-def _bucket_duration(minutes: int) -> str:
-    if minutes < 30:
-        return "<30m"
-    if minutes < 60:
-        return "30-60m"
-    if minutes < 90:
-        return "60-90m"
-    return "90m+"
+def _month_label(ym: str) -> str:
+    """YYYY-MM → short month name for chart axis (e.g. Jan)."""
+    return datetime.strptime(ym, "%Y-%m").strftime("%b")
 
 
 def _since(days: int) -> datetime:
@@ -388,79 +374,85 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
 # ── AI Analytics ─────────────────────────────────────────────────────────────
 
 
-async def get_ai_analytics(session: AsyncSession, days: int = 30) -> AIAnalyticsRead:
+def _drop_off_stage_sort_key(stage: str) -> tuple[int, int | str]:
+    if stage.startswith("Q") and stage[1:].isdigit():
+        return (0, int(stage[1:]))
+    return (1, stage)
+
+
+async def _ai_drop_off_points(
+    session: AsyncSession, assessments: list[Assessment], total_started: int
+) -> list[DropOffStagePoint]:
+    """% of started assessments that abandoned at each question stage (Q1, Q2, …)."""
+    abandoned = [a for a in assessments if a.status == AssessmentStatus.in_progress]
+    if not abandoned or total_started == 0:
+        return []
+
+    by_scope: dict[tuple[str, str], list[Assessment]] = defaultdict(list)
+    for a in abandoned:
+        by_scope[(a.destination_country, a.visa_type)].append(a)
+
+    stage_counts: dict[str, int] = defaultdict(int)
+    for (country, visa), group in by_scope.items():
+        questions = await list_questions(session, country, visa)
+        if not questions:
+            stage_counts["Before Q1"] += len(group)
+            continue
+        for assessment in group:
+            answered_ids = {ans.question_id for ans in (assessment.answers or [])}
+            stage = f"Q{len(questions)}"
+            for i, q in enumerate(questions):
+                if q.id not in answered_ids:
+                    stage = f"Q{i + 1}"
+                    break
+            stage_counts[stage] += 1
+
+    return [
+        DropOffStagePoint(
+            stage=stage,
+            value=round(100 * count / total_started, 1),
+        )
+        for stage, count in sorted(
+            stage_counts.items(), key=lambda x: _drop_off_stage_sort_key(x[0])
+        )
+        if count > 0
+    ]
+
+
+async def get_ai_analytics(session: AsyncSession, days: int = 270) -> AIAnalyticsRead:
     since = _since(days)
 
-    status_rows = (
-        await session.execute(
-            select(AdvisorLead.status, func.count())
-            .where(AdvisorLead.created_at >= since)
-            .group_by(AdvisorLead.status)
-        )
-    ).all()
-    recommendation_effectiveness = [
-        LabeledCountPoint(label=str(status), count=count) for status, count in status_rows
-    ]
-
-    match_scores = (
-        (
-            await session.execute(
-                select(AdvisorLead.match_score).where(AdvisorLead.created_at >= since)
-            )
-        )
+    assessments = list(
+        (await session.execute(select(Assessment).where(Assessment.created_at >= since)))
         .scalars()
         .all()
     )
-    match_bucket_counts: dict[str, int] = defaultdict(int)
-    for score in match_scores:
-        match_bucket_counts[_bucket_match_score(score)] += 1
-    match_score_distribution = [
-        LabeledCountPoint(label=label, count=match_bucket_counts.get(label, 0))
-        for label in _MATCH_SCORE_BUCKETS
+
+    total_started = len(assessments)
+    completed = [a for a in assessments if a.status == AssessmentStatus.completed]
+    total_completed = len(completed)
+
+    pass_count = sum(1 for a in completed if a.tier in PASS_TIERS)
+    fail_count = sum(1 for a in completed if a.tier in FAIL_TIERS)
+    pass_rate = round(100 * pass_count / total_completed, 1) if total_completed else 0.0
+    fail_rate = round(100 * fail_count / total_completed, 1) if total_completed else 0.0
+
+    month_counts: dict[str, int] = defaultdict(int)
+    for a in assessments:
+        month_counts[_month_key(a.created_at)] += 1
+    assessment_volume = [
+        AssessmentVolumePoint(month=_month_label(ym), value=count)
+        for ym, count in sorted(month_counts.items())
     ]
 
-    durations = (
-        (
-            await session.execute(
-                select(Booking.duration_minutes).where(
-                    Booking.status == BookingStatus.completed, Booking.scheduled_start >= since
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    duration_bucket_counts: dict[str, int] = defaultdict(int)
-    for minutes in durations:
-        duration_bucket_counts[_bucket_duration(minutes)] += 1
-    session_duration_distribution = [
-        LabeledCountPoint(label=label, count=duration_bucket_counts.get(label, 0))
-        for label in _DURATION_BUCKETS
-    ]
-
-    assessment_rows = (
-        await session.execute(
-            select(Assessment.completed_at, Assessment.tier).where(
-                Assessment.status == AssessmentStatus.completed,
-                Assessment.completed_at >= since,
-            )
-        )
-    ).all()
-    tier_month_counts: dict[tuple[str, str], int] = defaultdict(int)
-    for completed_at, tier in assessment_rows:
-        assert completed_at is not None  # filtered by completed_at >= since above
-        tier_month_counts[(_month_key(completed_at), str(tier))] += 1
-    eligibility_assessments_trend = [
-        EligibilityTierMonthPoint(month=month, tier=tier, count=count)
-        for (month, tier), count in sorted(tier_month_counts.items())
-    ]
+    drop_off_points = await _ai_drop_off_points(session, assessments, total_started)
 
     return AIAnalyticsRead(
         window_days=days,
-        recommendation_effectiveness=recommendation_effectiveness,
-        match_score_distribution=match_score_distribution,
-        session_duration_distribution=session_duration_distribution,
-        eligibility_assessments_trend=eligibility_assessments_trend,
+        pass_rate=pass_rate,
+        fail_rate=fail_rate,
+        assessment_volume=assessment_volume,
+        drop_off_points=drop_off_points,
     )
 
 
