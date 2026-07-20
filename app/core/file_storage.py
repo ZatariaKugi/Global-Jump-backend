@@ -108,19 +108,51 @@ def resolve_url(url_path: str, settings: Settings) -> str:
     S3 keeps "Block all public access" on, so reads need a time-limited presigned URL
     generated per-request rather than a permanent public link. Local storage already
     serves directly from the static mount, so the path is returned unchanged.
+
+    Presign / S3 client failures never raise — callers always get a usable path so
+    upload and message APIs cannot 500 solely because signing failed.
     """
     if not url_path.startswith("/uploads/") or not _s3_enabled(settings):
         return url_path
 
     key = url_path.removeprefix("/uploads/")
-    client = _client(settings)
-    return str(
-        client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-            ExpiresIn=3600,
+    try:
+        client = _client(settings)
+        return str(
+            client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
+                ExpiresIn=3600,
+            )
         )
-    )
+    except Exception:  # noqa: BLE001 — never fail API responses on signing
+        return url_path
+
+
+def resolve_media_url(value: str | None, settings: Settings) -> str | None:
+    """Resolve a stored media field for API responses.
+
+    - empty / null → ``None``
+    - absolute ``http(s)://`` URL → returned as-is
+    - bare file key or ``/uploads/{key}`` → signed/public URL via :func:`resolve_url`
+    """
+    if value is None:
+        return None
+    trimmed = value.strip()
+    if not trimmed:
+        return None
+    if trimmed.startswith(("http://", "https://")):
+        return trimmed
+    path = trimmed if trimmed.startswith("/uploads/") else f"/uploads/{trimmed.lstrip('/')}"
+    try:
+        return resolve_url(path, settings)
+    except Exception:  # noqa: BLE001 — defensive; resolve_url already swallows S3 errors
+        return path
+
+
+def storage_path_from_key(file_key: str) -> str:
+    """Canonical short path to persist in DB (never a presigned URL)."""
+    return f"/uploads/{normalize_file_key(file_key)}"
 
 
 def normalize_file_key(file_key: str) -> str:
