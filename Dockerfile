@@ -2,8 +2,7 @@
 # Multi-stage build using uv.
 #
 # Migrations are NOT applied during `docker build` (no database is available).
-# The entrypoint runs `alembic upgrade head` on container start so every deploy
-# auto-applies schema changes, matching typical Rails/Django/CI patterns.
+# The entrypoint / migrate script apply them at container start.
 
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
 
@@ -29,7 +28,11 @@ FROM python:3.12-slim-bookworm AS runtime
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    RUN_MIGRATIONS=true
+    RUN_MIGRATIONS=true \
+    DB_WAIT_ATTEMPTS=60 \
+    DB_WAIT_DELAY_SEC=1 \
+    MIGRATE_ATTEMPTS=10 \
+    MIGRATE_RETRY_DELAY_SEC=3
 
 # Non-root runtime user.
 RUN groupadd --system app && useradd --system --gid app --no-create-home appuser
@@ -37,10 +40,13 @@ RUN groupadd --system app && useradd --system --gid app --no-create-home appuser
 WORKDIR /app
 COPY --from=builder --chown=appuser:app /app /app
 
-# Writable upload dir for the non-root user (local disk fallback when S3 is unset).
+# Writable upload dir + executable startup scripts.
 RUN mkdir -p /app/uploads \
     && chown appuser:app /app/uploads \
-    && chmod +x /app/scripts/docker-entrypoint.sh
+    && chmod +x \
+        /app/scripts/docker-entrypoint.sh \
+        /app/scripts/migrate.sh \
+        /app/scripts/wait_for_db.sh
 
 USER appuser
 EXPOSE 8000
