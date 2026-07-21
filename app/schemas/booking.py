@@ -34,9 +34,23 @@ class AdvisorBookingCreate(BaseModel):
 
 
 class ClientRead(BaseModel):
+    """Advisor Clients table / picker row.
+
+    ``id`` and ``seeker_id`` are the same seeker user UUID (``id`` kept for the
+    calendar picker). Booking identifiers are separate when a booking exists.
+    """
+
     id: uuid.UUID
+    seeker_id: uuid.UUID
     full_name: str | None
     email: str
+    booking_id: uuid.UUID | None = None
+    # Human-readable appointment id (FE "consultation_number").
+    consultation_number: str | None = None
+    appointment_id: str | None = None
+    consultation_type: str | None = None
+    match_score: float | None = None
+    status: BookingStatus | None = None
 
 
 class BookingReschedule(BaseModel):
