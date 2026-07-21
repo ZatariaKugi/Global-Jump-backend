@@ -776,12 +776,18 @@ async def list_my_clients(
     request_id: RequestIdDep,
     q: Annotated[str | None, Query(max_length=100)] = None,
 ) -> ResponseEnvelope[list[ClientRead]]:
-    """Seekers with at least one prior booking with this advisor — powers the
-    calendar's "Select Client" / "Search Client" picker."""
+    """Seekers with at least one prior booking — Clients table + calendar picker.
+
+    ``id`` / ``seeker_id`` are the seeker user UUID. Booking fields
+    (``booking_id``, ``consultation_number`` / ``appointment_id``,
+    ``consultation_type``, ``status``) come from the latest booking;
+    ``match_score`` from the latest non-dismissed lead when present.
+    """
     stmt = booking_service.list_clients_stmt(current_user.id, q)
     clients, total = await paginate(session, stmt, params)
+    data = await booking_service.build_client_reads(session, current_user.id, clients)
     return ResponseEnvelope[list[ClientRead]](
-        data=[ClientRead(id=c.id, full_name=c.full_name, email=c.email) for c in clients],
+        data=data,
         meta=page_meta(params, total, request_id),
     )
 
