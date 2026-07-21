@@ -102,6 +102,39 @@ async def respond_to_review(
     )
 
 
+@router.patch("/reviews/{review_id}/response", response_model=ResponseEnvelope[ReviewRead])
+async def update_review_response(
+    review_id: uuid.UUID,
+    data: ReviewResponseCreate,
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[ReviewRead]:
+    """Edit an existing advisor reply (fails with ``no_response`` if none yet)."""
+    review = await review_service.get_by_id(session, review_id)
+    review = await review_service.update_response(session, review, current_user, data.response)
+    return ResponseEnvelope[ReviewRead](
+        data=await _read_with_seeker(session, review),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.delete("/reviews/{review_id}/response", response_model=ResponseEnvelope[ReviewRead])
+async def delete_review_response(
+    review_id: uuid.UUID,
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[ReviewRead]:
+    """Remove the advisor reply (``advisor_response`` / ``responded_at`` cleared)."""
+    review = await review_service.get_by_id(session, review_id)
+    review = await review_service.delete_response(session, review, current_user)
+    return ResponseEnvelope[ReviewRead](
+        data=await _read_with_seeker(session, review),
+        meta=Meta(request_id=request_id),
+    )
+
+
 @router.post("/reviews/{review_id}/report", response_model=ResponseEnvelope[ReviewRead])
 async def report_review(
     review_id: uuid.UUID,

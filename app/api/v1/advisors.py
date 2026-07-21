@@ -53,6 +53,7 @@ from app.schemas.payment import (
 )
 from app.schemas.payout import PayoutPreviewRead, PayoutRequestCreate, PayoutRequestRead
 from app.schemas.response import Meta, ResponseEnvelope
+from app.schemas.review import AdvisorReviewSummaryRead
 from app.schemas.seeker_document import (
     DocumentCommentCreate,
     DocumentCommentRead,
@@ -575,6 +576,30 @@ async def get_stripe_connect_status(
     return ResponseEnvelope[AdvisorConnectStatus](
         data=status,
         meta=Meta(request_id=request_id),
+    )
+
+
+# ── Reviews summary ──────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/me/reviews/summary",
+    response_model=ResponseEnvelope[AdvisorReviewSummaryRead],
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def get_my_reviews_summary(
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[AdvisorReviewSummaryRead]:
+    """Reviews tab header card — same shape as admin advisor reviews summary.
+
+    ``overall``, ``review_count``, ``positive_percent``, and 1–5 star ``breakdown``
+    without fetching the full review list.
+    """
+    summary = await review_service.build_tab_summary(session, current_user.id)
+    return ResponseEnvelope[AdvisorReviewSummaryRead](
+        data=summary, meta=Meta(request_id=request_id)
     )
 
 

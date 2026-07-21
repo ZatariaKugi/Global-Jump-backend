@@ -45,7 +45,7 @@ class Review(BaseModel):
     # Verified badge: review came from a confirmed paying seeker.
     is_verified: Mapped[bool] = mapped_column(default=False, nullable=False)
 
-    # Advisor may respond publicly once.
+    # Advisor may post a public reply; editable/deletable via PATCH/DELETE.
     advisor_response: Mapped[str | None] = mapped_column(String(500), nullable=True)
     responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
