@@ -466,13 +466,14 @@ async def list_advisor_sessions(
     advisor_id: uuid.UUID,
     params: PaginationDep,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     status: BookingStatus | None = None,
 ) -> ResponseEnvelope[list[AdvisorSessionRead]]:
     """Detail page's Session History tab."""
     stmt = booking_service.list_for_user_stmt(advisor_id, UserRole.advisor, status=status)
     bookings, total = await paginate(session, stmt, params)
-    data = await advisor_admin_service.build_session_reads(session, bookings)
+    data = await advisor_admin_service.build_session_reads(session, bookings, settings)
     return ResponseEnvelope[list[AdvisorSessionRead]](
         data=data, meta=page_meta(params, total, request_id)
     )

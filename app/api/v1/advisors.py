@@ -18,7 +18,7 @@ from app.api.deps import (
     require_verified_advisor,
 )
 from app.api.pagination import PaginationDep, page_meta, paginate
-from app.api.v1.bookings import _party_names, _read, _send_confirmations
+from app.api.v1.bookings import _party_names, _read_booking, _send_confirmations
 from app.core.exceptions import NotFoundError, PermissionDeniedError
 from app.core.file_storage import delete_file, resolve_url
 from app.core.visa_types import OptionalVisaType, visa_type_name
@@ -759,7 +759,7 @@ async def create_booking_for_client(
     await _send_confirmations(session, booking, settings)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 

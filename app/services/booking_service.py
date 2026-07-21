@@ -11,6 +11,7 @@ from sqlalchemy.types import String
 
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
+from app.core.file_storage import resolve_media_url
 from app.core.visa_types import humanize_slug
 from app.models.advisor_profile import AdvisorProfile, AdvisorService
 from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus, PaymentStatus
@@ -26,11 +27,13 @@ from app.schemas.booking import (
     BookingHistoryRead,
     BookingMeetingRead,
     BookingRead,
+    BookingSort,
 )
 from app.services import availability_service, booking_document_service, booking_note_service
 from app.services.availability_service import as_utc
 
 DEFAULT_NOTICE_HOURS = 24
+_ACTIVE_UPCOMING = (BookingStatus.pending, BookingStatus.confirmed)
 
 
 async def _next_appointment_number(session: AsyncSession) -> int:
@@ -46,7 +49,16 @@ def appointment_id_str(booking: Booking) -> str:
     return str(booking.appointment_number)
 
 
-def build_read(booking: Booking, seeker: User | None, advisor: User | None) -> BookingRead:
+def build_read(
+    booking: Booking,
+    seeker: User | None,
+    advisor: User | None,
+    *,
+    settings: Settings,
+    advisor_profile_photo_key: str | None = None,
+) -> BookingRead:
+    platform_fee = round(booking.price_usd * settings.PLATFORM_COMMISSION_RATE, 2)
+    advisor_fee = round(booking.price_usd - platform_fee, 2)
     return BookingRead(
         id=booking.id,
         appointment_id=appointment_id_str(booking),
@@ -55,8 +67,12 @@ def build_read(booking: Booking, seeker: User | None, advisor: User | None) -> B
         seeker_name=seeker.full_name if seeker else None,
         seeker_email=seeker.email if seeker else None,
         advisor_name=advisor.full_name if advisor else None,
+        advisor_email=advisor.email if advisor else None,
+        advisor_profile_photo_url=resolve_media_url(advisor_profile_photo_key, settings),
         service_type=booking.service_type,
         duration_minutes=booking.duration_minutes,
+        advisor_fee_usd=advisor_fee,
+        platform_fee_usd=platform_fee,
         price_usd=booking.price_usd,
         scheduled_start=as_utc(booking.scheduled_start),
         scheduled_end=as_utc(booking.scheduled_end),
@@ -71,6 +87,21 @@ def build_read(booking: Booking, seeker: User | None, advisor: User | None) -> B
         interpreter_language=booking.interpreter_language,
         created_at=booking.created_at,
     )
+
+
+async def advisor_photo_keys(
+    session: AsyncSession, advisor_ids: set[uuid.UUID]
+) -> dict[uuid.UUID, str | None]:
+    if not advisor_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(AdvisorProfile.user_id, AdvisorProfile.profile_photo_url).where(
+                AdvisorProfile.user_id.in_(advisor_ids)
+            )
+        )
+    ).all()
+    return dict(rows)
 
 
 async def _resolve_advisor(session: AsyncSession, advisor_id: uuid.UUID) -> User:
@@ -131,7 +162,7 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
         raise AppError("Cannot book yourself", code="invalid_booking")
 
     await _resolve_advisor(session, data.advisor_id)
-    service = await _resolve_service(session, data.advisor_id, data.service_type)
+    service = await _resolve_service(session, data.advisor_id, str(data.service_type))
 
     start_utc = as_utc(data.scheduled_start)
     if start_utc <= datetime.now(UTC):
@@ -174,7 +205,7 @@ async def create_by_advisor(
     if seeker is None or seeker.role != UserRole.seeker or not seeker.is_active:
         raise NotFoundError("Client not found")
 
-    service = await _resolve_service(session, advisor.id, data.service_type)
+    service = await _resolve_service(session, advisor.id, str(data.service_type))
 
     start_utc = as_utc(data.scheduled_start)
     if start_utc <= datetime.now(UTC):
@@ -210,9 +241,15 @@ def list_for_user_stmt(
     date_to: date | None = None,
     service_types: list[str] | None = None,
     q: str | None = None,
+    sort: BookingSort = "-scheduled_start",
 ) -> Select[tuple[Booking]]:
     column = Booking.advisor_id if role == UserRole.advisor else Booking.seeker_id
-    stmt = select(Booking).where(column == user_id).order_by(Booking.scheduled_start.desc())
+    order = (
+        Booking.scheduled_start.asc()
+        if sort == "scheduled_start"
+        else Booking.scheduled_start.desc()
+    )
+    stmt = select(Booking).where(column == user_id).order_by(order)
     if status is not None:
         stmt = stmt.where(Booking.status == status)
     if seeker_id is not None and role == UserRole.advisor:
@@ -233,8 +270,10 @@ def list_for_user_stmt(
         stmt = stmt.where(Booking.service_type.in_(service_types))
     if q:
         pattern = f"%{q.strip()}%"
-        # Search appointment ID, consultation type, and client name/email.
-        stmt = stmt.join(User, User.id == Booking.seeker_id).where(
+        # Advisor searches their clients; seeker searches the advisor side
+        # (name/email) — never the seeker's own name when role is seeker.
+        counterpart = Booking.seeker_id if role == UserRole.advisor else Booking.advisor_id
+        stmt = stmt.join(User, User.id == counterpart).where(
             or_(
                 cast(Booking.appointment_number, String).ilike(pattern),
                 Booking.service_type.ilike(pattern),
@@ -243,6 +282,23 @@ def list_for_user_stmt(
             )
         )
     return stmt
+
+
+async def get_next_upcoming(
+    session: AsyncSession, user_id: uuid.UUID, role: UserRole
+) -> Booking | None:
+    """Soonest pending/confirmed booking with ``scheduled_start`` >= now."""
+    column = Booking.advisor_id if role == UserRole.advisor else Booking.seeker_id
+    now = datetime.now(UTC)
+    result = await session.execute(
+        select(Booking)
+        .where(column == user_id)
+        .where(Booking.scheduled_start >= now)
+        .where(Booking.status.in_(_ACTIVE_UPCOMING))
+        .order_by(Booking.scheduled_start.asc())
+        .limit(1)
+    )
+    return result.scalars().first()
 
 
 async def get_for_party(

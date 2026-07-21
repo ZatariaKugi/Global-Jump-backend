@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.models.advisor_profile import AdvisorServiceType
 from app.models.booking import BookingStatus, PaymentStatus
 from app.schemas.booking_document_request import DocumentRequestRead
 from app.schemas.booking_note import BookingNoteRead
 
+# List sort: leading ``-`` = descending (default matches prior hardcoded order).
+BookingSort = Literal["scheduled_start", "-scheduled_start"]
+
 
 class BookingCreate(BaseModel):
     advisor_id: uuid.UUID
-    service_type: str = Field(min_length=1, max_length=100)
+    service_type: AdvisorServiceType
     scheduled_start: datetime
     seeker_note: str | None = Field(default=None, max_length=1000)
 
@@ -23,7 +28,7 @@ class AdvisorBookingCreate(BaseModel):
     """Advisor books a consultation directly for one of their existing clients."""
 
     seeker_id: uuid.UUID
-    service_type: str = Field(min_length=1, max_length=100)
+    service_type: AdvisorServiceType
     scheduled_start: datetime
     seeker_note: str | None = Field(default=None, max_length=1000)
 
@@ -64,8 +69,13 @@ class BookingRead(BaseModel):
     seeker_name: str | None
     seeker_email: str | None
     advisor_name: str | None
+    advisor_email: str | None
+    advisor_profile_photo_url: str | None
     service_type: str
     duration_minutes: int
+    # ``price_usd`` is the total charge; fee split uses PLATFORM_COMMISSION_RATE.
+    advisor_fee_usd: float
+    platform_fee_usd: float
     price_usd: float
     scheduled_start: datetime
     scheduled_end: datetime
