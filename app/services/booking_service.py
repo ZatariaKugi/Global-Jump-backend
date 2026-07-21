@@ -13,6 +13,7 @@ from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import resolve_media_url
 from app.core.visa_types import humanize_slug
+from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorProfile, AdvisorService
 from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus, PaymentStatus
 from app.models.booking_document_request import DocumentRequestStatus
@@ -28,6 +29,7 @@ from app.schemas.booking import (
     BookingMeetingRead,
     BookingRead,
     BookingSort,
+    ClientRead,
 )
 from app.services import availability_service, booking_document_service, booking_note_service
 from app.services.availability_service import as_utc
@@ -101,7 +103,10 @@ async def advisor_photo_keys(
             )
         )
     ).all()
-    return dict(rows)
+    out: dict[uuid.UUID, str | None] = {}
+    for user_id, photo in rows:
+        out[user_id] = photo
+    return out
 
 
 async def _resolve_advisor(session: AsyncSession, advisor_id: uuid.UUID) -> User:
@@ -608,8 +613,9 @@ async def build_details(
 def list_clients_stmt(advisor_id: uuid.UUID, q: str | None = None) -> Select[tuple[User]]:
     """Distinct seekers with at least one prior booking with this advisor.
 
-    Powers the calendar's "Select Client" / "Search Client" picker — deliberately
-    scoped to existing clients only, not an open search across every seeker.
+    Powers the calendar's "Select Client" / "Search Client" picker and the
+    Clients table — deliberately scoped to existing clients only, not an open
+    search across every seeker.
     """
     stmt = (
         select(User)
@@ -622,6 +628,64 @@ def list_clients_stmt(advisor_id: uuid.UUID, q: str | None = None) -> Select[tup
         pattern = f"%{q.strip()}%"
         stmt = stmt.where(or_(User.full_name.ilike(pattern), User.email.ilike(pattern)))
     return stmt
+
+
+async def build_client_reads(
+    session: AsyncSession, advisor_id: uuid.UUID, clients: list[User]
+) -> list[ClientRead]:
+    """Enrich client picker rows with latest booking + optional lead match_score."""
+    if not clients:
+        return []
+
+    seeker_ids = [c.id for c in clients]
+
+    bookings = (
+        await session.execute(
+            select(Booking)
+            .where(Booking.advisor_id == advisor_id)
+            .where(Booking.seeker_id.in_(seeker_ids))
+            .order_by(Booking.scheduled_start.desc())
+        )
+    ).scalars().all()
+    latest_booking: dict[uuid.UUID, Booking] = {}
+    for booking in bookings:
+        if booking.seeker_id not in latest_booking:
+            latest_booking[booking.seeker_id] = booking
+
+    leads = (
+        await session.execute(
+            select(AdvisorLead)
+            .where(AdvisorLead.advisor_id == advisor_id)
+            .where(AdvisorLead.seeker_id.in_(seeker_ids))
+            .where(AdvisorLead.status != AdvisorLeadStatus.dismissed)
+            .order_by(AdvisorLead.created_at.desc())
+        )
+    ).scalars().all()
+    latest_lead: dict[uuid.UUID, AdvisorLead] = {}
+    for lead in leads:
+        if lead.seeker_id not in latest_lead:
+            latest_lead[lead.seeker_id] = lead
+
+    rows: list[ClientRead] = []
+    for client in clients:
+        latest = latest_booking.get(client.id)
+        lead_row = latest_lead.get(client.id)
+        appt = appointment_id_str(latest) if latest is not None else None
+        rows.append(
+            ClientRead(
+                id=client.id,
+                seeker_id=client.id,
+                full_name=client.full_name,
+                email=client.email,
+                booking_id=latest.id if latest is not None else None,
+                consultation_number=appt,
+                appointment_id=appt,
+                consultation_type=latest.service_type if latest is not None else None,
+                match_score=lead_row.match_score if lead_row is not None else None,
+                status=latest.status if latest is not None else None,
+            )
+        )
+    return rows
 
 
 async def has_client_relationship(
