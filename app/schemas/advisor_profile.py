@@ -32,7 +32,10 @@ class LanguageEntry(BaseModel):
 
 
 class ServiceOffering(BaseModel):
-    """Bookable offering (duration + price) — managed via profile, not onboarding."""
+    """Bookable offering (duration + price) — managed via profile, not onboarding.
+
+    Prefer ``AdvisorServiceType`` values (same as booking create/list filters).
+    """
 
     service_type: str = Field(min_length=1, max_length=100)
     duration_minutes: int = Field(ge=15, le=480)

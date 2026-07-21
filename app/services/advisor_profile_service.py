@@ -136,7 +136,7 @@ async def update(
         profile.services = [
             AdvisorService(
                 profile_id=profile.id,
-                service_type=svc.service_type,
+                service_type=str(svc.service_type),
                 duration_minutes=svc.duration_minutes,
                 price_usd=svc.price_usd,
             )
