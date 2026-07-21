@@ -242,7 +242,8 @@ async def submit_answers(
         answered += 1
         weighted_sum += option.score * question.weight
         weight_total += question.weight
-        category_totals[question.category.value].append(option.score)
+        if question.category is not None:
+            category_totals[question.category.value].append(option.score)
         if option.score < TIP_SCORE_THRESHOLD and option.improvement_tip:
             tips.append(option.improvement_tip)
         answered_pairs.append((question, option))

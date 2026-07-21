@@ -119,6 +119,36 @@ async def respond(session: AsyncSession, review: Review, advisor: User, response
     return review
 
 
+async def update_response(
+    session: AsyncSession, review: Review, advisor: User, response: str
+) -> Review:
+    if review.advisor_id != advisor.id:
+        raise PermissionDeniedError("Only the reviewed advisor can respond")
+    if review.advisor_response is None:
+        raise AppError("Review has no response to update", code="no_response")
+    review.advisor_response = response
+    review.responded_at = datetime.now(UTC)
+    review.updated_by = advisor.id
+    session.add(review)
+    await session.flush()
+    await session.refresh(review)
+    return review
+
+
+async def delete_response(session: AsyncSession, review: Review, advisor: User) -> Review:
+    if review.advisor_id != advisor.id:
+        raise PermissionDeniedError("Only the reviewed advisor can respond")
+    if review.advisor_response is None:
+        raise AppError("Review has no response to delete", code="no_response")
+    review.advisor_response = None
+    review.responded_at = None
+    review.updated_by = advisor.id
+    session.add(review)
+    await session.flush()
+    await session.refresh(review)
+    return review
+
+
 async def report(
     session: AsyncSession, review: Review, reporter_id: uuid.UUID, reason: str
 ) -> Review:

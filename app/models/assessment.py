@@ -64,8 +64,8 @@ class AssessmentQuestion(BaseModel):
 
     text: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str | None] = mapped_column(String(1000), nullable=True)
-    category: Mapped[QuestionCategory] = mapped_column(
-        SAEnum(QuestionCategory, name="question_category"), nullable=False
+    category: Mapped[QuestionCategory | None] = mapped_column(
+        SAEnum(QuestionCategory, name="question_category"), nullable=True
     )
     # NULL = applies to all countries / visa types.
     country_code: Mapped[str | None] = mapped_column(String(2), nullable=True, index=True)

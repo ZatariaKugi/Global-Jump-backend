@@ -23,7 +23,7 @@ class QuestionRead(BaseModel):
     id: uuid.UUID
     text: str
     description: str | None
-    category: QuestionCategory
+    category: QuestionCategory | None
     display_order: int
     depends_on_option_id: uuid.UUID | None
     options: list[QuestionOptionRead]
@@ -58,7 +58,9 @@ class QuestionOptionPatchInput(BaseModel):
 class QuestionCreate(BaseModel):
     text: str = Field(min_length=1, max_length=500)
     description: str | None = Field(default=None, max_length=1000)
-    category: QuestionCategory
+    # Optional — questions are scoped by country/visa_type; category is for
+    # result breakdown only when provided.
+    category: QuestionCategory | None = None
     country_code: str | None = Field(default=None, min_length=2, max_length=2)
     visa_type: OptionalVisaType = None
     weight: float = Field(default=1.0, gt=0, le=10)
@@ -109,7 +111,7 @@ class QuestionAdminRead(BaseModel):
     id: uuid.UUID
     text: str
     description: str | None
-    category: QuestionCategory
+    category: QuestionCategory | None
     country_code: str | None
     visa_type: OptionalVisaType
     weight: float
