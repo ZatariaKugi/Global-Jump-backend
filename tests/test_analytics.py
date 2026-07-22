@@ -223,12 +223,18 @@ async def test_overview_acquisition_sources_and_country(
     assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
 
-    sources = {p["label"]: p["count"] for p in data["acquisition_sources"]}
+    assert "revenue_today_usd" in data
+
+    sources = {p["label"]: p["value"] for p in data["acquisition_sources"]}
     assert sources.get("paid_ads", 0) >= 1
     assert sources.get("organic", 0) >= 1
+    assert all("key" in p for p in data["acquisition_sources"])
 
-    countries = {p["label"]: p["count"] for p in data["users_by_country"]}
-    assert countries.get("GB", 0) >= 1
+    countries = {p["country_code"]: p for p in data["users_by_country"]}
+    assert "GB" in countries
+    assert countries["GB"]["users"] >= 1
+    assert countries["GB"]["country_code_numeric"] == "826"
+    assert countries["GB"]["country"]
 
 
 async def test_overview_retention(client: AsyncClient, admin_token: str, engine) -> None:
@@ -242,8 +248,12 @@ async def test_overview_retention(client: AsyncClient, admin_token: str, engine)
 
     resp = await client.get(f"{ANALYTICS}/overview", headers=admin_headers)
     assert resp.status_code == 200, resp.text
-    retention = {p["day"]: p["retention_pct"] for p in resp.json()["data"]["retention"]}
-    assert retention[1] == 100.0
+    cohort_date = registered_at.date().isoformat()
+    points = {p["date"]: p for p in resp.json()["data"]["retention"]}
+    assert cohort_date in points
+    assert points[cohort_date]["day1"] == 100.0
+    assert points[cohort_date]["day7"] is None
+    assert points[cohort_date]["day30"] is None
 
 
 # ── Advisor Analytics ────────────────────────────────────────────────────────

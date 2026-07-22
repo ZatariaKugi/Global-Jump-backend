@@ -24,9 +24,37 @@ class LabeledCountPoint(BaseModel):
     count: int
 
 
-class RetentionPoint(BaseModel):
-    day: int  # 1, 7, or 30
-    retention_pct: float
+class AcquisitionSourcePoint(BaseModel):
+    """Acquisition pie slice — ``key`` for chart config, ``value`` for magnitude."""
+
+    key: str
+    label: str
+    value: int
+
+
+class GeoUsersPoint(BaseModel):
+    """Users-by-country map row.
+
+    ``country_code_numeric`` is the ISO 3166-1 numeric id (e.g. ``\"840\"``) used by
+    map libraries; ``country_code`` is the alpha-2 we store on profiles.
+    """
+
+    country_code: str
+    country_code_numeric: str
+    country: str
+    users: int
+
+
+class RetentionSeriesPoint(BaseModel):
+    """Per signup-cohort date: % retained at day 1 / 7 / 30 after registration.
+
+    Percentages are null when the target day is still in the future.
+    """
+
+    date: str  # ISO YYYY-MM-DD (cohort signup date)
+    day1: float | None
+    day7: float | None
+    day30: float | None
 
 
 # ── Overview ─────────────────────────────────────────────────────────────────
@@ -44,11 +72,12 @@ class OverviewAnalyticsRead(BaseModel):
     total_users: int
     total_advisors: int
     active_advisors: int
+    revenue_today_usd: float
     booking_rate: float
-    users_by_country: list[LabeledCountPoint]
-    acquisition_sources: list[LabeledCountPoint]
+    users_by_country: list[GeoUsersPoint]
+    acquisition_sources: list[AcquisitionSourcePoint]
     onboarding_funnel: OnboardingFunnelRead
-    retention: list[RetentionPoint]
+    retention: list[RetentionSeriesPoint]
 
 
 # ── Advisor Analytics ────────────────────────────────────────────────────────
