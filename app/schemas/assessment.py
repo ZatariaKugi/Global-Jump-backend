@@ -149,9 +149,11 @@ class CategoryScoreRead(BaseModel):
 class AdvisorMatchRead(BaseModel):
     user_id: uuid.UUID
     full_name: str | None
+    email: str | None = None
     title: str | None
     profile_photo_url: str | None
     years_of_experience: int | None
+    average_rating: float | None = None
     match_score: float
     public_profile_slug: str | None
 

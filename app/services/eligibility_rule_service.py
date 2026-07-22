@@ -8,7 +8,7 @@ import uuid
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.eligibility_rule import EligibilityRule
+from app.models.eligibility_rule import EligibilityRule, EligibilityRuleCategory
 from app.schemas.eligibility_rule import EligibilityRuleCreate, EligibilityRuleUpdate
 
 
@@ -18,7 +18,7 @@ async def create(
     rule = EligibilityRule(
         name=data.name,
         description=data.description,
-        category=data.category,
+        category=data.category or EligibilityRuleCategory.other,
         country_code=data.country_code.upper() if data.country_code else None,
         visa_type=data.visa_type.lower() if data.visa_type else None,
         points=data.points,
