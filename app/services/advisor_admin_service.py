@@ -258,6 +258,7 @@ async def build_session_reads(
     advisor = await session.get(User, advisor_id)
     photos = await booking_service.advisor_photo_keys(session, {advisor_id})
     photo_key = photos.get(advisor_id)
+    seeker_photos = await booking_service.seeker_photo_keys(session, set(seeker_ids))
 
     count_rows = (
         await session.execute(
@@ -285,6 +286,7 @@ async def build_session_reads(
             advisor,
             settings=settings,
             advisor_profile_photo_key=photo_key,
+            seeker_profile_photo_key=seeker_photos.get(b.seeker_id),
         )
         out.append(
             AdvisorSessionRead(

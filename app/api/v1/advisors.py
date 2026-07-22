@@ -24,9 +24,9 @@ from app.core.file_storage import delete_file, resolve_url
 from app.core.visa_types import OptionalVisaType, visa_type_name
 from app.db.session import SessionDep
 from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
-from app.models.advisor_profile import AdvisorProfile
+from app.models.advisor_profile import AdvisorProfile, AdvisorServiceType
 from app.models.assessment import Assessment
-from app.models.booking import Booking
+from app.models.booking import Booking, BookingStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.advisor_credential import (
     AdvisorCredentialCreate,
@@ -798,19 +798,29 @@ async def list_my_clients(
     params: PaginationDep,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     q: Annotated[str | None, Query(max_length=100)] = None,
+    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
+    status: BookingStatus | None = None,
 ) -> ResponseEnvelope[list[ClientRead]]:
     """Seekers with at least one prior booking — Clients table + calendar picker.
 
     ``id`` / ``seeker_id`` are the seeker user UUID. Booking fields
     (``booking_id``, ``consultation_number`` / ``appointment_id``,
-    ``consultation_type``, ``status``) come from the latest booking;
-    ``match_score`` from the latest non-dismissed lead when present.
+    ``consultation_type``, ``status``, ``is_important``) come from the latest
+    booking; ``match_score`` from the latest non-dismissed lead when present.
+
+    ``service_type`` / ``status`` filter on that latest booking.
     """
-    stmt = booking_service.list_clients_stmt(current_user.id, q)
+    types = [t.value for t in service_type] if service_type else None
+    stmt = booking_service.list_clients_stmt(
+        current_user.id, q, service_types=types, status=status
+    )
     clients, total = await paginate(session, stmt, params)
-    data = await booking_service.build_client_reads(session, current_user.id, clients)
+    data = await booking_service.build_client_reads(
+        session, current_user.id, clients, settings
+    )
     return ResponseEnvelope[list[ClientRead]](
         data=data,
         meta=page_meta(params, total, request_id),

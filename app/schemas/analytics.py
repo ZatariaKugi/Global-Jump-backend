@@ -86,8 +86,17 @@ class OverviewAnalyticsRead(BaseModel):
 class TopAdvisorRead(BaseModel):
     user_id: uuid.UUID
     full_name: str | None
+    email: str
+    avatar_url: str | None
     avg_rating: float
     review_count: int
+
+
+class SessionTrendPoint(BaseModel):
+    """Completed consultation sessions per calendar month (absolute counts)."""
+
+    month: str  # ISO "YYYY-MM"
+    value: int
 
 
 class AdvisorAnalyticsRead(BaseModel):
@@ -95,7 +104,7 @@ class AdvisorAnalyticsRead(BaseModel):
     total_advisors: int
     session_completed_pct: float
     top_rated_advisors: list[TopAdvisorRead]
-    session_trend: list[MonthlyCountPoint]
+    session_trend: list[SessionTrendPoint]
 
 
 # ── Finance Analytics ────────────────────────────────────────────────────────
@@ -107,7 +116,13 @@ class FinanceAnalyticsRead(BaseModel):
     net_revenue_usd: float
     refunds_usd: float
     advisor_payout_usd: float
+    # % change vs the immediately preceding window of the same length.
+    gross_revenue_change_pct: float
+    net_revenue_change_pct: float
+    refunds_change_pct: float
+    advisor_payout_change_pct: float
     revenue_trend: list[MonthlyAmountPoint]
+    refund_trend: list[MonthlyAmountPoint]
     monthly_payouts: list[MonthlyAmountPoint]
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import Select, cast, func, or_, select
+from sqlalchemy import Select, and_, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.types import String
 
@@ -17,6 +17,7 @@ from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorProfile, AdvisorService
 from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus, PaymentStatus
 from app.models.booking_document_request import DocumentRequestStatus
+from app.models.seeker_profile import SeekerProfile
 from app.models.transaction import Transaction
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.booking import (
@@ -58,6 +59,7 @@ def build_read(
     *,
     settings: Settings,
     advisor_profile_photo_key: str | None = None,
+    seeker_profile_photo_key: str | None = None,
 ) -> BookingRead:
     platform_fee = round(booking.price_usd * settings.PLATFORM_COMMISSION_RATE, 2)
     advisor_fee = round(booking.price_usd - platform_fee, 2)
@@ -68,6 +70,7 @@ def build_read(
         advisor_id=booking.advisor_id,
         seeker_name=seeker.full_name if seeker else None,
         seeker_email=seeker.email if seeker else None,
+        seeker_profile_photo_url=resolve_media_url(seeker_profile_photo_key, settings),
         advisor_name=advisor.full_name if advisor else None,
         advisor_email=advisor.email if advisor else None,
         advisor_profile_photo_url=resolve_media_url(advisor_profile_photo_key, settings),
@@ -100,6 +103,24 @@ async def advisor_photo_keys(
         await session.execute(
             select(AdvisorProfile.user_id, AdvisorProfile.profile_photo_url).where(
                 AdvisorProfile.user_id.in_(advisor_ids)
+            )
+        )
+    ).all()
+    out: dict[uuid.UUID, str | None] = {}
+    for user_id, photo in rows:
+        out[user_id] = photo
+    return out
+
+
+async def seeker_photo_keys(
+    session: AsyncSession, seeker_ids: set[uuid.UUID]
+) -> dict[uuid.UUID, str | None]:
+    if not seeker_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(SeekerProfile.user_id, SeekerProfile.profile_photo_url).where(
+                SeekerProfile.user_id.in_(seeker_ids)
             )
         )
     ).all()
@@ -185,6 +206,8 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
         scheduled_start=start_utc,
         scheduled_end=end_utc,
         status=BookingStatus.pending,  # advisor must accept/reject before it's confirmed
+        # Surface new requests on the Clients table (bookmark / red-dot).
+        is_important=True,
         seeker_note=data.seeker_note,
         created_by=seeker.id,
     )
@@ -610,28 +633,60 @@ async def build_details(
     )
 
 
-def list_clients_stmt(advisor_id: uuid.UUID, q: str | None = None) -> Select[tuple[User]]:
+def list_clients_stmt(
+    advisor_id: uuid.UUID,
+    q: str | None = None,
+    *,
+    service_types: list[str] | None = None,
+    status: BookingStatus | None = None,
+) -> Select[tuple[User]]:
     """Distinct seekers with at least one prior booking with this advisor.
 
     Powers the calendar's "Select Client" / "Search Client" picker and the
     Clients table — deliberately scoped to existing clients only, not an open
     search across every seeker.
+
+    When ``service_types`` / ``status`` are set, filter on the seeker's
+    *latest* booking (max ``scheduled_start``) with this advisor.
     """
+    latest_starts = (
+        select(
+            Booking.seeker_id.label("seeker_id"),
+            func.max(Booking.scheduled_start).label("max_start"),
+        )
+        .where(Booking.advisor_id == advisor_id)
+        .group_by(Booking.seeker_id)
+    ).subquery()
+
     stmt = (
         select(User)
         .join(Booking, Booking.seeker_id == User.id)
-        .where(Booking.advisor_id == advisor_id)
+        .join(
+            latest_starts,
+            and_(
+                Booking.seeker_id == latest_starts.c.seeker_id,
+                Booking.scheduled_start == latest_starts.c.max_start,
+                Booking.advisor_id == advisor_id,
+            ),
+        )
         .distinct()
         .order_by(User.full_name)
     )
     if q:
         pattern = f"%{q.strip()}%"
         stmt = stmt.where(or_(User.full_name.ilike(pattern), User.email.ilike(pattern)))
+    if service_types:
+        stmt = stmt.where(Booking.service_type.in_(service_types))
+    if status is not None:
+        stmt = stmt.where(Booking.status == status)
     return stmt
 
 
 async def build_client_reads(
-    session: AsyncSession, advisor_id: uuid.UUID, clients: list[User]
+    session: AsyncSession,
+    advisor_id: uuid.UUID,
+    clients: list[User],
+    settings: Settings,
 ) -> list[ClientRead]:
     """Enrich client picker rows with latest booking + optional lead match_score."""
     if not clients:
@@ -640,31 +695,41 @@ async def build_client_reads(
     seeker_ids = [c.id for c in clients]
 
     bookings = (
-        await session.execute(
-            select(Booking)
-            .where(Booking.advisor_id == advisor_id)
-            .where(Booking.seeker_id.in_(seeker_ids))
-            .order_by(Booking.scheduled_start.desc())
+        (
+            await session.execute(
+                select(Booking)
+                .where(Booking.advisor_id == advisor_id)
+                .where(Booking.seeker_id.in_(seeker_ids))
+                .order_by(Booking.scheduled_start.desc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     latest_booking: dict[uuid.UUID, Booking] = {}
     for booking in bookings:
         if booking.seeker_id not in latest_booking:
             latest_booking[booking.seeker_id] = booking
 
     leads = (
-        await session.execute(
-            select(AdvisorLead)
-            .where(AdvisorLead.advisor_id == advisor_id)
-            .where(AdvisorLead.seeker_id.in_(seeker_ids))
-            .where(AdvisorLead.status != AdvisorLeadStatus.dismissed)
-            .order_by(AdvisorLead.created_at.desc())
+        (
+            await session.execute(
+                select(AdvisorLead)
+                .where(AdvisorLead.advisor_id == advisor_id)
+                .where(AdvisorLead.seeker_id.in_(seeker_ids))
+                .where(AdvisorLead.status != AdvisorLeadStatus.dismissed)
+                .order_by(AdvisorLead.created_at.desc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     latest_lead: dict[uuid.UUID, AdvisorLead] = {}
     for lead in leads:
         if lead.seeker_id not in latest_lead:
             latest_lead[lead.seeker_id] = lead
+
+    photos = await seeker_photo_keys(session, set(seeker_ids))
 
     rows: list[ClientRead] = []
     for client in clients:
@@ -677,12 +742,14 @@ async def build_client_reads(
                 seeker_id=client.id,
                 full_name=client.full_name,
                 email=client.email,
+                seeker_profile_photo_url=resolve_media_url(photos.get(client.id), settings),
                 booking_id=latest.id if latest is not None else None,
                 consultation_number=appt,
                 appointment_id=appt,
                 consultation_type=latest.service_type if latest is not None else None,
                 match_score=lead_row.match_score if lead_row is not None else None,
                 status=latest.status if latest is not None else None,
+                is_important=latest.is_important if latest is not None else False,
             )
         )
     return rows
