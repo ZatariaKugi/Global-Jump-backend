@@ -9,12 +9,13 @@ from fastapi import APIRouter, Query
 
 from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.api.pagination import PaginationDep, page_meta, paginate
-from app.core.exceptions import PermissionDeniedError
+from app.core.exceptions import AppError, PermissionDeniedError
 from app.core.visa_types import RequiredVisaType
 from app.db.session import SessionDep
 from app.models.assessment import Assessment, AssessmentStatus, InsightKind
 from app.models.user import User, UserRole
 from app.schemas.assessment import (
+    AdvisorMatchRead,
     AnswersSubmit,
     AssessmentCreate,
     AssessmentRead,
@@ -35,11 +36,9 @@ def _require_seeker(user: User) -> None:
 
 
 async def _build_read(session: SessionDep, assessment: Assessment) -> AssessmentRead:
-    matched = (
-        await advisor_matching_service.match(session, assessment)
-        if assessment.status == AssessmentStatus.completed
-        else []
-    )
+    matched: list[AdvisorMatchRead] = []
+    if assessment.status == AssessmentStatus.completed:
+        matched, _total = await advisor_matching_service.match(session, assessment)
     strengths: list[str] = []
     weaknesses: list[str] = []
     missing_requirements: list[str] = []
@@ -150,6 +149,41 @@ async def get_assessment(
     return ResponseEnvelope[AssessmentRead](
         data=await _build_read(session, assessment),
         meta=Meta(request_id=request_id),
+    )
+
+
+@router.get(
+    "/{assessment_id}/matched-advisors",
+    response_model=ResponseEnvelope[list[AdvisorMatchRead]],
+)
+async def list_matched_advisors(
+    assessment_id: uuid.UUID,
+    params: PaginationDep,
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[list[AdvisorMatchRead]]:
+    """Paginated AI-suggested advisors for a completed assessment.
+
+    Prefer this over the embedded ``matched_advisors`` preview on the assessment
+    payload when the list can grow beyond the default top-N.
+    """
+    _require_seeker(current_user)
+    assessment = await assessment_service.get_for_user(session, assessment_id, current_user.id)
+    if assessment.status != AssessmentStatus.completed:
+        raise AppError(
+            "Matched advisors are available after the assessment is completed",
+            code="assessment_incomplete",
+        )
+    items, total = await advisor_matching_service.match(
+        session,
+        assessment,
+        limit=params.limit,
+        offset=params.offset,
+    )
+    return ResponseEnvelope[list[AdvisorMatchRead]](
+        data=items,
+        meta=page_meta(params, total, request_id),
     )
 
 
