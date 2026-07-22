@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from app.api.deps import CurrentUser, RequestIdDep
 from app.api.pagination import PaginationDep, page_meta, paginate
+from app.core.visa_types import OptionalVisaType
 from app.db.session import SessionDep
 from app.models.review import Review
 from app.models.user import User
@@ -59,8 +61,13 @@ async def list_advisor_reviews(
     _current_user: CurrentUser,
     session: SessionDep,
     request_id: RequestIdDep,
+    visa_type: OptionalVisaType = None,
+    q: Annotated[
+        str | None,
+        Query(max_length=100, description="Search seeker name or review text"),
+    ] = None,
 ) -> ResponseEnvelope[list[ReviewRead]]:
-    stmt = review_service.list_public_stmt(advisor_id)
+    stmt = review_service.list_public_stmt(advisor_id, visa_type=visa_type, q=q)
     reviews, total = await paginate(session, stmt, params)
     data = await review_service.build_enriched_reads(session, reviews)
     return ResponseEnvelope[list[ReviewRead]](
