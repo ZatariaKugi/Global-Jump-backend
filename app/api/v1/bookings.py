@@ -62,6 +62,7 @@ def _read(
     settings: Settings,
     *,
     advisor_profile_photo_key: str | None = None,
+    seeker_profile_photo_key: str | None = None,
 ) -> BookingRead:
     return booking_service.build_read(
         booking,
@@ -69,6 +70,7 @@ def _read(
         advisor,
         settings=settings,
         advisor_profile_photo_key=advisor_profile_photo_key,
+        seeker_profile_photo_key=seeker_profile_photo_key,
     )
 
 
@@ -79,13 +81,15 @@ async def _read_booking(
     advisor: User | None,
     settings: Settings,
 ) -> BookingRead:
-    photos = await booking_service.advisor_photo_keys(session, {booking.advisor_id})
+    advisor_photos = await booking_service.advisor_photo_keys(session, {booking.advisor_id})
+    seeker_photos = await booking_service.seeker_photo_keys(session, {booking.seeker_id})
     return _read(
         booking,
         seeker,
         advisor,
         settings,
-        advisor_profile_photo_key=photos.get(booking.advisor_id),
+        advisor_profile_photo_key=advisor_photos.get(booking.advisor_id),
+        seeker_profile_photo_key=seeker_photos.get(booking.seeker_id),
     )
 
 
@@ -202,6 +206,9 @@ async def list_my_bookings(
     photos = await booking_service.advisor_photo_keys(
         session, {b.advisor_id for b in bookings}
     )
+    seeker_photos = await booking_service.seeker_photo_keys(
+        session, {b.seeker_id for b in bookings}
+    )
 
     return ResponseEnvelope[list[BookingRead]](
         data=[
@@ -211,6 +218,7 @@ async def list_my_bookings(
                 users.get(b.advisor_id),
                 settings,
                 advisor_profile_photo_key=photos.get(b.advisor_id),
+                seeker_profile_photo_key=seeker_photos.get(b.seeker_id),
             )
             for b in bookings
         ],

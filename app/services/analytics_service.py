@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import uuid
 from collections import defaultdict
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import func, select
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.countries import country_name, country_numeric
 from app.models.activity_log import ActivityLog
+from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import Assessment, AssessmentStatus
 from app.models.booking import Booking, BookingStatus
 from app.models.message import Message
@@ -33,6 +35,7 @@ from app.schemas.analytics import (
     OnboardingFunnelRead,
     OverviewAnalyticsRead,
     RetentionSeriesPoint,
+    SessionTrendPoint,
     TopAdvisorRead,
 )
 from app.services import review_service
@@ -306,21 +309,29 @@ async def get_advisor_analytics(session: AsyncSession, days: int = 30) -> Adviso
         .all()
     )
     summaries = await review_service.rating_summaries(session, list(advisor_ids))
-    name_rows = (
-        await session.execute(select(User.id, User.full_name).where(User.id.in_(advisor_ids)))
+    advisor_rows = (
+        await session.execute(
+            select(User.id, User.full_name, User.email, AdvisorProfile.profile_photo_url)
+            .outerjoin(AdvisorProfile, AdvisorProfile.user_id == User.id)
+            .where(User.id.in_(advisor_ids))
+        )
     ).all()
-    names: dict[uuid.UUID, str | None] = {}
-    for user_id, full_name in name_rows:
-        names[user_id] = full_name
+    advisors_by_id: dict[uuid.UUID, tuple[str | None, str, str | None]] = {
+        user_id: (full_name, email, photo) for user_id, full_name, email, photo in advisor_rows
+    }
     top_rated_advisors = sorted(
         (
             TopAdvisorRead(
                 user_id=advisor_id,
-                full_name=names.get(advisor_id),
+                full_name=full_name,
+                email=email,
+                avatar_url=photo,
                 avg_rating=avg,
                 review_count=count,
             )
             for advisor_id, (avg, count) in summaries.items()
+            if (info := advisors_by_id.get(advisor_id)) is not None
+            for full_name, email, photo in (info,)
         ),
         key=lambda a: a.avg_rating,
         reverse=True,
@@ -344,7 +355,7 @@ async def get_advisor_analytics(session: AsyncSession, days: int = 30) -> Adviso
     for booking in completed:
         trend_counts[_month_key(booking.scheduled_start)] += 1
     session_trend = [
-        MonthlyCountPoint(month=month, count=count) for month, count in sorted(trend_counts.items())
+        SessionTrendPoint(month=month, value=count) for month, count in sorted(trend_counts.items())
     ]
 
     return AdvisorAnalyticsRead(
@@ -359,58 +370,132 @@ async def get_advisor_analytics(session: AsyncSession, days: int = 30) -> Adviso
 # ── Finance Analytics ────────────────────────────────────────────────────────
 
 
-async def get_finance_analytics(session: AsyncSession, days: int = 30) -> FinanceAnalyticsRead:
-    since = _since(days)
+def _change_pct(current: float, previous: float) -> float:
+    """Percent change of ``current`` vs ``previous`` (0 when both zero)."""
+    if previous == 0:
+        return 100.0 if current > 0 else 0.0
+    return round(100.0 * (current - previous) / previous, 2)
 
-    transactions = (
-        (await session.execute(select(Transaction).where(Transaction.created_at >= since)))
-        .scalars()
-        .all()
-    )
+
+def _finance_window_totals(
+    transactions: Sequence[Transaction],
+    payouts: Sequence[PayoutRequest],
+    window_start: datetime,
+    window_end: datetime,
+) -> tuple[float, float, float, float]:
+    """Gross / refunds / net / advisor payout for [window_start, window_end)."""
     gross_txns = [
         t
         for t in transactions
-        if t.status
-        in (
-            TransactionStatus.succeeded,
-            TransactionStatus.partially_refunded,
-            TransactionStatus.refunded,
-        )
+        if t.status in _GROSS_STATUSES
+        and window_start <= _as_utc(t.created_at) < window_end
     ]
-    gross_revenue_usd = round(sum(t.amount_usd for t in gross_txns), 2)
+    gross = round(sum(t.amount_usd for t in gross_txns), 2)
 
-    refunded_txns = [
-        t for t in transactions if t.refunded_at is not None and _as_utc(t.refunded_at) >= since
+    refunded = [
+        t
+        for t in transactions
+        if t.refunded_at is not None and window_start <= _as_utc(t.refunded_at) < window_end
     ]
-    refunds_usd = round(sum(t.refunded_amount_usd or 0.0 for t in refunded_txns), 2)
+    refunds = round(sum(t.refunded_amount_usd or 0.0 for t in refunded), 2)
+    net = round(gross - refunds, 2)
 
-    net_revenue_usd = round(gross_revenue_usd - refunds_usd, 2)
-
-    revenue_trend_map: dict[str, float] = defaultdict(float)
-    for t in gross_txns:
-        revenue_trend_map[_month_key(t.created_at)] += t.amount_usd
-    revenue_trend = [
-        MonthlyAmountPoint(month=month, amount_usd=round(amount, 2))
-        for month, amount in sorted(revenue_trend_map.items())
+    window_payouts = [
+        p
+        for p in payouts
+        if p.processed_at is not None and window_start <= _as_utc(p.processed_at) < window_end
     ]
+    advisor_payout = round(sum(p.amount_usd for p in window_payouts), 2)
+    return gross, refunds, net, advisor_payout
 
-    payouts = (
+
+async def get_finance_analytics(session: AsyncSession, days: int = 30) -> FinanceAnalyticsRead:
+    now = datetime.now(UTC)
+    since = now - timedelta(days=days)
+    prev_since = now - timedelta(days=2 * days)
+
+    # Load both current and previous windows in one pass.
+    transactions = (
         (
             await session.execute(
-                select(PayoutRequest).where(
-                    PayoutRequest.status == PayoutStatus.completed,
-                    PayoutRequest.processed_at >= since,
+                select(Transaction).where(Transaction.created_at >= prev_since)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Also include older txns that were refunded in either window (created_at
+    # may predate prev_since while refunded_at falls inside).
+    refund_extra = (
+        (
+            await session.execute(
+                select(Transaction).where(
+                    Transaction.refunded_at.is_not(None),
+                    Transaction.refunded_at >= prev_since,
+                    Transaction.created_at < prev_since,
                 )
             )
         )
         .scalars()
         .all()
     )
-    advisor_payout_usd = round(sum(p.amount_usd for p in payouts), 2)
+    by_id = {t.id: t for t in transactions}
+    for t in refund_extra:
+        by_id.setdefault(t.id, t)
+    transactions = list(by_id.values())
+
+    payouts = (
+        (
+            await session.execute(
+                select(PayoutRequest).where(
+                    PayoutRequest.status == PayoutStatus.completed,
+                    PayoutRequest.processed_at >= prev_since,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    gross_revenue_usd, refunds_usd, net_revenue_usd, advisor_payout_usd = _finance_window_totals(
+        transactions, payouts, since, now
+    )
+    prev_gross, prev_refunds, prev_net, prev_payout = _finance_window_totals(
+        transactions, payouts, prev_since, since
+    )
+
+    # Trends: current window only.
+    current_gross = [
+        t
+        for t in transactions
+        if t.status in _GROSS_STATUSES and _as_utc(t.created_at) >= since
+    ]
+    revenue_trend_map: dict[str, float] = defaultdict(float)
+    for t in current_gross:
+        revenue_trend_map[_month_key(t.created_at)] += t.amount_usd
+    revenue_trend = [
+        MonthlyAmountPoint(month=month, amount_usd=round(amount, 2))
+        for month, amount in sorted(revenue_trend_map.items())
+    ]
+
+    refund_trend_map: dict[str, float] = defaultdict(float)
+    for t in transactions:
+        if t.refunded_at is None:
+            continue
+        refunded_at = _as_utc(t.refunded_at)
+        if refunded_at < since:
+            continue
+        refund_trend_map[_month_key(refunded_at)] += t.refunded_amount_usd or 0.0
+    refund_trend = [
+        MonthlyAmountPoint(month=month, amount_usd=round(amount, 2))
+        for month, amount in sorted(refund_trend_map.items())
+    ]
 
     payout_trend_map: dict[str, float] = defaultdict(float)
     for p in payouts:
-        assert p.processed_at is not None  # filtered by processed_at >= since above
+        assert p.processed_at is not None
+        if _as_utc(p.processed_at) < since:
+            continue
         payout_trend_map[_month_key(p.processed_at)] += p.amount_usd
     monthly_payouts = [
         MonthlyAmountPoint(month=month, amount_usd=round(amount, 2))
@@ -423,7 +508,12 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
         net_revenue_usd=net_revenue_usd,
         refunds_usd=refunds_usd,
         advisor_payout_usd=advisor_payout_usd,
+        gross_revenue_change_pct=_change_pct(gross_revenue_usd, prev_gross),
+        net_revenue_change_pct=_change_pct(net_revenue_usd, prev_net),
+        refunds_change_pct=_change_pct(refunds_usd, prev_refunds),
+        advisor_payout_change_pct=_change_pct(advisor_payout_usd, prev_payout),
         revenue_trend=revenue_trend,
+        refund_trend=refund_trend,
         monthly_payouts=monthly_payouts,
     )
 

@@ -296,6 +296,11 @@ async def test_advisor_analytics_top_rated_and_completion(
     ratings_by_user = {t["user_id"]: t["avg_rating"] for t in top}
     assert ratings_by_user[str(advisor_a)] == 5.0
     assert ratings_by_user[str(advisor_b)] == 3.0
+    by_id = {t["user_id"]: t for t in top}
+    assert by_id[str(advisor_a)]["email"] == "advisor-a@test.com"
+    assert by_id[str(advisor_b)]["email"] == "advisor-b@test.com"
+    assert "avatar_url" in by_id[str(advisor_a)]
+    assert all("value" in p and "count" not in p for p in data["session_trend"])
 
     assert data["session_completed_pct"] == 50.0
 
@@ -348,6 +353,12 @@ async def test_finance_analytics_revenue_and_refunds(
     assert data["refunds_usd"] == 20.0
     assert data["net_revenue_usd"] == 130.0
     assert data["advisor_payout_usd"] == 80.0
+    assert "gross_revenue_change_pct" in data
+    assert "net_revenue_change_pct" in data
+    assert "refunds_change_pct" in data
+    assert "advisor_payout_change_pct" in data
+    assert isinstance(data["refund_trend"], list)
+    assert any(p["amount_usd"] == 20.0 for p in data["refund_trend"])
 
 
 # ── AI Analytics ─────────────────────────────────────────────────────────────
