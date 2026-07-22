@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
@@ -71,12 +71,14 @@ def list_public_stmt(
     *,
     flagged: bool | None = None,
     visa_type: VisaType | None = None,
+    q: str | None = None,
 ) -> Select[tuple[Review]]:
     """Public (visible + flagged) reviews for an advisor.
 
     When ``flagged=True``, restrict to moderation_status=flagged only
     (admin Reviews tab filter). When ``visa_type`` is set, restrict to
     seekers whose ``intended_visa_type`` matches the PRD enum value.
+    When ``q`` is set, match seeker full name or review text (ilike).
     """
     stmt = select(Review).where(Review.advisor_id == advisor_id)
     if flagged is True:
@@ -86,6 +88,11 @@ def list_public_stmt(
     if visa_type is not None:
         stmt = stmt.join(SeekerProfile, SeekerProfile.user_id == Review.seeker_id).where(
             func.lower(SeekerProfile.intended_visa_type) == visa_type.value
+        )
+    if q and q.strip():
+        pattern = f"%{q.strip()}%"
+        stmt = stmt.join(User, User.id == Review.seeker_id).where(
+            or_(User.full_name.ilike(pattern), Review.text.ilike(pattern))
         )
     return stmt.order_by(Review.created_at.desc())
 
