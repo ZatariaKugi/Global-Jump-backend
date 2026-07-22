@@ -44,6 +44,7 @@ class ClientRead(BaseModel):
     seeker_id: uuid.UUID
     full_name: str | None
     email: str
+    seeker_profile_photo_url: str | None = None
     booking_id: uuid.UUID | None = None
     # Human-readable appointment id (FE "consultation_number").
     consultation_number: str | None = None
@@ -51,6 +52,8 @@ class ClientRead(BaseModel):
     consultation_type: str | None = None
     match_score: float | None = None
     status: BookingStatus | None = None
+    # From the latest booking — drives Clients-table bookmark / red-dot.
+    is_important: bool = False
 
 
 class BookingReschedule(BaseModel):
@@ -82,6 +85,7 @@ class BookingRead(BaseModel):
     advisor_id: uuid.UUID
     seeker_name: str | None
     seeker_email: str | None
+    seeker_profile_photo_url: str | None
     advisor_name: str | None
     advisor_email: str | None
     advisor_profile_photo_url: str | None

@@ -209,6 +209,9 @@ async def test_list_clients_returns_only_this_advisors_seekers(client: AsyncClie
     assert resp.status_code == 200, resp.text
     emails = {c["email"] for c in resp.json()["data"]}
     assert emails == {"clientA@test.com"}
+    row = resp.json()["data"][0]
+    assert row["is_important"] is True  # seeker-created pending auto-flags
+    assert "seeker_profile_photo_url" in row
 
 
 async def test_list_clients_search_filters_by_name(client: AsyncClient, engine) -> None:
