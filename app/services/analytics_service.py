@@ -10,6 +10,7 @@ from datetime import UTC, date, datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.countries import country_name, country_numeric
 from app.models.activity_log import ActivityLog
 from app.models.assessment import Assessment, AssessmentStatus
 from app.models.booking import Booking, BookingStatus
@@ -19,26 +20,41 @@ from app.models.seeker_profile import SeekerProfile
 from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.analytics import (
+    AcquisitionSourcePoint,
     AdvisorAnalyticsRead,
     AIAnalyticsRead,
     AssessmentVolumePoint,
     DropOffStagePoint,
     EngagementAnalyticsRead,
     FinanceAnalyticsRead,
-    LabeledCountPoint,
+    GeoUsersPoint,
     MonthlyAmountPoint,
     MonthlyCountPoint,
     OnboardingFunnelRead,
     OverviewAnalyticsRead,
-    RetentionPoint,
+    RetentionSeriesPoint,
     TopAdvisorRead,
 )
 from app.services import review_service
 from app.services.assessment_service import FAIL_TIERS, PASS_TIERS, list_questions
 
+_GROSS_STATUSES = (
+    TransactionStatus.succeeded,
+    TransactionStatus.partially_refunded,
+    TransactionStatus.refunded,
+)
+
 
 def _month_key(dt: datetime) -> str:
     return dt.strftime("%Y-%m")
+
+
+def _slug_key(label: str) -> str:
+    """Stable chart key from a free-text label (e.g. paid_ads → paid_ads)."""
+    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in label.strip())
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned.strip("_") or "unknown"
 
 
 def _month_label(ym: str) -> str:
@@ -105,6 +121,19 @@ async def get_overview_analytics(session: AsyncSession, days: int = 30) -> Overv
     ).scalar_one()
     booking_rate = round(100.0 * booked / assessed, 2) if assessed else 0.0
 
+    today = datetime.now(UTC).date()
+    today_start = datetime(today.year, today.month, today.day, tzinfo=UTC)
+    today_end = today_start + timedelta(days=1)
+    revenue_today_usd = (
+        await session.execute(
+            select(func.coalesce(func.sum(Transaction.amount_usd), 0.0)).where(
+                Transaction.status.in_(_GROSS_STATUSES),
+                Transaction.created_at >= today_start,
+                Transaction.created_at < today_end,
+            )
+        )
+    ).scalar_one()
+
     country_rows = (
         await session.execute(
             select(SeekerProfile.country_of_residence, func.count())
@@ -113,9 +142,20 @@ async def get_overview_analytics(session: AsyncSession, days: int = 30) -> Overv
             .group_by(SeekerProfile.country_of_residence)
         )
     ).all()
-    users_by_country = [
-        LabeledCountPoint(label=country, count=count) for country, count in country_rows
-    ]
+    users_by_country: list[GeoUsersPoint] = []
+    for code, count in country_rows:
+        alpha = str(code).upper()
+        numeric = country_numeric(alpha)
+        if numeric is None:
+            continue
+        users_by_country.append(
+            GeoUsersPoint(
+                country_code=alpha,
+                country_code_numeric=numeric,
+                country=country_name(alpha) or alpha,
+                users=count,
+            )
+        )
 
     source_rows = (
         await session.execute(
@@ -125,7 +165,12 @@ async def get_overview_analytics(session: AsyncSession, days: int = 30) -> Overv
         )
     ).all()
     acquisition_sources = [
-        LabeledCountPoint(label=str(source), count=count) for source, count in source_rows
+        AcquisitionSourcePoint(
+            key=_slug_key(str(source)),
+            label=str(source),
+            value=count,
+        )
+        for source, count in source_rows
     ]
 
     onboarding_funnel = await _onboarding_funnel(session, since)
@@ -136,6 +181,7 @@ async def get_overview_analytics(session: AsyncSession, days: int = 30) -> Overv
         total_users=total_users,
         total_advisors=total_advisors,
         active_advisors=active_advisors,
+        revenue_today_usd=round(float(revenue_today_usd), 2),
         booking_rate=booking_rate,
         users_by_country=users_by_country,
         acquisition_sources=acquisition_sources,
@@ -194,7 +240,12 @@ async def _onboarding_funnel(session: AsyncSession, since: datetime) -> Onboardi
     )
 
 
-async def _retention(session: AsyncSession, since: datetime) -> list[RetentionPoint]:
+async def _retention(session: AsyncSession, since: datetime) -> list[RetentionSeriesPoint]:
+    """Per signup-date cohort: day1 / day7 / day30 return rates.
+
+    Each point is one registration calendar day in the window. Percentages are
+    null when the target day is still in the future (cohort too young).
+    """
     today = datetime.now(UTC).date()
     cohort_rows = (
         await session.execute(select(User.id, User.created_at).where(User.created_at >= since))
@@ -214,20 +265,26 @@ async def _retention(session: AsyncSession, since: datetime) -> list[RetentionPo
     for user_id, occurred_on in activity_rows:
         activity_by_user[user_id].add(occurred_on)
 
-    points: list[RetentionPoint] = []
-    for n in (1, 7, 30):
-        eligible_total = 0
-        retained_total = 0
-        for cohort_day, user_ids in cohorts.items():
-            target_day = cohort_day + timedelta(days=n)
-            if target_day > today:
-                continue
-            eligible_total += len(user_ids)
-            for user_id in user_ids:
-                if target_day in activity_by_user.get(user_id, set()):
-                    retained_total += 1
-        pct = round(100.0 * retained_total / eligible_total, 2) if eligible_total else 0.0
-        points.append(RetentionPoint(day=n, retention_pct=pct))
+    def _pct(cohort_day: date, n: int, user_ids: list[uuid.UUID]) -> float | None:
+        target = cohort_day + timedelta(days=n)
+        if target > today:
+            return None
+        if not user_ids:
+            return 0.0
+        retained = sum(1 for uid in user_ids if target in activity_by_user.get(uid, set()))
+        return round(100.0 * retained / len(user_ids), 2)
+
+    points: list[RetentionSeriesPoint] = []
+    for cohort_day in sorted(cohorts):
+        user_ids = cohorts[cohort_day]
+        points.append(
+            RetentionSeriesPoint(
+                date=cohort_day.isoformat(),
+                day1=_pct(cohort_day, 1, user_ids),
+                day7=_pct(cohort_day, 7, user_ids),
+                day30=_pct(cohort_day, 30, user_ids),
+            )
+        )
     return points
 
 
