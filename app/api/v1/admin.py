@@ -501,12 +501,13 @@ async def list_advisor_earnings_transactions(
     advisor_id: uuid.UUID,
     params: PaginationDep,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[TransactionFinanceRead]]:
     """Detail page's Earnings tab — transaction history sub-list."""
     stmt = payment_service.list_for_advisor_stmt(advisor_id)
     txns, total = await paginate(session, stmt, params)
-    data = [await payment_service.finance_read(session, t) for t in txns]
+    data = [await payment_service.finance_read(session, t, settings) for t in txns]
     return ResponseEnvelope[list[TransactionFinanceRead]](
         data=data, meta=page_meta(params, total, request_id)
     )
@@ -1148,6 +1149,7 @@ async def get_payments_summary(
 async def list_all_payments(
     params: PaginationDep,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     status: TransactionStatus | None = None,
     date_from: datetime | None = None,
@@ -1157,7 +1159,7 @@ async def list_all_payments(
     """Full transaction list across the platform, optionally filtered."""
     stmt = payment_service.list_all_stmt(status, date_from, date_to, search)
     txns, total = await paginate(session, stmt, params)
-    data = [await payment_service.finance_read(session, t) for t in txns]
+    data = [await payment_service.finance_read(session, t, settings) for t in txns]
     return ResponseEnvelope[list[TransactionFinanceRead]](
         data=data,
         meta=page_meta(params, total, request_id),
@@ -1168,11 +1170,12 @@ async def list_all_payments(
 async def get_payment(
     transaction_id: uuid.UUID,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[TransactionFinanceRead]:
     """Transaction Information modal — full detail with customer/advisor parties."""
     txn = await payment_service.get_by_id(session, transaction_id)
-    data = await payment_service.finance_read(session, txn)
+    data = await payment_service.finance_read(session, txn, settings)
     return ResponseEnvelope[TransactionFinanceRead](
         data=data,
         meta=Meta(request_id=request_id),
@@ -1249,7 +1252,7 @@ async def refund_payment(
     txn = await payment_service.refund_transaction(
         session, transaction_id, principal.id, body.reason, settings, body.amount_usd
     )
-    data = await payment_service.finance_read(session, txn)
+    data = await payment_service.finance_read(session, txn, settings)
     return ResponseEnvelope[TransactionFinanceRead](
         data=data,
         meta=Meta(request_id=request_id),

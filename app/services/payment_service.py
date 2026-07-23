@@ -893,7 +893,9 @@ def list_all_stmt(
     return stmt.order_by(Transaction.created_at.desc())
 
 
-async def finance_read(session: AsyncSession, txn: Transaction) -> TransactionFinanceRead:
+async def finance_read(
+    session: AsyncSession, txn: Transaction, settings: Settings
+) -> TransactionFinanceRead:
     """Enrich a transaction with its booking's seeker/advisor names for admin views."""
     booking = await session.get(Booking, txn.booking_id)
     if booking is None:
@@ -905,6 +907,11 @@ async def finance_read(session: AsyncSession, txn: Transaction) -> TransactionFi
     seeker_profile = (
         await session.execute(
             select(SeekerProfile).where(SeekerProfile.user_id == booking.seeker_id)
+        )
+    ).scalar_one_or_none()
+    advisor_profile = (
+        await session.execute(
+            select(AdvisorProfile).where(AdvisorProfile.user_id == booking.advisor_id)
         )
     ).scalar_one_or_none()
     return TransactionFinanceRead(
@@ -938,6 +945,12 @@ async def finance_read(session: AsyncSession, txn: Transaction) -> TransactionFi
         invoice_id=format_invoice_id(txn.invoice_number),
         display_status=display_status(txn),
         seeker_country=seeker_profile.country_of_residence if seeker_profile else None,
+        seeker_photo_url=resolve_media_url(
+            seeker_profile.profile_photo_url if seeker_profile else None, settings
+        ),
+        advisor_photo_url=resolve_media_url(
+            advisor_profile.profile_photo_url if advisor_profile else None, settings
+        ),
     )
 
 
