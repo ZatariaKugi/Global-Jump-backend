@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.models.booking import BookingStatus
 from app.models.seeker_document import DocumentCategory, SeekerDocumentStatus
+
+CustomerDocumentsRowStatus = Literal["pending", "completed"]
 
 
 class SeekerDocumentCreate(BaseModel):
@@ -38,6 +42,26 @@ class SeekerDocumentRead(BaseModel):
     reviewed_at: datetime | None
     reviewed_by: uuid.UUID | None
     created_at: datetime
+
+
+class CustomerDocumentsRowRead(BaseModel):
+    """One row on the advisor "Documents of customers" table.
+
+    Scoped to a booking (appointment) + that seeker's document portfolio.
+    """
+
+    booking_id: uuid.UUID
+    appointment_id: str
+    seeker_id: uuid.UUID
+    seeker_name: str | None
+    seeker_email: str
+    seeker_profile_photo_url: str | None
+    service_type: str
+    booking_status: BookingStatus
+    documents_count: int
+    # pending = any under_review/rejected or zero docs; completed = all approved.
+    documents_status: CustomerDocumentsRowStatus
+    updated_at: datetime
 
 
 class DocumentCommentCreate(BaseModel):
