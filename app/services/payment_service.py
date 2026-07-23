@@ -266,8 +266,18 @@ async def _next_invoice_number(session: AsyncSession) -> int:
     return current_max + 1
 
 
+def _stripe_get(obj: object, key: str, default: object = None) -> object:
+    """Read a field from a StripeObject or plain dict (webhook payload either way)."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    try:
+        return obj[key]  # type: ignore[index]
+    except (KeyError, TypeError, AttributeError):
+        return default
+
+
 async def _handle_checkout_completed(session: AsyncSession, cs: object, settings: Settings) -> None:
-    session_id: str = cs["id"]  # type: ignore[index]
+    session_id = str(_stripe_get(cs, "id") or "")
     txn_result = await session.execute(
         select(Transaction).where(Transaction.stripe_checkout_session_id == session_id)
     )
@@ -276,15 +286,23 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
         log.warning("webhook_checkout_no_txn", session_id=session_id)
         return
 
-    pi_id: str | None = cs.get("payment_intent")  # type: ignore[attr-defined]
+    raw_pi = _stripe_get(cs, "payment_intent")
+    pi_id: str | None = None
+    if isinstance(raw_pi, str):
+        pi_id = raw_pi
+    elif raw_pi is not None:
+        pi_id = str(_stripe_get(raw_pi, "id") or "") or None
+
     charge_id: str | None = None
     if pi_id:
         try:
             pi = await stripe.PaymentIntent.retrieve_async(pi_id, expand=["latest_charge"])
-            latest_charge = pi.get("latest_charge")  # type: ignore[attr-defined]
+            latest_charge = _stripe_get(pi, "latest_charge")
             if latest_charge:
                 charge_id = (
-                    latest_charge["id"] if isinstance(latest_charge, dict) else latest_charge.id
+                    latest_charge["id"]
+                    if isinstance(latest_charge, dict)
+                    else str(_stripe_get(latest_charge, "id") or latest_charge)
                 )
         except stripe.StripeError as exc:
             log.warning("webhook_pi_retrieve_failed", pi_id=pi_id, error=str(exc))
@@ -324,7 +342,7 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
 
 
 async def _handle_checkout_expired(session: AsyncSession, cs: object) -> None:
-    session_id: str = cs["id"]  # type: ignore[index]
+    session_id = str(_stripe_get(cs, "id") or "")
     txn_result = await session.execute(
         select(Transaction).where(Transaction.stripe_checkout_session_id == session_id)
     )
@@ -340,7 +358,7 @@ async def _handle_checkout_expired(session: AsyncSession, cs: object) -> None:
 
 
 async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None:
-    charge_id: str = charge["id"]  # type: ignore[index]
+    charge_id = str(_stripe_get(charge, "id") or "")
     txn_result = await session.execute(
         select(Transaction).where(Transaction.stripe_charge_id == charge_id)
     )
@@ -349,10 +367,10 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
         log.warning("webhook_refund_no_txn", charge_id=charge_id)
         return
 
-    amount_refunded_cents = charge.get("amount_refunded")  # type: ignore[attr-defined]
+    amount_refunded_cents = _stripe_get(charge, "amount_refunded")
     refunded_amount_usd = (
-        round(amount_refunded_cents / 100, 2)
-        if amount_refunded_cents is not None
+        round(int(amount_refunded_cents) / 100, 2)  # type: ignore[arg-type]
+        if isinstance(amount_refunded_cents, (int, float))
         else txn.amount_usd
     )
     is_full = refunded_amount_usd >= txn.amount_usd
