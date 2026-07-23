@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import uuid
-from typing import Literal
+from datetime import date, datetime, timedelta
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Query, Request
 
 from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.api.pagination import PaginationDep, page_meta, paginate
 from app.db.session import SessionDep
+from app.models.advisor_profile import AdvisorServiceType
 from app.models.transaction import Transaction
 from app.models.user import UserRole
 from app.schemas.payment import (
@@ -24,6 +26,9 @@ from app.schemas.response import Meta, ResponseEnvelope
 from app.services import payment_service
 
 router = APIRouter(prefix="/payments", tags=["payments"])
+
+PaymentHistorySort = Literal["created_at", "-created_at", "amount_usd", "-amount_usd"]
+PaymentPeriod = Literal["7d", "30d", "90d", "365d", "all"]
 
 
 async def _get_accessible_transaction(
@@ -41,9 +46,12 @@ async def get_payment_config(
     request_id: RequestIdDep,
     _current_user: CurrentUser,
 ) -> ResponseEnvelope[PaymentConfigRead]:
-    """Stripe publishable key for frontend Checkout / Elements."""
+    """Stripe publishable key + commission rate for frontend Checkout / fee math."""
     return ResponseEnvelope[PaymentConfigRead](
-        data=PaymentConfigRead(publishable_key=settings.STRIPE_PUBLISHABLE_KEY),
+        data=PaymentConfigRead(
+            publishable_key=settings.STRIPE_PUBLISHABLE_KEY,
+            platform_commission_rate=settings.PLATFORM_COMMISSION_RATE,
+        ),
         meta=Meta(request_id=request_id),
     )
 
@@ -98,9 +106,39 @@ async def get_payment_history(
     current_user: CurrentUser,
     session: SessionDep,
     request_id: RequestIdDep,
+    q: Annotated[str | None, Query(max_length=100)] = None,
+    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
+    visa_type: Annotated[
+        list[str] | None,
+        Query(description="Alias of service_type for FE URL parity"),
+    ] = None,
+    sort: Annotated[PaymentHistorySort, Query()] = "-created_at",
+    period: Annotated[PaymentPeriod | None, Query()] = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
 ) -> ResponseEnvelope[list[SeekerPaymentRead]]:
     """Visa-seeker payment history with advisor + fee split columns."""
-    stmt = payment_service.list_for_seeker_stmt(current_user.id)
+    types = [t.value for t in service_type] if service_type else None
+    if not types and visa_type:
+        types = visa_type
+
+    resolved_from = date_from
+    resolved_to = date_to
+    if period and period != "all" and date_from is None and date_to is None:
+        from datetime import UTC
+
+        days = int(period.rstrip("d"))
+        resolved_to = datetime.now(UTC).date()
+        resolved_from = resolved_to - timedelta(days=days)
+
+    stmt = payment_service.list_for_seeker_stmt(
+        current_user.id,
+        q=q,
+        service_types=types,
+        date_from=resolved_from,
+        date_to=resolved_to,
+        sort=sort,
+    )
     txns, total = await paginate(session, stmt, params)
     data = [await payment_service.seeker_payment_read(session, t) for t in txns]
     return ResponseEnvelope[list[SeekerPaymentRead]](

@@ -18,6 +18,7 @@ from app.models.advisor_profile import (
     AdvisorOfferedService,
     AdvisorProfile,
     AdvisorService,
+    AdvisorServiceType,
     AdvisorVisaSpecialization,
 )
 from app.models.conversation import Conversation
@@ -36,22 +37,36 @@ from app.schemas.advisor_profile import (
 )
 from app.services import review_service
 
+_VALID_SERVICE_TYPES = {e.value for e in AdvisorServiceType}
+
 
 def offered_service_types(profile: AdvisorProfile) -> list[str]:
     """Service-type strings for booking dropdowns.
 
     Prefer bookable ``AdvisorService`` types (what ``POST /bookings`` resolves),
     then any onboarding ``offered_services`` categories, de-duplicated.
+    Only ``AdvisorServiceType`` enum values are returned so the FE cannot
+    offer freeform labels that fail booking validation.
     """
     out: list[str] = []
     seen: set[str] = set()
     for raw in [s.service_type for s in (profile.services or [])] + [
         s.service_type for s in (profile.offered_services or [])
     ]:
-        if raw not in seen:
+        if raw in _VALID_SERVICE_TYPES and raw not in seen:
             seen.add(raw)
             out.append(raw)
     return out
+
+
+def starting_price_usd(profile: AdvisorProfile | None) -> float | None:
+    """Lowest bookable service price, or None when the advisor has no services."""
+    if profile is None or not profile.services:
+        return None
+    prices = [
+        s.price_usd for s in profile.services if s.service_type in _VALID_SERVICE_TYPES
+    ]
+    return min(prices) if prices else None
 
 
 def _visa_specializations(profile: AdvisorProfile) -> list[VisaType]:
@@ -173,12 +188,14 @@ def _build_common(profile: AdvisorProfile, settings: Settings) -> dict[str, obje
         ],
         "services": [
             ServiceOffering(
-                service_type=s.service_type,
+                service_type=AdvisorServiceType(s.service_type),
                 duration_minutes=s.duration_minutes,
                 price_usd=s.price_usd,
             )
             for s in (profile.services or [])
+            if s.service_type in _VALID_SERVICE_TYPES
         ],
+        "starting_price_usd": starting_price_usd(profile),
         "is_featured": profile.is_featured,
         "public_profile_slug": profile.public_profile_slug,
     }
@@ -307,7 +324,6 @@ def build_listing_card(
             is_bookmarked=is_bookmarked,
             conversation_id=conversation_id,
         )
-    prices = [s.price_usd for s in (profile.services or [])]
     return AdvisorListingCard(
         user_id=user.id,
         full_name=user.full_name,
@@ -319,7 +335,7 @@ def build_listing_card(
         visa_specializations=_visa_specializations(profile),
         country_expertise=[c.country_code for c in (profile.country_expertise or [])],
         languages=[lang.language for lang in (profile.languages or [])],
-        starting_price_usd=min(prices) if prices else None,
+        starting_price_usd=starting_price_usd(profile),
         average_rating=average_rating,
         review_count=review_count,
         is_featured=profile.is_featured,
@@ -362,6 +378,7 @@ def build_public_read(
         country_expertise=[],
         languages=[],
         services=[],
+        starting_price_usd=None,
         is_featured=False,
         public_profile_slug=None,
         match_percentage=match_percentage,

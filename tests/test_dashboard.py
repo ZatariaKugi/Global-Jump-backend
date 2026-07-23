@@ -241,7 +241,7 @@ async def test_revenue_breakdown_bucketing(client: AsyncClient, admin_token: str
         consult_booking = Booking(
             seeker_id=seeker_id,
             advisor_id=advisor_id,
-            service_type="consultation_30",
+            service_type="immigration_specialist",
             duration_minutes=30,
             price_usd=100.0,
             scheduled_start=now,

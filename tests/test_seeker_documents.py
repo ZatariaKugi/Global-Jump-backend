@@ -46,7 +46,7 @@ async def _booked_pair(client: AsyncClient, engine) -> tuple[str, dict, dict]:
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(day, 10),
         },
         headers=seeker_headers,

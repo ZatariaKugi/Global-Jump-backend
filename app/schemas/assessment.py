@@ -154,6 +154,7 @@ class AdvisorMatchRead(BaseModel):
     profile_photo_url: str | None
     years_of_experience: int | None
     average_rating: float | None = None
+    starting_price_usd: float | None = None
     match_score: float
     public_profile_slug: str | None
 
