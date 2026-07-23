@@ -27,7 +27,14 @@ from app.services import payment_service
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
-PaymentHistorySort = Literal["created_at", "-created_at", "amount_usd", "-amount_usd"]
+PaymentHistorySort = Literal[
+    "created_at",
+    "-created_at",
+    "amount_usd",
+    "-amount_usd",
+    "total_amount",
+    "-total_amount",
+]
 PaymentPeriod = Literal["7d", "30d", "90d", "365d", "all"]
 
 
@@ -105,6 +112,7 @@ async def get_payment_history(
     params: PaginationDep,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     q: Annotated[str | None, Query(max_length=100)] = None,
     service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
@@ -140,7 +148,7 @@ async def get_payment_history(
         sort=sort,
     )
     txns, total = await paginate(session, stmt, params)
-    data = [await payment_service.seeker_payment_read(session, t) for t in txns]
+    data = [await payment_service.seeker_payment_read(session, t, settings) for t in txns]
     return ResponseEnvelope[list[SeekerPaymentRead]](
         data=data,
         meta=page_meta(params, total, request_id),
@@ -152,11 +160,12 @@ async def get_payment_detail(
     transaction_id: uuid.UUID,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[SeekerPaymentRead]:
     """Payment Details — seeker/advisor/admin with enriched seeker-oriented fields."""
     txn = await _get_accessible_transaction(session, transaction_id, current_user)
-    data = await payment_service.seeker_payment_read(session, txn)
+    data = await payment_service.seeker_payment_read(session, txn, settings)
     return ResponseEnvelope[SeekerPaymentRead](
         data=data,
         meta=Meta(request_id=request_id),
