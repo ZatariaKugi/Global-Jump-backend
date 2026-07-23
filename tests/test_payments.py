@@ -35,7 +35,7 @@ async def _confirmed_booking(client: AsyncClient, engine) -> tuple[str, dict, di
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(day, 10),
         },
         headers=seeker_headers,
@@ -136,7 +136,7 @@ async def test_advisor_can_list_own_payments(client: AsyncClient, engine) -> Non
     data = resp.json()["data"]
     assert len(data) == 1
     assert data[0]["seeker_id"] == seeker_id
-    assert data[0]["service_type"] == "consultation_30"
+    assert data[0]["service_type"] == "immigration_specialist"
     assert data[0]["status"] == "succeeded"
 
 
@@ -265,4 +265,4 @@ async def test_payment_receipt_email_sent_on_successful_payment(
 
     mock_send.assert_awaited_once()
     assert mock_send.call_args.args[0] == "cust@test.com"
-    assert mock_send.call_args.kwargs["service_type"] == "consultation_30"
+    assert mock_send.call_args.kwargs["service_type"] == "immigration_specialist"

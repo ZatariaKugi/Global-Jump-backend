@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import stripe
 import structlog
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -106,19 +106,42 @@ async def create_checkout_session(
     booking = await session.get(Booking, booking_id)
     if booking is None or booking.seeker_id != seeker_id:
         raise NotFoundError("Booking not found")
-    if booking.status != BookingStatus.confirmed:
+    # Pay-first: allow checkout while the request is still pending, or after
+    # the advisor has confirmed. Reject terminal / non-payable states.
+    if booking.status not in (BookingStatus.pending, BookingStatus.confirmed):
         raise AppError("Booking is not in a payable state", code="invalid_booking_state")
     if booking.payment_status != PaymentStatus.unpaid:
         raise AppError("Booking is already paid or refunded", code="already_paid")
 
-    # Guard against duplicate checkout sessions
-    existing = await session.execute(
-        select(Transaction).where(Transaction.booking_id == booking_id)
-    )
-    if existing.scalar_one_or_none() is not None:
-        raise AppError(
-            "A checkout session already exists for this booking", code="duplicate_checkout"
-        )
+    # Resume an existing open Checkout Session instead of hard-failing.
+    existing = (
+        await session.execute(select(Transaction).where(Transaction.booking_id == booking_id))
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.status != TransactionStatus.pending:
+            raise AppError(
+                "A checkout session already exists for this booking", code="duplicate_checkout"
+            )
+        try:
+            checkout_session = await stripe.checkout.Session.retrieve_async(
+                existing.stripe_checkout_session_id
+            )
+        except stripe.StripeError as exc:
+            raise AppError(
+                "Could not resume the existing checkout session", code="checkout_resume_failed"
+            ) from exc
+        url = getattr(checkout_session, "url", None)
+        status = getattr(checkout_session, "status", None)
+        if status == "open" and url:
+            log.info(
+                "checkout_session_resumed",
+                booking_id=str(booking_id),
+                session_id=existing.stripe_checkout_session_id,
+            )
+            return CheckoutResponse(checkout_url=url, session_id=checkout_session.id)
+        # Session expired / completed — drop the pending txn and create a fresh one.
+        await session.delete(existing)
+        await session.flush()
 
     advisor_profile = await _get_advisor_profile(session, booking.advisor_id)
 
@@ -569,14 +592,31 @@ async def build_invoice(
     ).scalar_one_or_none()
     to_address = None
     if seeker_profile and seeker_profile.country_of_residence:
-        to_address = seeker_profile.country_of_residence
+        from app.core.countries import country_name
+
+        code = seeker_profile.country_of_residence
+        to_address = country_name(code) or code
+
+    advisor_profile = (
+        await session.execute(
+            select(AdvisorProfile).where(AdvisorProfile.user_id == booking.advisor_id)
+        )
+    ).scalar_one_or_none()
 
     invoice_id = format_invoice_id(txn.invoice_number) or f"{txn.invoice_number:08d}"
     issued = txn.created_at
 
+    from_phone = getattr(settings, "INVOICE_FROM_PHONE", None)
+    to_phone = None  # no phone column on users/profiles yet
+
     if perspective == "advisor":
         from_name = (advisor.full_name if advisor else None) or "Advisor"
         from_address = None
+        if advisor_profile and advisor_profile.country_of_residence:
+            from app.core.countries import country_name
+
+            code = advisor_profile.country_of_residence
+            from_address = country_name(code) or code
         line_items = [
             InvoiceLineItem(
                 description=booking.service_type,
@@ -628,9 +668,11 @@ async def build_invoice(
         booking_id=booking.id,
         from_name=from_name,
         from_address=from_address,
+        from_phone=from_phone,
         to_name=seeker.full_name if seeker else None,
         to_email=seeker.email if seeker else "",
         to_address=to_address,
+        to_phone=to_phone,
         line_items=line_items,
         subtotal_usd=subtotal,
         tax_usd=tax,
@@ -644,14 +686,51 @@ async def build_invoice(
     )
 
 
-def list_for_seeker_stmt(seeker_id: uuid.UUID) -> Select[tuple[Transaction]]:
-    return (
+def list_for_seeker_stmt(
+    seeker_id: uuid.UUID,
+    *,
+    q: str | None = None,
+    service_types: list[str] | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    sort: str = "-created_at",
+) -> Select[tuple[Transaction]]:
+    """Visa-seeker payment history with optional search / type / date filters."""
+    stmt = (
         select(Transaction)
         .join(Booking, Booking.id == Transaction.booking_id)
+        .outerjoin(User, User.id == Booking.advisor_id)
         .where(Booking.seeker_id == seeker_id)
         .where(Transaction.is_archived.is_(False))
-        .order_by(Transaction.created_at.desc())
     )
+    if q:
+        pattern = f"%{q.strip()}%"
+        stmt = stmt.where(
+            or_(
+                User.full_name.ilike(pattern),
+                User.email.ilike(pattern),
+                Booking.service_type.ilike(pattern),
+                cast(Transaction.invoice_number, String).ilike(pattern),
+            )
+        )
+    if service_types:
+        stmt = stmt.where(Booking.service_type.in_(service_types))
+    if date_from is not None:
+        start = datetime(date_from.year, date_from.month, date_from.day, tzinfo=UTC)
+        stmt = stmt.where(Transaction.created_at >= start)
+    if date_to is not None:
+        end = datetime(date_to.year, date_to.month, date_to.day, tzinfo=UTC) + timedelta(days=1)
+        stmt = stmt.where(Transaction.created_at < end)
+
+    if sort == "created_at":
+        stmt = stmt.order_by(Transaction.created_at.asc())
+    elif sort == "amount_usd":
+        stmt = stmt.order_by(Transaction.amount_usd.asc())
+    elif sort == "-amount_usd":
+        stmt = stmt.order_by(Transaction.amount_usd.desc())
+    else:
+        stmt = stmt.order_by(Transaction.created_at.desc())
+    return stmt
 
 
 async def seeker_payment_read(session: AsyncSession, txn: Transaction) -> SeekerPaymentRead:

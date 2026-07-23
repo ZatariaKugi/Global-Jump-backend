@@ -186,7 +186,7 @@ async def main() -> None:
                     "languages": [{"language": "English", "proficiency": "native"}],
                     "services": [
                         {
-                            "service_type": "consultation_30",
+                            "service_type": "immigration_specialist",
                             "duration_minutes": 30,
                             "price_usd": 50.00,
                         }
@@ -228,7 +228,7 @@ async def main() -> None:
                 "/bookings",
                 json={
                     "advisor_id": advisor_id,
-                    "service_type": "consultation_30",
+                    "service_type": "immigration_specialist",
                     "scheduled_start": slot_start,
                     "seeker_note": "Flow test booking",
                 },

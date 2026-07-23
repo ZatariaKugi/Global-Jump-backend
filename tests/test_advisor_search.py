@@ -76,11 +76,15 @@ async def _seed_two_advisors(client: AsyncClient, engine) -> tuple[str, str, str
             "title": "Canada PR Consultant",
             "bio": "Express entry and family sponsorship",
             "years_of_experience": 5,
-            "visa_specializations": ["permanent_residency", "family"],
+            "visa_specializations": ["pr", "family"],
             "country_expertise": ["CA"],
             "languages": [{"language": "French", "proficiency": "fluent"}],
             "services": [
-                {"service_type": "consultation_30", "duration_minutes": 30, "price_usd": 60.0}
+                {
+                    "service_type": "immigration_specialist",
+                    "duration_minutes": 30,
+                    "price_usd": 60.0,
+                }
             ],
         },
     )

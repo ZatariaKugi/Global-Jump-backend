@@ -47,7 +47,11 @@ async def _bookable_advisor(
         "Bookable Advisor",
         {
             "services": [
-                {"service_type": "consultation_30", "duration_minutes": 30, "price_usd": 75.0}
+                {
+                    "service_type": "immigration_specialist",
+                    "duration_minutes": 30,
+                    "price_usd": 75.0,
+                }
             ]
         },
     )
@@ -75,7 +79,7 @@ async def test_create_booking_happy_path(client: AsyncClient, engine) -> None:
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(day, 10),
             "seeker_note": "First consultation",
         },
@@ -87,7 +91,7 @@ async def test_create_booking_happy_path(client: AsyncClient, engine) -> None:
     data = body["data"]
     assert data["status"] == "pending"  # advisor must accept before it's confirmed
     assert data["payment_status"] == "unpaid"
-    assert data["service_type"] == "consultation_30"
+    assert data["service_type"] == "immigration_specialist"
     assert data["duration_minutes"] == 30
     assert data["price_usd"] == 75.0
     assert data["advisor_name"] == "Bookable Advisor"
@@ -100,7 +104,7 @@ async def test_double_booking_rejected(client: AsyncClient, engine) -> None:
 
     payload = {
         "advisor_id": advisor_id,
-        "service_type": "consultation_30",
+        "service_type": "immigration_specialist",
         "scheduled_start": _slot_iso(day, 10),
     }
     assert (await client.post(BOOKINGS, json=payload, headers=headers)).status_code == 201
@@ -120,7 +124,7 @@ async def test_booking_outside_availability_rejected(client: AsyncClient, engine
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(day + timedelta(days=1), 10),
         },
         headers=headers,
@@ -152,7 +156,7 @@ async def test_advisor_cannot_create_booking(client: AsyncClient, engine) -> Non
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(day, 10),
         },
         headers=advisor_headers,
@@ -168,7 +172,7 @@ async def test_role_scoped_lists_and_detail_isolation(client: AsyncClient, engin
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(day, 9),
         },
         headers=cust_headers,
@@ -217,7 +221,7 @@ async def test_seeker_late_cancellation_blocked(client: AsyncClient, engine) -> 
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(day, 10),
         },
         headers=cust_headers,
@@ -246,7 +250,7 @@ async def test_seeker_cancel_with_enough_notice(client: AsyncClient, engine) -> 
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(day + timedelta(days=14), 10),
         },
         headers=cust_headers,
@@ -276,7 +280,7 @@ async def test_reschedule_moves_and_validates(client: AsyncClient, engine) -> No
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(far_day, 10),
         },
         headers=cust_headers,
@@ -310,7 +314,7 @@ async def test_complete_and_no_show_transitions(client: AsyncClient, engine) -> 
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(day, 10),
         },
         headers=cust_headers,
@@ -356,7 +360,7 @@ async def test_booking_in_past_rejected(client: AsyncClient, engine) -> None:
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": datetime.now(UTC).replace(year=2020).isoformat(),
         },
         headers=cust_headers,
@@ -378,7 +382,7 @@ async def _pending_booking(
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(day, hour),
         },
         headers=cust_headers,
@@ -470,7 +474,7 @@ async def test_seeker_id_filter_scopes_advisor_history(client: AsyncClient, engi
             BOOKINGS,
             json={
                 "advisor_id": advisor_id,
-                "service_type": "consultation_30",
+                "service_type": "immigration_specialist",
                 "scheduled_start": _slot_iso(day, hour),
             },
             headers=headers,

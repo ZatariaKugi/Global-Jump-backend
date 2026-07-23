@@ -22,6 +22,7 @@ from app.models.seeker_profile import SeekerProfile
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.assessment import AdvisorMatchRead
 from app.services import matching_weights_service, review_service
+from app.services.advisor_profile_service import starting_price_usd
 from app.services.matching_weights_service import DEFAULT_CONFIG, MatchingWeightConfig
 
 DEFAULT_LIMIT = 5
@@ -160,6 +161,7 @@ async def match(
             profile_photo_url=profile.profile_photo_url,
             years_of_experience=profile.years_of_experience,
             average_rating=ratings[user.id][0] if user.id in ratings else None,
+            starting_price_usd=starting_price_usd(profile),
             match_score=score_advisor_for_assessment(
                 profile,
                 assessment.destination_country,

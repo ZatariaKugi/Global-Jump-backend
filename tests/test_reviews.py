@@ -34,7 +34,7 @@ async def _completed_booking(
         "/api/v1/bookings",
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(day, hour),
         },
         headers=cust_headers,
@@ -95,7 +95,7 @@ async def test_review_requires_completed_booking(client: AsyncClient, engine) ->
         "/api/v1/bookings",
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(day, 11),
         },
         headers=cust_headers,

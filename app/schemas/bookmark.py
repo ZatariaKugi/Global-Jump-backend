@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class BookmarkCreate(BaseModel):
@@ -24,7 +24,9 @@ class BookmarkRead(BaseModel):
     expertise: str | None  # title / specialty label
     average_rating: float | None
     years_of_experience: int | None
-    match_percentage: int | None  # 0–100, null when seeker has no destination/visa context
+    offered_services: list[str] = Field(default_factory=list)
+    starting_price_usd: float | None = None
+    match_percentage: int | None = None  # 0–100, null when seeker has no destination/visa context
     status: Literal["active", "inactive"]
     public_profile_slug: str | None
     is_bookmarked: bool = True
