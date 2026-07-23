@@ -169,24 +169,29 @@ def build_comment_read(comment: SeekerDocumentComment, author: User | None) -> D
 def _row_documents_status(
     count: int, under_review: int, approved: int, rejected: int
 ) -> CustomerDocumentsRowStatus:
-    """Map portfolio tallies to the FE Pending / Completed badge."""
+    """Map portfolio tallies to the FE Pending / Completed / Rejected badge."""
     if count == 0:
         return "pending"
-    if under_review > 0 or rejected > 0:
+    if under_review > 0:
         return "pending"
+    if rejected == count:
+        return "rejected"
     if approved == count:
         return "completed"
     return "pending"
 
 
-def _portfolio_completed_clause() -> ColumnElement[bool]:
-    """Seeker has ≥1 doc and none under_review/rejected (all approved)."""
-    has_docs = exists(
+def _portfolio_has_docs_clause() -> ColumnElement[bool]:
+    return exists(
         select(SeekerDocument.id).where(
             SeekerDocument.seeker_id == Booking.seeker_id,
             SeekerDocument.is_archived.is_(False),
         )
     )
+
+
+def _portfolio_completed_clause() -> ColumnElement[bool]:
+    """Seeker has ≥1 doc and none under_review/rejected (all approved)."""
     has_open = exists(
         select(SeekerDocument.id).where(
             SeekerDocument.seeker_id == Booking.seeker_id,
@@ -196,7 +201,26 @@ def _portfolio_completed_clause() -> ColumnElement[bool]:
             ),
         )
     )
-    return has_docs & ~has_open
+    return _portfolio_has_docs_clause() & ~has_open
+
+
+def _portfolio_rejected_clause() -> ColumnElement[bool]:
+    """Seeker has ≥1 doc, none under_review, and every doc is rejected."""
+    has_under_review = exists(
+        select(SeekerDocument.id).where(
+            SeekerDocument.seeker_id == Booking.seeker_id,
+            SeekerDocument.is_archived.is_(False),
+            SeekerDocument.status == SeekerDocumentStatus.under_review,
+        )
+    )
+    has_non_rejected = exists(
+        select(SeekerDocument.id).where(
+            SeekerDocument.seeker_id == Booking.seeker_id,
+            SeekerDocument.is_archived.is_(False),
+            SeekerDocument.status != SeekerDocumentStatus.rejected,
+        )
+    )
+    return _portfolio_has_docs_clause() & ~has_under_review & ~has_non_rejected
 
 
 def list_customer_documents_stmt(
@@ -221,8 +245,12 @@ def list_customer_documents_stmt(
     )
     if documents_status == "completed":
         stmt = stmt.where(_portfolio_completed_clause())
+    elif documents_status == "rejected":
+        stmt = stmt.where(_portfolio_rejected_clause())
     elif documents_status == "pending":
-        stmt = stmt.where(~_portfolio_completed_clause())
+        stmt = stmt.where(
+            ~_portfolio_completed_clause() & ~_portfolio_rejected_clause()
+        )
     return stmt
 
 
