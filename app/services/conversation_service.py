@@ -11,19 +11,69 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import resolve_media_url
+from app.models.advisor_profile import AdvisorProfile
 from app.models.conversation import Conversation
 from app.models.message import Message, MessageAttachment
 from app.models.review import ModerationStatus
+from app.models.seeker_profile import SeekerProfile
 from app.models.user import User, UserRole
 from app.schemas.conversation import (
     AttachmentRead,
     ConversationRead,
     FlaggedMessageRead,
     MessageRead,
+    OtherPartyRole,
 )
 from app.services.ws_manager import manager
 
 PUBLIC_STATUSES = (ModerationStatus.visible, ModerationStatus.flagged)
+
+
+async def profile_photo_keys(
+    session: AsyncSession, user_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, str | None]:
+    """Seeker/advisor profile photo keys for the given user ids."""
+    if not user_ids:
+        return {}
+    out: dict[uuid.UUID, str | None] = dict.fromkeys(user_ids)
+    advisor_rows = (
+        await session.execute(
+            select(AdvisorProfile.user_id, AdvisorProfile.profile_photo_url).where(
+                AdvisorProfile.user_id.in_(user_ids)
+            )
+        )
+    ).all()
+    for user_id, url in advisor_rows:
+        out[user_id] = url
+    seeker_rows = (
+        await session.execute(
+            select(SeekerProfile.user_id, SeekerProfile.profile_photo_url).where(
+                SeekerProfile.user_id.in_(user_ids)
+            )
+        )
+    ).all()
+    for user_id, url in seeker_rows:
+        if out.get(user_id) is None:
+            out[user_id] = url
+    return out
+
+
+async def advisor_titles(
+    session: AsyncSession, user_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, str | None]:
+    if not user_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(AdvisorProfile.user_id, AdvisorProfile.title).where(
+                AdvisorProfile.user_id.in_(user_ids)
+            )
+        )
+    ).all()
+    out: dict[uuid.UUID, str | None] = {}
+    for uid, title in rows:
+        out[uid] = title
+    return out
 
 
 async def conversation_ids_for_seeker(
@@ -288,12 +338,19 @@ async def moderate(
     return message
 
 
-def build_message_read(message: Message, sender: User | None, settings: Settings) -> MessageRead:
+def build_message_read(
+    message: Message,
+    sender: User | None,
+    settings: Settings,
+    *,
+    sender_photo_key: str | None = None,
+) -> MessageRead:
     return MessageRead(
         id=message.id,
         conversation_id=message.conversation_id,
         sender_id=message.sender_id,
         sender_name=sender.full_name if sender else None,
+        sender_photo_url=resolve_media_url(sender_photo_key, settings),
         body=message.body,
         attachments=[
             AttachmentRead(
@@ -312,18 +369,49 @@ def build_message_read(message: Message, sender: User | None, settings: Settings
 
 
 async def build_conversation_read(
-    session: AsyncSession, conversation: Conversation, current_user_id: uuid.UUID
+    session: AsyncSession,
+    conversation: Conversation,
+    current_user_id: uuid.UUID,
+    settings: Settings,
 ) -> ConversationRead:
     other_id = other_party_id(conversation, current_user_id)
     other = await session.get(User, other_id)
     last = await last_message(session, conversation.id)
     unread = await unread_count(session, conversation.id, current_user_id)
+
+    other_role: OtherPartyRole | None = None
+    other_title: str | None = None
+    other_photo_key: str | None = None
+    if other is not None:
+        if other.role == UserRole.advisor:
+            other_role = "advisor"
+            advisor_profile = (
+                await session.execute(
+                    select(AdvisorProfile).where(AdvisorProfile.user_id == other.id)
+                )
+            ).scalar_one_or_none()
+            if advisor_profile is not None:
+                other_title = advisor_profile.title
+                other_photo_key = advisor_profile.profile_photo_url
+        elif other.role == UserRole.seeker:
+            other_role = "seeker"
+            seeker_profile = (
+                await session.execute(
+                    select(SeekerProfile).where(SeekerProfile.user_id == other.id)
+                )
+            ).scalar_one_or_none()
+            if seeker_profile is not None:
+                other_photo_key = seeker_profile.profile_photo_url
+
     return ConversationRead(
         id=conversation.id,
         seeker_id=conversation.seeker_id,
         advisor_id=conversation.advisor_id,
         other_party_id=other_id,
         other_party_name=other.full_name if other else None,
+        other_party_photo_url=resolve_media_url(other_photo_key, settings),
+        other_party_role=other_role,
+        other_party_title=other_title,
         other_party_online=manager.is_online(conversation.id, other_id),
         last_message_at=conversation.last_message_at,
         last_message_preview=last.body[:140] if last and last.body else None,
@@ -333,9 +421,15 @@ async def build_conversation_read(
 
 
 def build_flagged_read(
-    message: Message, sender: User | None, settings: Settings
+    message: Message,
+    sender: User | None,
+    settings: Settings,
+    *,
+    sender_photo_key: str | None = None,
 ) -> FlaggedMessageRead:
-    base = build_message_read(message, sender, settings)
+    base = build_message_read(
+        message, sender, settings, sender_photo_key=sender_photo_key
+    )
     return FlaggedMessageRead(
         **base.model_dump(),
         moderation_status=message.moderation_status,
