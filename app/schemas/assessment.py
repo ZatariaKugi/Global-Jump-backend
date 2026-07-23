@@ -195,23 +195,22 @@ class AssessmentSummaryRead(BaseModel):
 
 
 class AssessmentVolumePoint(BaseModel):
-    date: str  # ISO date (YYYY-MM-DD)
-    count: int
+    """Area-chart point — month axis label + assessment count."""
+
+    month: str  # e.g. "Jan"
+    value: int
 
 
 class AssessmentDropOffPoint(BaseModel):
-    question_id: uuid.UUID | None
-    label: str
-    count: int
+    """Bar-chart point — question stage + drop-off % of assessments started."""
+
+    stage: str  # e.g. "Q1", "Q2"
+    value: float
 
 
 class AssessmentAnalyticsRead(BaseModel):
     window_days: int
-    total_started: int
-    total_completed: int
-    volume: list[AssessmentVolumePoint]
-    pass_rate: float
-    fail_rate: float
-    drop_off_count: int
-    drop_off_rate: float
+    pass_rate: float  # 0–100
+    fail_rate: float  # 0–100
+    assessment_volume: list[AssessmentVolumePoint]
     drop_off_points: list[AssessmentDropOffPoint]

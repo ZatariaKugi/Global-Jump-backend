@@ -499,6 +499,21 @@ PASS_TIERS = (EligibilityTier.highly_eligible, EligibilityTier.likely_eligible)
 FAIL_TIERS = (EligibilityTier.borderline, EligibilityTier.low_eligibility)
 
 
+def _month_key(dt: datetime) -> str:
+    return dt.strftime("%Y-%m")
+
+
+def _month_label(ym: str) -> str:
+    """YYYY-MM → short month name for chart axis (e.g. Jan)."""
+    return datetime.strptime(ym, "%Y-%m").strftime("%b")
+
+
+def _drop_off_stage_sort_key(stage: str) -> tuple[int, int | str]:
+    if stage.startswith("Q") and stage[1:].isdigit():
+        return (0, int(stage[1:]))
+    return (1, stage)
+
+
 async def get_analytics(
     session: AsyncSession,
     country: str | None = None,
@@ -511,39 +526,34 @@ async def get_analytics(
     if country:
         scope_filters.append(Assessment.destination_country == country.upper())
     if visa_type:
-        scope_filters.append(Assessment.visa_type == visa_type.lower())
+        scope_filters.append(Assessment.visa_type == str(visa_type).lower())
 
     base_stmt = select(Assessment).where(Assessment.created_at >= since, *scope_filters)
     started = list((await session.execute(base_stmt)).scalars().all())
 
-    total_started = len(started)
     completed = [a for a in started if a.status == AssessmentStatus.completed]
     total_completed = len(completed)
-    in_progress = total_started - total_completed
 
     pass_count = sum(1 for a in completed if a.tier in PASS_TIERS)
     fail_count = sum(1 for a in completed if a.tier in FAIL_TIERS)
     pass_rate = round(100 * pass_count / total_completed, 1) if total_completed else 0.0
     fail_rate = round(100 * fail_count / total_completed, 1) if total_completed else 0.0
 
-    drop_off_rate = round(100 * in_progress / total_started, 1) if total_started else 0.0
-
-    volume_counts: dict[str, int] = defaultdict(int)
+    month_counts: dict[str, int] = defaultdict(int)
     for a in started:
-        volume_counts[a.created_at.date().isoformat()] += 1
-    volume = [AssessmentVolumePoint(date=d, count=c) for d, c in sorted(volume_counts.items())]
+        month_counts[_month_key(a.created_at)] += 1
+    assessment_volume = [
+        AssessmentVolumePoint(month=_month_label(ym), value=count)
+        for ym, count in sorted(month_counts.items())
+    ]
 
-    drop_off_points = await _drop_off_points(session, started, country, visa_type)
+    drop_off_points = await _drop_off_points(session, started)
 
     return AssessmentAnalyticsRead(
         window_days=days,
-        total_started=total_started,
-        total_completed=total_completed,
-        volume=volume,
         pass_rate=pass_rate,
         fail_rate=fail_rate,
-        drop_off_count=in_progress,
-        drop_off_rate=drop_off_rate,
+        assessment_volume=assessment_volume,
         drop_off_points=drop_off_points,
     )
 
@@ -551,48 +561,39 @@ async def get_analytics(
 async def _drop_off_points(
     session: AsyncSession,
     started: list[Assessment],
-    country: str | None,
-    visa_type: str | None,
 ) -> list[AssessmentDropOffPoint]:
-    """Attribute each abandoned assessment to the next unanswered question."""
+    """% of started assessments that abandoned at each question stage (Q1, Q2, …)."""
+    total_started = len(started)
     abandoned = [a for a in started if a.status == AssessmentStatus.in_progress]
-    if not abandoned:
+    if not abandoned or total_started == 0:
         return []
 
-    # Load questions for the most common abandoned scope (or filter scope).
-    scope_country = country.upper() if country else None
-    scope_visa = visa_type.lower() if visa_type else None
-    if scope_country is None and abandoned:
-        scope_country = abandoned[0].destination_country
-    if scope_visa is None and abandoned:
-        scope_visa = abandoned[0].visa_type
+    by_scope: dict[tuple[str, str], list[Assessment]] = defaultdict(list)
+    for a in abandoned:
+        by_scope[(a.destination_country, a.visa_type)].append(a)
 
-    questions = await list_questions(
-        session, scope_country or "US", scope_visa or "tourist"
-    )
-    if not questions:
-        return [
-            AssessmentDropOffPoint(
-                question_id=None, label="Before first question", count=len(abandoned)
-            )
-        ]
-
-    counts: dict[uuid.UUID | None, int] = defaultdict(int)
-    labels: dict[uuid.UUID | None, str] = {None: "Before first question"}
-    for q in questions:
-        labels[q.id] = q.text[:80]
-
-    for assessment in abandoned:
-        answered_ids = {a.question_id for a in (assessment.answers or [])}
-        drop_qid: uuid.UUID | None = None
-        for q in questions:
-            if q.id not in answered_ids:
-                drop_qid = q.id
-                break
-        counts[drop_qid] += 1
+    stage_counts: dict[str, int] = defaultdict(int)
+    for (country, visa), group in by_scope.items():
+        questions = await list_questions(session, country, visa)
+        if not questions:
+            stage_counts["Before Q1"] += len(group)
+            continue
+        for assessment in group:
+            answered_ids = {ans.question_id for ans in (assessment.answers or [])}
+            stage = f"Q{len(questions)}"
+            for i, q in enumerate(questions):
+                if q.id not in answered_ids:
+                    stage = f"Q{i + 1}"
+                    break
+            stage_counts[stage] += 1
 
     return [
-        AssessmentDropOffPoint(question_id=qid, label=labels.get(qid, "Unknown"), count=c)
-        for qid, c in counts.items()
-        if c > 0
+        AssessmentDropOffPoint(
+            stage=stage,
+            value=round(100 * count / total_started, 1),
+        )
+        for stage, count in sorted(
+            stage_counts.items(), key=lambda x: _drop_off_stage_sort_key(x[0])
+        )
+        if count > 0
     ]

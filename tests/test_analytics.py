@@ -364,7 +364,7 @@ async def test_finance_analytics_revenue_and_refunds(
 # ── AI Analytics ─────────────────────────────────────────────────────────────
 
 
-async def test_ai_analytics_pass_fail_volume_and_drop_off(
+async def test_ai_analytics_distribution_funnel_and_eligibility(
     client: AsyncClient, admin_token: str, engine
 ) -> None:
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
@@ -378,7 +378,7 @@ async def test_ai_analytics_pass_fail_volume_and_drop_off(
                 Assessment(
                     user_id=seeker_id,
                     destination_country="GB",
-                    visa_type="work",
+                    visa_type="student",
                     status=AssessmentStatus.completed,
                     score=90.0,
                     tier=EligibilityTier.highly_eligible,
@@ -400,7 +400,7 @@ async def test_ai_analytics_pass_fail_volume_and_drop_off(
                 Assessment(
                     user_id=seeker_id,
                     destination_country="GB",
-                    visa_type="work",
+                    visa_type="tourist",
                     status=AssessmentStatus.in_progress,
                     created_at=now,
                 ),
@@ -414,25 +414,53 @@ async def test_ai_analytics_pass_fail_volume_and_drop_off(
 
     assert set(data.keys()) >= {
         "window_days",
-        "pass_rate",
-        "fail_rate",
-        "assessment_volume",
-        "drop_off_points",
+        "assessment_distribution",
+        "advisor_match_funnel",
+        "eligibility_breakdown",
     }
-    assert "recommendation_effectiveness" not in data
-    assert "match_score_distribution" not in data
-    assert "session_duration_distribution" not in data
-    assert "eligibility_assessments_trend" not in data
+    assert "pass_rate" not in data
+    assert "assessment_volume" not in data
+    assert "drop_off_points" not in data
 
-    assert data["pass_rate"] == 50.0
-    assert data["fail_rate"] == 50.0
-    assert len(data["assessment_volume"]) == 1
-    assert data["assessment_volume"][0]["month"] == now.strftime("%b")
-    assert data["assessment_volume"][0]["value"] == 3
-    # Abandoned with no questions → Before Q1; value is % of started (1/3 ≈ 33.3)
-    assert data["drop_off_points"]
-    assert data["drop_off_points"][0]["stage"] == "Before Q1"
-    assert data["drop_off_points"][0]["value"] == 33.3
+    dist = data["assessment_distribution"]
+    assert len(dist) == 7
+    assert [p["key"] for p in dist] == [
+        "student",
+        "work",
+        "tourist",
+        "pr",
+        "family",
+        "investment",
+        "asylum",
+    ]
+    by_key = {p["key"]: p for p in dist}
+    assert by_key["student"]["label"] == "Study Visa"
+    assert by_key["student"]["value"] == 1
+    assert by_key["work"]["value"] == 1
+    assert by_key["tourist"]["value"] == 1
+    assert by_key["pr"]["value"] == 0
+    assert "change_pct" in by_key["student"]
+
+    funnel = data["advisor_match_funnel"]
+    assert [p["key"] for p in funnel] == [
+        "impressions",
+        "matches_shown",
+        "advisors_clicked",
+        "session_booked",
+    ]
+    assert funnel[0]["value"] == 3  # started
+    assert funnel[1]["value"] == 2  # completed (no leads → fallback)
+
+    breakdown = data["eligibility_breakdown"]
+    assert len(breakdown) == 7
+    assert breakdown[0]["category"] == "Study Visa"
+    assert breakdown[0]["high"] == 100.0
+    assert breakdown[0]["medium"] == 0.0
+    assert breakdown[0]["low"] == 0.0
+    assert breakdown[1]["category"] == "Work Visa"
+    assert breakdown[1]["low"] == 100.0
+    assert breakdown[2]["category"] == "Tourist Visa"
+    assert breakdown[2]["low"] == breakdown[2]["medium"] == breakdown[2]["high"] == 0.0
 
 
 # ── Engagement Analytics ─────────────────────────────────────────────────────

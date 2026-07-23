@@ -129,22 +129,38 @@ class FinanceAnalyticsRead(BaseModel):
 # ── AI Analytics ─────────────────────────────────────────────────────────────
 
 
-class AssessmentVolumePoint(BaseModel):
-    month: str  # axis label, e.g. "Jan"
-    value: int  # assessment count for that month
+class AssessmentDistributionPoint(BaseModel):
+    """Donut slice — one per visa type (``key`` = VisaType API value)."""
+
+    key: str
+    label: str
+    value: int
+    change_pct: float
 
 
-class DropOffStagePoint(BaseModel):
-    stage: str  # e.g. "Q1"
-    value: float  # drop-off percentage (0–100) of assessments started
+class AdvisorMatchFunnelPoint(BaseModel):
+    """Conversion funnel stage (not visa-keyed)."""
+
+    key: str
+    label: str
+    value: int
+    change_pct: float
+
+
+class EligibilityBreakdownPoint(BaseModel):
+    """Stacked-bar row — eligibility mix (%) for one visa type."""
+
+    category: str
+    low: float
+    medium: float
+    high: float
 
 
 class AIAnalyticsRead(BaseModel):
     window_days: int
-    pass_rate: float  # 0–100, % of completed assessments in pass tiers
-    fail_rate: float  # 0–100, % of completed assessments in fail tiers
-    assessment_volume: list[AssessmentVolumePoint]
-    drop_off_points: list[DropOffStagePoint]
+    assessment_distribution: list[AssessmentDistributionPoint]
+    advisor_match_funnel: list[AdvisorMatchFunnelPoint]
+    eligibility_breakdown: list[EligibilityBreakdownPoint]
 
 
 # ── Engagement Analytics ─────────────────────────────────────────────────────
