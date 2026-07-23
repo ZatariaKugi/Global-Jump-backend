@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import uuid
 from datetime import UTC, date, datetime, timedelta
 
@@ -770,6 +772,64 @@ async def seeker_payment_read(
         refunded_at=txn.refunded_at,
         refund_reason=txn.refund_reason,
     )
+
+
+_SEEKER_EXPORT_MAX_ROWS = 5_000
+
+_SEEKER_CSV_HEADERS = (
+    "Invoice ID",
+    "Advisor",
+    "Advisor Email",
+    "Services",
+    "Date",
+    "Platform Fee",
+    "Consultant Fee",
+    "Total Amount",
+    "Status",
+)
+
+
+async def export_seeker_history_csv(
+    session: AsyncSession,
+    seeker_id: uuid.UUID,
+    settings: Settings,
+    *,
+    q: str | None = None,
+    service_types: list[str] | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    sort: str = "-created_at",
+) -> str:
+    """CSV body for the seeker Payments Export button (same filters as history)."""
+    stmt = list_for_seeker_stmt(
+        seeker_id,
+        q=q,
+        service_types=service_types,
+        date_from=date_from,
+        date_to=date_to,
+        sort=sort,
+    ).limit(_SEEKER_EXPORT_MAX_ROWS)
+    txns = list((await session.execute(stmt)).scalars().all())
+    rows = [await seeker_payment_read(session, t, settings) for t in txns]
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(_SEEKER_CSV_HEADERS)
+    for row in rows:
+        writer.writerow(
+            [
+                row.invoice_id or "",
+                row.advisor_name or "",
+                row.advisor_email or "",
+                row.service_type,
+                row.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                f"{row.platform_fee_usd:.2f}",
+                f"{row.consultant_fee_usd:.2f}",
+                f"{row.total_amount:.2f}",
+                row.display_status,
+            ]
+        )
+    return buf.getvalue()
 
 
 async def seeker_payment_summary(
