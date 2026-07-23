@@ -91,6 +91,7 @@ def build_read(
         interpreter_contact=booking.interpreter_contact,
         interpreter_language=booking.interpreter_language,
         created_at=booking.created_at,
+        updated_at=booking.updated_at,
     )
 
 
@@ -269,15 +270,16 @@ def list_for_user_stmt(
     date_to: date | None = None,
     service_types: list[str] | None = None,
     q: str | None = None,
-    sort: BookingSort = "-scheduled_start",
+    sort: BookingSort = "-updated_at",
 ) -> Select[tuple[Booking]]:
     column = Booking.advisor_id if role == UserRole.advisor else Booking.seeker_id
-    order = (
-        Booking.scheduled_start.asc()
-        if sort == "scheduled_start"
-        else Booking.scheduled_start.desc()
-    )
-    stmt = select(Booking).where(column == user_id).order_by(order)
+    order_map = {
+        "scheduled_start": Booking.scheduled_start.asc(),
+        "-scheduled_start": Booking.scheduled_start.desc(),
+        "updated_at": Booking.updated_at.asc(),
+        "-updated_at": Booking.updated_at.desc(),
+    }
+    stmt = select(Booking).where(column == user_id).order_by(order_map[sort])
     if status is not None:
         stmt = stmt.where(Booking.status == status)
     if seeker_id is not None and role == UserRole.advisor:

@@ -28,6 +28,7 @@ from app.schemas.booking import (
     BookingRead,
     BookingReject,
     BookingReschedule,
+    BookingsListResponse,
     BookingSort,
 )
 from app.schemas.booking_document_request import (
@@ -166,7 +167,7 @@ async def create_booking(
     )
 
 
-@router.get("", response_model=ResponseEnvelope[list[BookingRead]])
+@router.get("", response_model=BookingsListResponse)
 async def list_my_bookings(
     params: PaginationDep,
     current_user: CurrentUser,
@@ -188,8 +189,14 @@ async def list_my_bookings(
             ),
         ),
     ] = None,
-    sort: Annotated[BookingSort, Query()] = "-scheduled_start",
-) -> ResponseEnvelope[list[BookingRead]]:
+    sort: Annotated[BookingSort, Query()] = "-updated_at",
+) -> BookingsListResponse:
+    """Appointments table (newest ``updated_at`` first) + ``next_upcoming`` for Chat Now.
+
+    ``next_upcoming`` is the soonest pending/confirmed booking with
+    ``scheduled_start >= now`` — independent of list filters/sort. Do not use
+    ``data[0]`` for the banner.
+    """
     role = current_user.role
     types = [t.value for t in service_type] if service_type else None
     stmt = booking_service.list_for_user_stmt(
@@ -197,31 +204,41 @@ async def list_my_bookings(
     )
     bookings, total = await paginate(session, stmt, params)
 
+    next_booking = await booking_service.get_next_upcoming(
+        session, current_user.id, role
+    )
+
     user_ids = {b.seeker_id for b in bookings} | {b.advisor_id for b in bookings}
+    if next_booking is not None:
+        user_ids.add(next_booking.seeker_id)
+        user_ids.add(next_booking.advisor_id)
     users: dict[uuid.UUID, User] = {}
     for uid in user_ids:
         user = await session.get(User, uid)
         if user is not None:
             users[uid] = user
-    photos = await booking_service.advisor_photo_keys(
-        session, {b.advisor_id for b in bookings}
-    )
-    seeker_photos = await booking_service.seeker_photo_keys(
-        session, {b.seeker_id for b in bookings}
-    )
 
-    return ResponseEnvelope[list[BookingRead]](
-        data=[
-            _read(
-                b,
-                users.get(b.seeker_id),
-                users.get(b.advisor_id),
-                settings,
-                advisor_profile_photo_key=photos.get(b.advisor_id),
-                seeker_profile_photo_key=seeker_photos.get(b.seeker_id),
-            )
-            for b in bookings
-        ],
+    advisor_ids = {b.advisor_id for b in bookings}
+    seeker_ids = {b.seeker_id for b in bookings}
+    if next_booking is not None:
+        advisor_ids.add(next_booking.advisor_id)
+        seeker_ids.add(next_booking.seeker_id)
+    photos = await booking_service.advisor_photo_keys(session, advisor_ids)
+    seeker_photos = await booking_service.seeker_photo_keys(session, seeker_ids)
+
+    def _row(b: Booking) -> BookingRead:
+        return _read(
+            b,
+            users.get(b.seeker_id),
+            users.get(b.advisor_id),
+            settings,
+            advisor_profile_photo_key=photos.get(b.advisor_id),
+            seeker_profile_photo_key=seeker_photos.get(b.seeker_id),
+        )
+
+    return BookingsListResponse(
+        data=[_row(b) for b in bookings],
+        next_upcoming=_row(next_booking) if next_booking is not None else None,
         meta=page_meta(params, total, request_id),
     )
 
