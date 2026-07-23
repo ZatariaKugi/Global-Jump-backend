@@ -369,7 +369,7 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
 
     amount_refunded_cents = _stripe_get(charge, "amount_refunded")
     refunded_amount_usd = (
-        round(int(amount_refunded_cents) / 100, 2)  # type: ignore[arg-type]
+        round(int(amount_refunded_cents) / 100, 2)
         if isinstance(amount_refunded_cents, (int, float))
         else txn.amount_usd
     )
