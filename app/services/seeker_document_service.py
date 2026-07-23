@@ -10,7 +10,7 @@ from sqlalchemy import ColumnElement, Select, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import ConflictError, NotFoundError
 from app.core.file_storage import resolve_media_url, resolve_url
 from app.models.booking import Booking
 from app.models.seeker_document import (
@@ -88,6 +88,32 @@ async def set_status(
     await session.flush()
     await session.refresh(document)
     return document
+
+
+async def is_portfolio_completed(session: AsyncSession, seeker_id: uuid.UUID) -> bool:
+    """True when the seeker has ≥1 active doc and every doc is approved."""
+    rows = list(
+        (
+            await session.execute(
+                select(SeekerDocument.status).where(
+                    SeekerDocument.seeker_id == seeker_id,
+                    SeekerDocument.is_archived.is_(False),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return bool(rows) and all(s == SeekerDocumentStatus.approved for s in rows)
+
+
+async def assert_portfolio_editable(session: AsyncSession, seeker_id: uuid.UUID) -> None:
+    """Block review mutations once the portfolio is fully approved (completed)."""
+    if await is_portfolio_completed(session, seeker_id):
+        raise ConflictError(
+            "All documents are approved; this portfolio is locked",
+            code="portfolio_completed",
+        )
 
 
 async def add_comment(
