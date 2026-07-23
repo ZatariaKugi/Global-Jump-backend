@@ -47,6 +47,7 @@ async def create_conversation(
     data: ConversationCreate,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[ConversationRead]:
     conversation = await conversation_service.get_or_create(
@@ -54,7 +55,7 @@ async def create_conversation(
     )
     return ResponseEnvelope[ConversationRead](
         data=await conversation_service.build_conversation_read(
-            session, conversation, current_user.id
+            session, conversation, current_user.id, settings
         ),
         meta=Meta(request_id=request_id),
     )
@@ -65,13 +66,16 @@ async def list_conversations(
     params: PaginationDep,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     q: str | None = None,
 ) -> ResponseEnvelope[list[ConversationRead]]:
     stmt = conversation_service.list_for_user_stmt(current_user.id, q)
     conversations, total = await paginate(session, stmt, params)
     data = [
-        await conversation_service.build_conversation_read(session, c, current_user.id)
+        await conversation_service.build_conversation_read(
+            session, c, current_user.id, settings
+        )
         for c in conversations
     ]
     return ResponseEnvelope[list[ConversationRead]](
@@ -97,8 +101,14 @@ async def list_messages(
     stmt = conversation_service.list_messages_stmt(conversation.id)
     messages, total = await paginate(session, stmt, params)
     senders = await _resolve_senders(session, messages)
+    photos = await conversation_service.profile_photo_keys(session, list(senders.keys()))
     data = [
-        conversation_service.build_message_read(m, senders.get(m.sender_id), settings)
+        conversation_service.build_message_read(
+            m,
+            senders.get(m.sender_id),
+            settings,
+            sender_photo_key=photos.get(m.sender_id),
+        )
         for m in messages
     ]
     return ResponseEnvelope[list[MessageRead]](data=data, meta=page_meta(params, total, request_id))
@@ -140,7 +150,13 @@ async def send_message(
     message = await conversation_service.send_message(
         session, conversation, current_user, data.body, attachments
     )
-    message_read = conversation_service.build_message_read(message, current_user, settings)
+    photos = await conversation_service.profile_photo_keys(session, [current_user.id])
+    message_read = conversation_service.build_message_read(
+        message,
+        current_user,
+        settings,
+        sender_photo_key=photos.get(current_user.id),
+    )
 
     await manager.broadcast(
         conversation_id, {"type": "message", "data": jsonable_encoder(message_read)}
@@ -160,7 +176,13 @@ async def mark_message_read(
     message = await conversation_service.get_message_for_user(session, message_id, current_user.id)
     message = await conversation_service.mark_read(session, message, current_user)
     sender = await session.get(User, message.sender_id)
-    data = conversation_service.build_message_read(message, sender, settings)
+    photos = await conversation_service.profile_photo_keys(session, [message.sender_id])
+    data = conversation_service.build_message_read(
+        message,
+        sender,
+        settings,
+        sender_photo_key=photos.get(message.sender_id),
+    )
 
     await manager.broadcast(
         message.conversation_id,
@@ -185,7 +207,13 @@ async def edit_message(
 ) -> ResponseEnvelope[MessageRead]:
     message = await conversation_service.get_message_for_user(session, message_id, current_user.id)
     message = await conversation_service.edit_message(session, message, current_user.id, data.body)
-    message_read = conversation_service.build_message_read(message, current_user, settings)
+    photos = await conversation_service.profile_photo_keys(session, [current_user.id])
+    message_read = conversation_service.build_message_read(
+        message,
+        current_user,
+        settings,
+        sender_photo_key=photos.get(current_user.id),
+    )
 
     await manager.broadcast(
         message.conversation_id,
@@ -222,8 +250,14 @@ async def report_message(
     message = await conversation_service.get_message_for_user(session, message_id, current_user.id)
     message = await conversation_service.report(session, message, current_user.id, data.reason)
     sender = await session.get(User, message.sender_id)
+    photos = await conversation_service.profile_photo_keys(session, [message.sender_id])
     return ResponseEnvelope[MessageRead](
-        data=conversation_service.build_message_read(message, sender, settings),
+        data=conversation_service.build_message_read(
+            message,
+            sender,
+            settings,
+            sender_photo_key=photos.get(message.sender_id),
+        ),
         meta=Meta(request_id=request_id),
     )
 
