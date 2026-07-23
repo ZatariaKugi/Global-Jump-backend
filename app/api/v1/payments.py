@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Query, Request
+from fastapi.responses import Response
 
 from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.api.pagination import PaginationDep, page_meta, paginate
+from app.core.exceptions import PermissionDeniedError
 from app.db.session import SessionDep
 from app.models.advisor_profile import AdvisorServiceType
 from app.models.transaction import Transaction
@@ -36,6 +38,32 @@ PaymentHistorySort = Literal[
     "-total_amount",
 ]
 PaymentPeriod = Literal["7d", "30d", "90d", "365d", "all"]
+
+
+def _require_seeker(current_user: CurrentUser) -> None:
+    if current_user.role != UserRole.seeker:
+        raise PermissionDeniedError("Seeker account required")
+
+
+def _history_filters(
+    *,
+    service_type: list[AdvisorServiceType] | None,
+    visa_type: list[str] | None,
+    period: PaymentPeriod | None,
+    date_from: date | None,
+    date_to: date | None,
+) -> tuple[list[str] | None, date | None, date | None]:
+    types = [t.value for t in service_type] if service_type else None
+    if not types and visa_type:
+        types = visa_type
+
+    resolved_from = date_from
+    resolved_to = date_to
+    if period and period != "all" and date_from is None and date_to is None:
+        days = int(period.rstrip("d"))
+        resolved_to = datetime.now(UTC).date()
+        resolved_from = resolved_to - timedelta(days=days)
+    return types, resolved_from, resolved_to
 
 
 async def _get_accessible_transaction(
@@ -126,18 +154,13 @@ async def get_payment_history(
     date_to: date | None = None,
 ) -> ResponseEnvelope[list[SeekerPaymentRead]]:
     """Visa-seeker payment history with advisor + fee split columns."""
-    types = [t.value for t in service_type] if service_type else None
-    if not types and visa_type:
-        types = visa_type
-
-    resolved_from = date_from
-    resolved_to = date_to
-    if period and period != "all" and date_from is None and date_to is None:
-        from datetime import UTC
-
-        days = int(period.rstrip("d"))
-        resolved_to = datetime.now(UTC).date()
-        resolved_from = resolved_to - timedelta(days=days)
+    types, resolved_from, resolved_to = _history_filters(
+        service_type=service_type,
+        visa_type=visa_type,
+        period=period,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
     stmt = payment_service.list_for_seeker_stmt(
         current_user.id,
@@ -152,6 +175,50 @@ async def get_payment_history(
     return ResponseEnvelope[list[SeekerPaymentRead]](
         data=data,
         meta=page_meta(params, total, request_id),
+    )
+
+
+@router.get("/history/export")
+async def export_payment_history(
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    q: Annotated[str | None, Query(max_length=100)] = None,
+    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
+    visa_type: Annotated[
+        list[str] | None,
+        Query(description="Alias of service_type for FE URL parity"),
+    ] = None,
+    sort: Annotated[PaymentHistorySort, Query()] = "-created_at",
+    period: Annotated[PaymentPeriod | None, Query()] = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> Response:
+    """Download seeker payment history as CSV (same filters as ``GET /history``)."""
+    _require_seeker(current_user)
+    types, resolved_from, resolved_to = _history_filters(
+        service_type=service_type,
+        visa_type=visa_type,
+        period=period,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    csv_body = await payment_service.export_seeker_history_csv(
+        session,
+        current_user.id,
+        settings,
+        q=q,
+        service_types=types,
+        date_from=resolved_from,
+        date_to=resolved_to,
+        sort=sort,
+    )
+    stamp = datetime.now(UTC).strftime("%Y%m%d")
+    filename = f"payments-{stamp}.csv"
+    return Response(
+        content=csv_body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
