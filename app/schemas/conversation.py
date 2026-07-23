@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from app.models.review import ModerationStatus
+
+OtherPartyRole = Literal["advisor", "seeker"]
 
 
 class ConversationCreate(BaseModel):
@@ -46,6 +49,7 @@ class MessageRead(BaseModel):
     conversation_id: uuid.UUID
     sender_id: uuid.UUID
     sender_name: str | None
+    sender_photo_url: str | None = None
     body: str | None
     attachments: list[AttachmentRead]
     read_at: datetime | None
@@ -59,6 +63,9 @@ class ConversationRead(BaseModel):
     advisor_id: uuid.UUID
     other_party_id: uuid.UUID
     other_party_name: str | None
+    other_party_photo_url: str | None = None
+    other_party_role: OtherPartyRole | None = None
+    other_party_title: str | None = None
     other_party_online: bool
     last_message_at: datetime | None
     last_message_preview: str | None

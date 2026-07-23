@@ -1312,10 +1312,20 @@ async def list_flagged_messages(
     """Moderation queue: messages reported by users, awaiting a decision."""
     stmt = conversation_service.list_flagged_stmt()
     messages, total = await paginate(session, stmt, params)
+    photos = await conversation_service.profile_photo_keys(
+        session, list({m.sender_id for m in messages})
+    )
     data = []
     for message in messages:
         sender = await session.get(User, message.sender_id)
-        data.append(conversation_service.build_flagged_read(message, sender, settings))
+        data.append(
+            conversation_service.build_flagged_read(
+                message,
+                sender,
+                settings,
+                sender_photo_key=photos.get(message.sender_id),
+            )
+        )
     return ResponseEnvelope[list[FlaggedMessageRead]](
         data=data,
         meta=page_meta(params, total, request_id),
@@ -1338,8 +1348,14 @@ async def moderate_message(
     message = await conversation_service.get_by_id(session, message_id)
     message = await conversation_service.moderate(session, message, body.action, principal.id)
     sender = await session.get(User, message.sender_id)
+    photos = await conversation_service.profile_photo_keys(session, [message.sender_id])
     return ResponseEnvelope[FlaggedMessageRead](
-        data=conversation_service.build_flagged_read(message, sender, settings),
+        data=conversation_service.build_flagged_read(
+            message,
+            sender,
+            settings,
+            sender_photo_key=photos.get(message.sender_id),
+        ),
         meta=Meta(request_id=request_id),
     )
 
