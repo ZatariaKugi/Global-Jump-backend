@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from app.models.booking import BookingStatus
 from app.models.seeker_document import DocumentCategory, SeekerDocumentStatus
 
-CustomerDocumentsRowStatus = Literal["pending", "completed"]
+CustomerDocumentsRowStatus = Literal["pending", "completed", "rejected"]
 
 
 class SeekerDocumentCreate(BaseModel):
@@ -59,7 +59,8 @@ class CustomerDocumentsRowRead(BaseModel):
     service_type: str
     booking_status: BookingStatus
     documents_count: int
-    # pending = any under_review/rejected or zero docs; completed = all approved.
+    # pending = zero docs, any under_review, or mixed approved/rejected;
+    # completed = all approved; rejected = all rejected (none under_review).
     documents_status: CustomerDocumentsRowStatus
     updated_at: datetime
 
