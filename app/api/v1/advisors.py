@@ -44,7 +44,7 @@ from app.schemas.advisor_profile import (
     AdvisorProfileUpdate,
     AdvisorVerificationResubmitRead,
 )
-from app.schemas.booking import AdvisorBookingCreate, BookingRead, ClientRead
+from app.schemas.booking import AdvisorBookingCreate, BookingRead, BookingSort, ClientRead
 from app.schemas.payment import (
     AdvisorConnectStatus,
     AdvisorEarnings,
@@ -55,6 +55,8 @@ from app.schemas.payout import PayoutPreviewRead, PayoutRequestCreate, PayoutReq
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.review import AdvisorReviewSummaryRead
 from app.schemas.seeker_document import (
+    CustomerDocumentsRowRead,
+    CustomerDocumentsRowStatus,
     DocumentCommentCreate,
     DocumentCommentRead,
     SeekerDocumentRead,
@@ -822,6 +824,47 @@ async def list_my_clients(
         session, current_user.id, clients, settings
     )
     return ResponseEnvelope[list[ClientRead]](
+        data=data,
+        meta=page_meta(params, total, request_id),
+    )
+
+
+@router.get(
+    "/me/customer-documents",
+    response_model=ResponseEnvelope[list[CustomerDocumentsRowRead]],
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def list_customer_documents(
+    params: PaginationDep,
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+    q: Annotated[str | None, Query(max_length=100)] = None,
+    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
+    documents_status: CustomerDocumentsRowStatus | None = None,
+    sort: Annotated[BookingSort, Query()] = "-scheduled_start",
+) -> ResponseEnvelope[list[CustomerDocumentsRowRead]]:
+    """Documents of customers table — one row per booking with portfolio tallies.
+
+    Returns ``appointment_id``, client identity, ``documents_count``, aggregate
+    ``documents_status`` (pending/completed), and ``updated_at``. Drill into
+    ``GET /me/clients/{seeker_id}/documents`` for the review UI and
+    ``GET /bookings/{booking_id}/details`` for Booking detail.
+    """
+    types = [t.value for t in service_type] if service_type else None
+    stmt = seeker_document_service.list_customer_documents_stmt(
+        current_user.id,
+        q=q,
+        service_types=types,
+        documents_status=documents_status,
+        sort=sort,
+    )
+    bookings, total = await paginate(session, stmt, params)
+    data = await seeker_document_service.build_customer_document_rows(
+        session, list(bookings), settings
+    )
+    return ResponseEnvelope[list[CustomerDocumentsRowRead]](
         data=data,
         meta=page_meta(params, total, request_id),
     )
