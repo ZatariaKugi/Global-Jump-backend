@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from httpx import AsyncClient
 
 from tests.test_assessments import ASSESSMENTS, _opt, _seed_questions, _seeker_token
@@ -29,7 +31,7 @@ async def _complete_assessment(
     return resp.json()["data"]
 
 
-async def test_analytics_volume_and_totals(client: AsyncClient, admin_token: str) -> None:
+async def test_analytics_volume_and_shape(client: AsyncClient, admin_token: str) -> None:
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
     questions = await _seed_questions(client, admin_token)
 
@@ -41,9 +43,15 @@ async def test_analytics_volume_and_totals(client: AsyncClient, admin_token: str
     resp = await client.get(f"{ANALYTICS}?country=GB&visa_type=work", headers=admin_headers)
     assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
-    assert data["total_started"] == 2
-    assert data["total_completed"] == 2
-    assert sum(p["count"] for p in data["volume"]) == 2
+    assert set(data.keys()) == {
+        "window_days",
+        "pass_rate",
+        "fail_rate",
+        "assessment_volume",
+        "drop_off_points",
+    }
+    assert sum(p["value"] for p in data["assessment_volume"]) == 2
+    assert data["assessment_volume"][0]["month"] == datetime.now(UTC).strftime("%b")
 
 
 async def test_analytics_pass_and_fail_rate(client: AsyncClient, admin_token: str) -> None:
@@ -61,7 +69,6 @@ async def test_analytics_pass_and_fail_rate(client: AsyncClient, admin_token: st
     resp = await client.get(f"{ANALYTICS}?country=GB&visa_type=work", headers=admin_headers)
     assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
-    assert data["total_completed"] == 2
     assert data["pass_rate"] == 50.0
     assert data["fail_rate"] == 50.0
 
@@ -70,7 +77,7 @@ async def test_analytics_drop_off(client: AsyncClient, admin_token: str) -> None
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
     await _seed_questions(client, admin_token)
 
-    # Started but never answered -> counts as drop-off.
+    # Started but never answered -> drop-off at Q1 (100% of started).
     token = await _seeker_token(client, "dropoff@test.com")
     resp = await client.post(
         ASSESSMENTS,
@@ -82,10 +89,9 @@ async def test_analytics_drop_off(client: AsyncClient, admin_token: str) -> None
     resp = await client.get(f"{ANALYTICS}?country=GB&visa_type=work", headers=admin_headers)
     assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
-    assert data["total_started"] == 1
-    assert data["total_completed"] == 0
-    assert data["drop_off_count"] == 1
-    assert data["drop_off_rate"] == 100.0
+    assert data["drop_off_points"]
+    assert data["drop_off_points"][0]["stage"] == "Q1"
+    assert data["drop_off_points"][0]["value"] == 100.0
 
 
 async def test_non_admin_forbidden_from_analytics(client: AsyncClient) -> None:
