@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query
 
-from app.api.deps import CurrentUser, RequestIdDep
+from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.api.pagination import PaginationDep, page_meta, paginate
 from app.core.exceptions import PermissionDeniedError
 from app.core.visa_types import OptionalVisaType
@@ -31,12 +31,15 @@ async def create_bookmark(
     data: BookmarkCreate,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookmarkRead]:
     """Bookmark an approved advisor."""
     _require_seeker(current_user)
     bookmark = await bookmark_service.create(session, current_user, data.advisor_id)
-    rows = await bookmark_service.build_list_reads(session, current_user.id, [bookmark])
+    rows = await bookmark_service.build_list_reads(
+        session, current_user.id, [bookmark], settings
+    )
     return ResponseEnvelope[BookmarkRead](data=rows[0], meta=Meta(request_id=request_id))
 
 
@@ -45,6 +48,7 @@ async def list_bookmarks(
     params: PaginationDep,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     q: Annotated[
         str | None, Query(max_length=100, description="Search name, email, expertise")
@@ -68,7 +72,9 @@ async def list_bookmarks(
         recommended=recommended,
     )
     bookmarks, total = await paginate(session, stmt, params)
-    data = await bookmark_service.build_list_reads(session, current_user.id, bookmarks)
+    data = await bookmark_service.build_list_reads(
+        session, current_user.id, bookmarks, settings
+    )
     return ResponseEnvelope[list[BookmarkRead]](
         data=data, meta=page_meta(params, total, request_id)
     )
