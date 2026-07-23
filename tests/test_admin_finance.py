@@ -38,7 +38,11 @@ async def _named_booking(
         advisor_name,
         {
             "services": [
-                {"service_type": "consultation_30", "duration_minutes": 30, "price_usd": 75.0}
+                {
+                    "service_type": "immigration_specialist",
+                    "duration_minutes": 30,
+                    "price_usd": 75.0,
+                }
             ]
         },
     )
@@ -65,7 +69,7 @@ async def _named_booking(
         BOOKINGS,
         json={
             "advisor_id": advisor_id,
-            "service_type": "consultation_30",
+            "service_type": "immigration_specialist",
             "scheduled_start": _slot_iso(_next_weekday(2), 10),
         },
         headers=seeker_headers,
@@ -115,7 +119,7 @@ async def test_admin_can_search_payments_by_name(
     assert len(data) == 1
     assert data[0]["seeker_name"] == "Alice Anderson"
     assert data[0]["advisor_name"] == "Advisor One"
-    assert data[0]["service_type"] == "consultation_30"
+    assert data[0]["service_type"] == "immigration_specialist"
 
 
 async def test_non_admin_forbidden_from_finance_list(client: AsyncClient) -> None:

@@ -25,6 +25,8 @@ class CheckoutResponse(BaseModel):
 
 class PaymentConfigRead(BaseModel):
     publishable_key: str | None
+    # FE derives platform fee = price * platform_commission_rate before checkout.
+    platform_commission_rate: float
 
 
 class TransactionRead(BaseModel):
@@ -161,9 +163,11 @@ class InvoiceRead(BaseModel):
     booking_id: uuid.UUID
     from_name: str
     from_address: str | None = None
+    from_phone: str | None = None
     to_name: str | None
     to_email: str
     to_address: str | None = None
+    to_phone: str | None = None
     line_items: list[InvoiceLineItem]
     subtotal_usd: float
     tax_usd: float
