@@ -876,7 +876,7 @@ async def list_customer_documents(
     """Documents of customers table — one row per booking with portfolio tallies.
 
     Returns ``appointment_id``, client identity, ``documents_count``, aggregate
-    ``documents_status`` (pending/completed), and ``updated_at``. Drill into
+    ``documents_status`` (pending/completed/rejected), and ``updated_at``. Drill into
     ``GET /me/clients/{seeker_id}/documents`` for the review UI and
     ``GET /bookings/{booking_id}/details`` for Booking detail.
     """
