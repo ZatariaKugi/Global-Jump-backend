@@ -12,9 +12,15 @@ from app.models.advisor_profile import AdvisorServiceType
 from app.models.booking import BookingStatus, PaymentStatus
 from app.schemas.booking_document_request import DocumentRequestRead
 from app.schemas.booking_note import BookingNoteRead
+from app.schemas.response import Meta
 
-# List sort: leading ``-`` = descending (default matches prior hardcoded order).
-BookingSort = Literal["scheduled_start", "-scheduled_start"]
+# List sort: leading ``-`` = descending. Appointments default is ``-updated_at``.
+BookingSort = Literal[
+    "scheduled_start",
+    "-scheduled_start",
+    "updated_at",
+    "-updated_at",
+]
 
 
 class BookingCreate(BaseModel):
@@ -107,6 +113,16 @@ class BookingRead(BaseModel):
     interpreter_contact: str | None
     interpreter_language: str | None
     created_at: datetime
+    updated_at: datetime
+
+
+class BookingsListResponse(BaseModel):
+    """Appointments list + dedicated banner booking (do not use ``data[0]`` for Chat Now)."""
+
+    success: bool = True
+    data: list[BookingRead]
+    next_upcoming: BookingRead | None = None
+    meta: Meta = Field(default_factory=Meta)
 
 
 class BookingHistoryRead(BaseModel):
