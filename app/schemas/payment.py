@@ -70,6 +70,9 @@ class TransactionFinanceRead(TransactionAdminRead):
     seeker_email: str | None = None
     advisor_email: str | None = None
     seeker_country: str | None = None
+    # Fully-qualified (presigned S3 or absolute) URLs for Next.js <Image>; null → initials.
+    seeker_photo_url: str | None = None
+    advisor_photo_url: str | None = None
 
 
 class TransactionAdvisorRead(TransactionRead):
