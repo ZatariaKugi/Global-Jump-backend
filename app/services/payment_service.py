@@ -13,6 +13,7 @@ from sqlalchemy.orm import aliased
 
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError
+from app.core.file_storage import resolve_media_url
 from app.models.advisor_profile import AdvisorProfile
 from app.models.booking import Booking, BookingStatus, PaymentStatus
 from app.models.transaction import Transaction, TransactionStatus
@@ -722,18 +723,20 @@ def list_for_seeker_stmt(
         end = datetime(date_to.year, date_to.month, date_to.day, tzinfo=UTC) + timedelta(days=1)
         stmt = stmt.where(Transaction.created_at < end)
 
-    if sort == "created_at":
+    if sort in ("created_at",):
         stmt = stmt.order_by(Transaction.created_at.asc())
-    elif sort == "amount_usd":
+    elif sort in ("amount_usd", "total_amount"):
         stmt = stmt.order_by(Transaction.amount_usd.asc())
-    elif sort == "-amount_usd":
+    elif sort in ("-amount_usd", "-total_amount"):
         stmt = stmt.order_by(Transaction.amount_usd.desc())
     else:
         stmt = stmt.order_by(Transaction.created_at.desc())
     return stmt
 
 
-async def seeker_payment_read(session: AsyncSession, txn: Transaction) -> SeekerPaymentRead:
+async def seeker_payment_read(
+    session: AsyncSession, txn: Transaction, settings: Settings
+) -> SeekerPaymentRead:
     booking = await session.get(Booking, txn.booking_id)
     if booking is None:
         raise NotFoundError("Booking not found")
@@ -750,12 +753,15 @@ async def seeker_payment_read(session: AsyncSession, txn: Transaction) -> Seeker
         advisor_id=booking.advisor_id,
         advisor_name=advisor.full_name if advisor else None,
         advisor_email=advisor.email if advisor else None,
-        advisor_photo_url=advisor_profile.profile_photo_url if advisor_profile else None,
+        advisor_photo_url=resolve_media_url(
+            advisor_profile.profile_photo_url if advisor_profile else None, settings
+        ),
         service_type=booking.service_type,
         created_at=txn.created_at,
         platform_fee_usd=txn.commission_usd,
         consultant_fee_usd=txn.advisor_payout_usd,
         amount_usd=txn.amount_usd,
+        total_amount=txn.amount_usd,
         status=txn.status,
         display_status=display_status(txn),
         payment_method=txn.payment_method,

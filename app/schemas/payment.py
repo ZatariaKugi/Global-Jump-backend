@@ -103,6 +103,7 @@ class SeekerPaymentRead(BaseModel):
     platform_fee_usd: float
     consultant_fee_usd: float
     amount_usd: float
+    total_amount: float  # same as amount_usd — grand total charged (FE column name)
     status: TransactionStatus
     display_status: PaymentDisplayStatus
     payment_method: str
