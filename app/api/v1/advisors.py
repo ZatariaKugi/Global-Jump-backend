@@ -192,7 +192,12 @@ async def list_advisors(
     min_rating: Annotated[float | None, Query(ge=1, le=5)] = None,
     recommended: Annotated[
         bool,
-        Query(description="When true, AI-suggested (featured) advisors sort first"),
+        Query(
+            description=(
+                "When true, AI-suggested advisors (highest match for the seeker's "
+                "destination/visa) sort first; falls back to featured when no match context"
+            )
+        ),
     ] = False,
     sort: Annotated[SortOption, Query()] = "newest",
 ) -> ResponseEnvelope[list[AdvisorListingCard]]:
@@ -208,10 +213,33 @@ async def list_advisors(
         sort=sort,
     )
     stmt = advisor_search_service.build_search_stmt(filters)
-    users, total = await paginate(session, stmt, params)
-    profiles_by_user = await _profiles_by_user(session, users)
-    ratings = await review_service.rating_summaries(session, [u.id for u in users])
     destination, match_visa = await _seeker_match_context(session, principal)
+
+    if recommended and destination and match_visa:
+        # Score the full filtered set so AI matches lead every page, not only featured.
+        all_users = list((await session.execute(stmt)).scalars().all())
+        profiles_by_user = await _profiles_by_user(session, all_users)
+        ratings = await review_service.rating_summaries(session, [u.id for u in all_users])
+
+        def _match_pct(u: User) -> int:
+            return (
+                advisor_matching_service.match_percentage(
+                    profiles_by_user.get(u.id),
+                    destination,
+                    match_visa,
+                    (ratings.get(u.id) or (None, 0))[0],
+                )
+                or 0
+            )
+
+        all_users.sort(key=lambda u: (_match_pct(u), u.created_at), reverse=True)
+        total = len(all_users)
+        users = all_users[params.offset : params.offset + params.limit]
+    else:
+        users, total = await paginate(session, stmt, params)
+        profiles_by_user = await _profiles_by_user(session, users)
+        ratings = await review_service.rating_summaries(session, [u.id for u in users])
+
     bookmarked = await _bookmarked_ids(session, principal, [u.id for u in users])
     conversations = await _conversation_ids(session, principal, [u.id for u in users])
 
@@ -920,6 +948,7 @@ async def review_client_document(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[SeekerDocumentRead]:
     await _assert_advisor_client_relationship(session, current_user.id, seeker_id)
+    await seeker_document_service.assert_portfolio_editable(session, seeker_id)
     document = await seeker_document_service.get_for_seeker(session, document_id, seeker_id)
     document = await seeker_document_service.set_status(session, document, data, current_user.id)
     return ResponseEnvelope[SeekerDocumentRead](
