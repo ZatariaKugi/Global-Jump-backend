@@ -166,12 +166,22 @@ class AIAnalyticsRead(BaseModel):
 # ── Engagement Analytics ─────────────────────────────────────────────────────
 
 
+class EngagementTrendPoint(BaseModel):
+    """Monthly engagement series point (messages, call hours, or document uploads)."""
+
+    month: str  # ISO "YYYY-MM"
+    value: float
+
+
 class EngagementAnalyticsRead(BaseModel):
     window_days: int
     messages_sent: int
-    avg_response_time_hours: float
-    session_completed: int
-    messages_sent_trend: list[MonthlyCountPoint]
-    video_call_hours_trend: list[MonthlyAmountPoint]  # SUM(duration_minutes)/60 per month
-    session_duration_trend: list[MonthlyAmountPoint]  # AVG(duration_minutes)/60 per month
-    session_completed_trend: list[MonthlyCountPoint]
+    messages_sent_change_pct: float
+    video_call_hours: float
+    video_call_hours_change_pct: float
+    documents_uploaded: int
+    documents_uploaded_change_pct: float
+    # Trends: current window only, oldest → newest.
+    messages_sent_trend: list[EngagementTrendPoint]
+    video_call_hours_trend: list[EngagementTrendPoint]  # SUM(duration_minutes)/60
+    documents_uploaded_trend: list[EngagementTrendPoint]

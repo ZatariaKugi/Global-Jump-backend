@@ -56,4 +56,41 @@ class ConnectionManager:
                 self.unregister(conversation_id, websocket)
 
 
+class InboxManager:
+    """User-level sockets for the conversations list (preview + unread badge).
+
+    One connection (or more, multi-tab) per logged-in user — independent of which
+    thread is open. WhatsApp-style inbox updates go here; live message bubbles
+    still use :class:`ConnectionManager`.
+    """
+
+    def __init__(self) -> None:
+        self._connections: dict[uuid.UUID, set[WebSocket]] = defaultdict(set)
+
+    def register(self, user_id: uuid.UUID, websocket: WebSocket) -> None:
+        self._connections[user_id].add(websocket)
+
+    def unregister(self, user_id: uuid.UUID, websocket: WebSocket) -> None:
+        connections = self._connections.get(user_id)
+        if connections is not None:
+            connections.discard(websocket)
+            if not connections:
+                del self._connections[user_id]
+
+    async def send_user(self, user_id: uuid.UUID, payload: dict[str, Any]) -> None:
+        for websocket in list(self._connections.get(user_id, ())):
+            try:
+                await websocket.send_json(payload)
+            except Exception:
+                self.unregister(user_id, websocket)
+
+    async def send_users(
+        self, user_ids: list[uuid.UUID] | tuple[uuid.UUID, ...], payload: dict[str, Any]
+    ) -> None:
+        """Send the same payload to each user (e.g. both conversation parties)."""
+        for user_id in user_ids:
+            await self.send_user(user_id, payload)
+
+
 manager = ConnectionManager()
+inbox_manager = InboxManager()

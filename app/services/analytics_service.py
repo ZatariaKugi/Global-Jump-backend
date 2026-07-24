@@ -20,6 +20,7 @@ from app.models.assessment import Assessment, AssessmentStatus, EligibilityTier
 from app.models.booking import Booking, BookingStatus
 from app.models.message import Message
 from app.models.payout_request import PayoutRequest, PayoutStatus
+from app.models.seeker_document import SeekerDocument
 from app.models.seeker_profile import SeekerProfile
 from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User, UserRole, VerificationStatus
@@ -32,10 +33,10 @@ from app.schemas.analytics import (
     AssessmentDistributionPoint,
     EligibilityBreakdownPoint,
     EngagementAnalyticsRead,
+    EngagementTrendPoint,
     FinanceAnalyticsRead,
     GeoUsersPoint,
     MonthlyAmountPoint,
-    MonthlyCountPoint,
     OnboardingFunnelRead,
     OverviewAnalyticsRead,
     RetentionSeriesPoint,
@@ -548,7 +549,7 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
 
 
 def _ai_visa_counts(assessments: Sequence[Assessment]) -> dict[VisaType, int]:
-    counts: dict[VisaType, int] = {vt: 0 for vt in _AI_VISA_ORDER}
+    counts: dict[VisaType, int] = dict.fromkeys(_AI_VISA_ORDER, 0)
     for a in assessments:
         parsed = parse_visa_type(a.visa_type)
         if parsed is not None:
@@ -728,90 +729,98 @@ async def get_ai_analytics(session: AsyncSession, days: int = 270) -> AIAnalytic
 # ── Engagement Analytics ─────────────────────────────────────────────────────
 
 
+def _engagement_hours(bookings: Sequence[Booking]) -> float:
+    return round(sum(b.duration_minutes for b in bookings) / 60.0, 2)
+
+
 async def get_engagement_analytics(
     session: AsyncSession, days: int = 30
 ) -> EngagementAnalyticsRead:
-    since = _since(days)
+    now = datetime.now(UTC)
+    since = now - timedelta(days=days)
+    prev_since = now - timedelta(days=2 * days)
 
     messages = (
         (
             await session.execute(
-                select(Message)
-                .where(Message.created_at >= since)
-                .order_by(Message.conversation_id, Message.created_at)
+                select(Message).where(Message.created_at >= prev_since)
             )
         )
         .scalars()
         .all()
     )
-    messages_sent = len(messages)
+    cur_messages = [m for m in messages if _as_utc(m.created_at) >= since]
+    prev_messages = [m for m in messages if prev_since <= _as_utc(m.created_at) < since]
+    messages_sent = len(cur_messages)
 
     messages_trend_map: dict[str, int] = defaultdict(int)
-    for m in messages:
+    for m in cur_messages:
         messages_trend_map[_month_key(m.created_at)] += 1
     messages_sent_trend = [
-        MonthlyCountPoint(month=month, count=count)
+        EngagementTrendPoint(month=month, value=float(count))
         for month, count in sorted(messages_trend_map.items())
     ]
-
-    response_gaps_hours: list[float] = []
-    prev_by_conversation: dict[uuid.UUID, Message] = {}
-    for m in messages:
-        prev = prev_by_conversation.get(m.conversation_id)
-        if prev is not None and prev.sender_id != m.sender_id:
-            gap = (m.created_at - prev.created_at).total_seconds() / 3600.0
-            response_gaps_hours.append(gap)
-        prev_by_conversation[m.conversation_id] = m
-    avg_response_time_hours = (
-        round(sum(response_gaps_hours) / len(response_gaps_hours), 2)
-        if response_gaps_hours
-        else 0.0
-    )
 
     completed_bookings = (
         (
             await session.execute(
                 select(Booking).where(
-                    Booking.status == BookingStatus.completed, Booking.scheduled_start >= since
+                    Booking.status == BookingStatus.completed,
+                    Booking.scheduled_start >= prev_since,
                 )
             )
         )
         .scalars()
         .all()
     )
-    session_completed = len(completed_bookings)
-
-    completed_trend_map: dict[str, int] = defaultdict(int)
-    sum_duration_map: dict[str, float] = defaultdict(float)
-    count_duration_map: dict[str, int] = defaultdict(int)
-    for b in completed_bookings:
-        month = _month_key(b.scheduled_start)
-        completed_trend_map[month] += 1
-        sum_duration_map[month] += b.duration_minutes
-        count_duration_map[month] += 1
-    session_completed_trend = [
-        MonthlyCountPoint(month=month, count=count)
-        for month, count in sorted(completed_trend_map.items())
+    cur_bookings = [b for b in completed_bookings if _as_utc(b.scheduled_start) >= since]
+    prev_bookings = [
+        b for b in completed_bookings if prev_since <= _as_utc(b.scheduled_start) < since
     ]
+    video_call_hours = _engagement_hours(cur_bookings)
+    prev_video_call_hours = _engagement_hours(prev_bookings)
+
+    sum_duration_map: dict[str, float] = defaultdict(float)
+    for b in cur_bookings:
+        sum_duration_map[_month_key(b.scheduled_start)] += b.duration_minutes
     video_call_hours_trend = [
-        MonthlyAmountPoint(month=month, amount_usd=round(minutes / 60.0, 2))
+        EngagementTrendPoint(month=month, value=round(minutes / 60.0, 2))
         for month, minutes in sorted(sum_duration_map.items())
     ]
-    session_duration_trend = [
-        MonthlyAmountPoint(
-            month=month,
-            amount_usd=round((sum_duration_map[month] / count_duration_map[month]) / 60.0, 2),
+
+    documents = (
+        (
+            await session.execute(
+                select(SeekerDocument).where(
+                    SeekerDocument.created_at >= prev_since,
+                    SeekerDocument.is_archived.is_(False),
+                )
+            )
         )
-        for month in sorted(sum_duration_map)
+        .scalars()
+        .all()
+    )
+    cur_documents = [d for d in documents if _as_utc(d.created_at) >= since]
+    prev_documents = [d for d in documents if prev_since <= _as_utc(d.created_at) < since]
+    documents_uploaded = len(cur_documents)
+
+    documents_trend_map: dict[str, int] = defaultdict(int)
+    for d in cur_documents:
+        documents_trend_map[_month_key(d.created_at)] += 1
+    documents_uploaded_trend = [
+        EngagementTrendPoint(month=month, value=float(count))
+        for month, count in sorted(documents_trend_map.items())
     ]
 
     return EngagementAnalyticsRead(
         window_days=days,
         messages_sent=messages_sent,
-        avg_response_time_hours=avg_response_time_hours,
-        session_completed=session_completed,
+        messages_sent_change_pct=_change_pct(messages_sent, len(prev_messages)),
+        video_call_hours=video_call_hours,
+        video_call_hours_change_pct=_change_pct(video_call_hours, prev_video_call_hours),
+        documents_uploaded=documents_uploaded,
+        documents_uploaded_change_pct=_change_pct(documents_uploaded, len(prev_documents)),
         messages_sent_trend=messages_sent_trend,
         video_call_hours_trend=video_call_hours_trend,
-        session_duration_trend=session_duration_trend,
-        session_completed_trend=session_completed_trend,
+        documents_uploaded_trend=documents_uploaded_trend,
     )
