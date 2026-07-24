@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.encryption import decrypt_field, encrypt_field
+from app.core.file_storage import resolve_media_url
 from app.core.logging import get_logger
 from app.models.seeker_profile import (
     SeekerCountryVisited,
@@ -89,7 +90,12 @@ def build_read(profile: SeekerProfile, settings: Settings) -> SeekerProfileRead:
         date_of_birth=profile.date_of_birth,
         nationality=profile.nationality,
         country_of_residence=profile.country_of_residence,
-        profile_photo_url=profile.profile_photo_url,
+        profile_photo_url=resolve_media_url(profile.profile_photo_url, settings),
+        banner_url=resolve_media_url(profile.banner_url, settings),
+        phone=profile.phone,
+        timezone=profile.timezone,
+        preferred_language=profile.preferred_language,
+        about=profile.about,
         intended_visa_type=profile.intended_visa_type,
         intended_destination=profile.intended_destination,
         passport_number_masked=None,

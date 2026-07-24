@@ -75,6 +75,13 @@ class SeekerProfile(BaseModel):
     nationality: Mapped[str | None] = mapped_column(String(2), nullable=True)
     country_of_residence: Mapped[str | None] = mapped_column(String(2), nullable=True)
     profile_photo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    banner_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # Edit-profile sheet (shared seeker settings)
+    phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    timezone: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    preferred_language: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    about: Mapped[str | None] = mapped_column(String(2000), nullable=True)
 
     # Onboarding intent — captured during the post-registration onboarding wizard
     intended_visa_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
