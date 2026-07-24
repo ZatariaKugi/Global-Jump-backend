@@ -4,32 +4,47 @@ from __future__ import annotations
 
 import uuid
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import ColumnElement, Select, exists, func, select
+from sqlalchemy import ColumnElement, Select, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.exceptions import ConflictError, NotFoundError
 from app.core.file_storage import resolve_media_url, resolve_url
+from app.core.visa_types import parse_visa_type
 from app.models.booking import Booking
 from app.models.seeker_document import (
+    DocumentCategory,
     SeekerDocument,
     SeekerDocumentComment,
     SeekerDocumentStatus,
 )
 from app.models.user import User, UserRole
+from app.models.visa_type import VisaType
 from app.schemas.booking import BookingSort
 from app.schemas.seeker_document import (
+    ChecklistItemStatus,
     ClientSeekerBrief,
     CustomerDocumentsRowRead,
     CustomerDocumentsRowStatus,
+    DocumentChecklistItem,
     DocumentCommentRead,
+    DocumentPortfolioSummary,
     SeekerDocumentCreate,
     SeekerDocumentRead,
     SeekerDocumentStatusUpdate,
+    SeekerDocumentUpdate,
 )
 from app.services import booking_service
+
+# Required portfolio categories for the seeker Documents checklist / Missing card.
+REQUIRED_CHECKLIST: tuple[tuple[DocumentCategory, str], ...] = (
+    (DocumentCategory.passport, "Passport"),
+    (DocumentCategory.finance, "Bank Statement"),
+    (DocumentCategory.supporting, "Employment Letter"),
+    (DocumentCategory.educational, "Academic Certification"),
+)
 
 
 async def create(
@@ -42,6 +57,8 @@ async def create(
         file_url=file_url,
         file_size_bytes=data.file_size_bytes,
         content_type=data.content_type,
+        expires_at=data.expires_at,
+        visa_type=data.visa_type.value if data.visa_type is not None else None,
         created_by=seeker_id,
     )
     session.add(document)
@@ -50,27 +67,87 @@ async def create(
     return document
 
 
-def list_by_seeker_stmt(seeker_id: uuid.UUID) -> Select[tuple[SeekerDocument]]:
-    return (
+async def update_document(
+    session: AsyncSession,
+    document: SeekerDocument,
+    data: SeekerDocumentUpdate,
+    actor_id: uuid.UUID,
+) -> SeekerDocument:
+    if data.document_name is not None:
+        document.document_name = data.document_name
+    if data.clear_expires_at:
+        document.expires_at = None
+    elif data.expires_at is not None:
+        document.expires_at = data.expires_at
+    if data.clear_visa_type:
+        document.visa_type = None
+    elif data.visa_type is not None:
+        document.visa_type = data.visa_type.value
+    document.updated_by = actor_id
+    session.add(document)
+    await session.flush()
+    await session.refresh(document)
+    return document
+
+
+async def archive_document(
+    session: AsyncSession, document: SeekerDocument, actor_id: uuid.UUID
+) -> None:
+    document.archive(actor_id)
+    session.add(document)
+    await session.flush()
+
+
+def list_by_seeker_stmt(
+    seeker_id: uuid.UUID,
+    *,
+    category: DocumentCategory | None = None,
+    status: SeekerDocumentStatus | None = None,
+    visa_type: VisaType | None = None,
+    expiring_within_days: int | None = None,
+    expires_before: date | None = None,
+) -> Select[tuple[SeekerDocument]]:
+    stmt = (
         select(SeekerDocument)
         .where(SeekerDocument.seeker_id == seeker_id)
         .where(SeekerDocument.is_archived.is_(False))
-        .order_by(SeekerDocument.created_at.desc())
     )
+    if category is not None:
+        stmt = stmt.where(SeekerDocument.category == category)
+    if status is not None:
+        stmt = stmt.where(SeekerDocument.status == status)
+    if visa_type is not None:
+        # Untagged docs apply to every visa filter.
+        stmt = stmt.where(
+            or_(
+                SeekerDocument.visa_type == visa_type.value,
+                SeekerDocument.visa_type.is_(None),
+            )
+        )
+    if expiring_within_days is not None:
+        cutoff = date.today() + timedelta(days=expiring_within_days)
+        stmt = stmt.where(SeekerDocument.expires_at.is_not(None)).where(
+            SeekerDocument.expires_at <= cutoff
+        )
+    if expires_before is not None:
+        stmt = stmt.where(SeekerDocument.expires_at.is_not(None)).where(
+            SeekerDocument.expires_at <= expires_before
+        )
+    return stmt.order_by(SeekerDocument.created_at.desc())
 
 
 async def get_for_seeker(
     session: AsyncSession, document_id: uuid.UUID, seeker_id: uuid.UUID
 ) -> SeekerDocument:
     document = await session.get(SeekerDocument, document_id)
-    if document is None or document.seeker_id != seeker_id:
+    if document is None or document.seeker_id != seeker_id or document.is_archived:
         raise NotFoundError("Document not found")
     return document
 
 
 async def get_by_id(session: AsyncSession, document_id: uuid.UUID) -> SeekerDocument:
     document = await session.get(SeekerDocument, document_id)
-    if document is None:
+    if document is None or document.is_archived:
         raise NotFoundError("Document not found")
     return document
 
@@ -117,6 +194,72 @@ async def assert_portfolio_editable(session: AsyncSession, seeker_id: uuid.UUID)
         )
 
 
+def _checklist_status_for_docs(
+    docs: list[SeekerDocument],
+) -> tuple[ChecklistItemStatus, uuid.UUID | None]:
+    """Pick the best status for a required category from matching uploads."""
+    if not docs:
+        return "missing", None
+    approved = next((d for d in docs if d.status == SeekerDocumentStatus.approved), None)
+    if approved is not None:
+        return "approved", approved.id
+    reviewing = next((d for d in docs if d.status == SeekerDocumentStatus.under_review), None)
+    if reviewing is not None:
+        return "under_review", reviewing.id
+    rejected = docs[0]
+    return "rejected", rejected.id
+
+
+async def portfolio_summary(
+    session: AsyncSession,
+    seeker_id: uuid.UUID,
+    visa_type: VisaType | None = None,
+) -> DocumentPortfolioSummary:
+    """Overview tallies + required-category checklist for the Documents page."""
+    stmt = list_by_seeker_stmt(seeker_id, visa_type=visa_type)
+    docs = list((await session.execute(stmt)).scalars().all())
+
+    total = len(docs)
+    approved = sum(1 for d in docs if d.status == SeekerDocumentStatus.approved)
+    under_review = sum(1 for d in docs if d.status == SeekerDocumentStatus.under_review)
+    rejected = sum(1 for d in docs if d.status == SeekerDocumentStatus.rejected)
+
+    by_category: dict[DocumentCategory, list[SeekerDocument]] = defaultdict(list)
+    for doc in docs:
+        by_category[doc.category].append(doc)
+
+    checklist: list[DocumentChecklistItem] = []
+    missing = 0
+    required_approved = 0
+    for category, label in REQUIRED_CHECKLIST:
+        status, document_id = _checklist_status_for_docs(by_category.get(category, []))
+        if status == "missing":
+            missing += 1
+        elif status == "approved":
+            required_approved += 1
+        checklist.append(
+            DocumentChecklistItem(
+                category=category,
+                label=label,
+                status=status,
+                document_id=document_id,
+            )
+        )
+
+    required_n = len(REQUIRED_CHECKLIST)
+    progress_percent = int(round(100 * required_approved / required_n)) if required_n else 0
+
+    return DocumentPortfolioSummary(
+        total=total,
+        approved=approved,
+        under_review=under_review,
+        missing=missing,
+        rejected=rejected,
+        progress_percent=progress_percent,
+        checklist=checklist,
+    )
+
+
 async def add_comment(
     session: AsyncSession, document: SeekerDocument, author_id: uuid.UUID, body: str
 ) -> SeekerDocumentComment:
@@ -150,6 +293,8 @@ def build_read(document: SeekerDocument, settings: Settings) -> SeekerDocumentRe
         file_size_bytes=document.file_size_bytes,
         content_type=document.content_type,
         status=document.status,
+        expires_at=document.expires_at,
+        visa_type=parse_visa_type(document.visa_type),
         reviewed_at=document.reviewed_at,
         reviewed_by=document.reviewed_by,
         created_at=document.created_at,

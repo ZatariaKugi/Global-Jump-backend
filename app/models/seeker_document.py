@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String
+from sqlalchemy import Date, DateTime, ForeignKey, Integer, String
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -45,6 +45,9 @@ class SeekerDocument(BaseModel):
         default=SeekerDocumentStatus.under_review,
         nullable=False,
     )
+    expires_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Optional visa scope (VisaType value); null = applies to any visa filter.
+    visa_type: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reviewed_by: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
 
