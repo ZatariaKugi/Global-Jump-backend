@@ -18,15 +18,15 @@ from app.api.deps import (
     require_verified_advisor,
 )
 from app.api.pagination import PaginationDep, page_meta, paginate
-from app.api.v1.bookings import _party_names, _read, _send_confirmations
+from app.api.v1.bookings import _party_names, _read_booking, _send_confirmations
 from app.core.exceptions import NotFoundError, PermissionDeniedError
 from app.core.file_storage import delete_file, resolve_url
 from app.core.visa_types import OptionalVisaType, visa_type_name
 from app.db.session import SessionDep
 from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
-from app.models.advisor_profile import AdvisorProfile
+from app.models.advisor_profile import AdvisorProfile, AdvisorServiceType
 from app.models.assessment import Assessment
-from app.models.booking import Booking
+from app.models.booking import Booking, BookingStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.advisor_credential import (
     AdvisorCredentialCreate,
@@ -44,7 +44,7 @@ from app.schemas.advisor_profile import (
     AdvisorProfileUpdate,
     AdvisorVerificationResubmitRead,
 )
-from app.schemas.booking import AdvisorBookingCreate, BookingRead, ClientRead
+from app.schemas.booking import AdvisorBookingCreate, BookingRead, BookingSort, ClientRead
 from app.schemas.payment import (
     AdvisorConnectStatus,
     AdvisorEarnings,
@@ -53,7 +53,10 @@ from app.schemas.payment import (
 )
 from app.schemas.payout import PayoutPreviewRead, PayoutRequestCreate, PayoutRequestRead
 from app.schemas.response import Meta, ResponseEnvelope
+from app.schemas.review import AdvisorReviewSummaryRead
 from app.schemas.seeker_document import (
+    CustomerDocumentsRowRead,
+    CustomerDocumentsRowStatus,
     DocumentCommentCreate,
     DocumentCommentRead,
     SeekerDocumentRead,
@@ -189,7 +192,12 @@ async def list_advisors(
     min_rating: Annotated[float | None, Query(ge=1, le=5)] = None,
     recommended: Annotated[
         bool,
-        Query(description="When true, AI-suggested (featured) advisors sort first"),
+        Query(
+            description=(
+                "When true, AI-suggested advisors (highest match for the seeker's "
+                "destination/visa) sort first; falls back to featured when no match context"
+            )
+        ),
     ] = False,
     sort: Annotated[SortOption, Query()] = "newest",
 ) -> ResponseEnvelope[list[AdvisorListingCard]]:
@@ -205,10 +213,33 @@ async def list_advisors(
         sort=sort,
     )
     stmt = advisor_search_service.build_search_stmt(filters)
-    users, total = await paginate(session, stmt, params)
-    profiles_by_user = await _profiles_by_user(session, users)
-    ratings = await review_service.rating_summaries(session, [u.id for u in users])
     destination, match_visa = await _seeker_match_context(session, principal)
+
+    if recommended and destination and match_visa:
+        # Score the full filtered set so AI matches lead every page, not only featured.
+        all_users = list((await session.execute(stmt)).scalars().all())
+        profiles_by_user = await _profiles_by_user(session, all_users)
+        ratings = await review_service.rating_summaries(session, [u.id for u in all_users])
+
+        def _match_pct(u: User) -> int:
+            return (
+                advisor_matching_service.match_percentage(
+                    profiles_by_user.get(u.id),
+                    destination,
+                    match_visa,
+                    (ratings.get(u.id) or (None, 0))[0],
+                )
+                or 0
+            )
+
+        all_users.sort(key=lambda u: (_match_pct(u), u.created_at), reverse=True)
+        total = len(all_users)
+        users = all_users[params.offset : params.offset + params.limit]
+    else:
+        users, total = await paginate(session, stmt, params)
+        profiles_by_user = await _profiles_by_user(session, users)
+        ratings = await review_service.rating_summaries(session, [u.id for u in users])
+
     bookmarked = await _bookmarked_ids(session, principal, [u.id for u in users])
     conversations = await _conversation_ids(session, principal, [u.id for u in users])
 
@@ -578,6 +609,30 @@ async def get_stripe_connect_status(
     )
 
 
+# ── Reviews summary ──────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/me/reviews/summary",
+    response_model=ResponseEnvelope[AdvisorReviewSummaryRead],
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def get_my_reviews_summary(
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[AdvisorReviewSummaryRead]:
+    """Reviews tab header card — same shape as admin advisor reviews summary.
+
+    ``overall``, ``review_count``, ``positive_percent``, and 1–5 star ``breakdown``
+    without fetching the full review list.
+    """
+    summary = await review_service.build_tab_summary(session, current_user.id)
+    return ResponseEnvelope[AdvisorReviewSummaryRead](
+        data=summary, meta=Meta(request_id=request_id)
+    )
+
+
 # ── Earnings ─────────────────────────────────────────────────────────────────
 
 
@@ -759,7 +814,7 @@ async def create_booking_for_client(
     await _send_confirmations(session, booking, settings)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -773,15 +828,72 @@ async def list_my_clients(
     params: PaginationDep,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     q: Annotated[str | None, Query(max_length=100)] = None,
+    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
+    status: BookingStatus | None = None,
 ) -> ResponseEnvelope[list[ClientRead]]:
-    """Seekers with at least one prior booking with this advisor — powers the
-    calendar's "Select Client" / "Search Client" picker."""
-    stmt = booking_service.list_clients_stmt(current_user.id, q)
+    """Seekers with at least one prior booking — Clients table + calendar picker.
+
+    ``id`` / ``seeker_id`` are the seeker user UUID. Booking fields
+    (``booking_id``, ``consultation_number`` / ``appointment_id``,
+    ``consultation_type``, ``status``, ``is_important``) come from the latest
+    booking; ``match_score`` from the latest non-dismissed lead when present.
+
+    ``service_type`` / ``status`` filter on that latest booking.
+    """
+    types = [t.value for t in service_type] if service_type else None
+    stmt = booking_service.list_clients_stmt(
+        current_user.id, q, service_types=types, status=status
+    )
     clients, total = await paginate(session, stmt, params)
+    data = await booking_service.build_client_reads(
+        session, current_user.id, clients, settings
+    )
     return ResponseEnvelope[list[ClientRead]](
-        data=[ClientRead(id=c.id, full_name=c.full_name, email=c.email) for c in clients],
+        data=data,
+        meta=page_meta(params, total, request_id),
+    )
+
+
+@router.get(
+    "/me/customer-documents",
+    response_model=ResponseEnvelope[list[CustomerDocumentsRowRead]],
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def list_customer_documents(
+    params: PaginationDep,
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+    q: Annotated[str | None, Query(max_length=100)] = None,
+    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
+    documents_status: CustomerDocumentsRowStatus | None = None,
+    sort: Annotated[BookingSort, Query()] = "-scheduled_start",
+) -> ResponseEnvelope[list[CustomerDocumentsRowRead]]:
+    """Documents of customers table — one row per booking with portfolio tallies.
+
+    Returns ``appointment_id``, client identity, ``documents_count``, aggregate
+    ``documents_status`` (pending/completed/rejected), and ``updated_at``. Drill into
+    ``GET /me/clients/{seeker_id}/documents`` for the review UI and
+    ``GET /bookings/{booking_id}/details`` for Booking detail.
+    """
+    types = [t.value for t in service_type] if service_type else None
+    stmt = seeker_document_service.list_customer_documents_stmt(
+        current_user.id,
+        q=q,
+        service_types=types,
+        documents_status=documents_status,
+        sort=sort,
+    )
+    bookings, total = await paginate(session, stmt, params)
+    data = await seeker_document_service.build_customer_document_rows(
+        session, list(bookings), settings
+    )
+    return ResponseEnvelope[list[CustomerDocumentsRowRead]](
+        data=data,
         meta=page_meta(params, total, request_id),
     )
 
@@ -812,12 +924,16 @@ async def list_client_documents(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[SeekerDocumentRead]]:
+    """Document rows for one client, plus ``meta.seeker`` for the detail header."""
     await _assert_advisor_client_relationship(session, current_user.id, seeker_id)
     stmt = seeker_document_service.list_by_seeker_stmt(seeker_id)
     documents, total = await paginate(session, stmt, params)
+    seeker = await seeker_document_service.build_client_seeker_brief(
+        session, seeker_id, settings
+    )
     return ResponseEnvelope[list[SeekerDocumentRead]](
         data=[seeker_document_service.build_read(d, settings) for d in documents],
-        meta=page_meta(params, total, request_id),
+        meta=page_meta(params, total, request_id, seeker=seeker),
     )
 
 
@@ -836,6 +952,7 @@ async def review_client_document(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[SeekerDocumentRead]:
     await _assert_advisor_client_relationship(session, current_user.id, seeker_id)
+    await seeker_document_service.assert_portfolio_editable(session, seeker_id)
     document = await seeker_document_service.get_for_seeker(session, document_id, seeker_id)
     document = await seeker_document_service.set_status(session, document, data, current_user.id)
     return ResponseEnvelope[SeekerDocumentRead](

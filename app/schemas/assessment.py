@@ -23,7 +23,7 @@ class QuestionRead(BaseModel):
     id: uuid.UUID
     text: str
     description: str | None
-    category: QuestionCategory
+    category: QuestionCategory | None
     display_order: int
     depends_on_option_id: uuid.UUID | None
     options: list[QuestionOptionRead]
@@ -58,7 +58,9 @@ class QuestionOptionPatchInput(BaseModel):
 class QuestionCreate(BaseModel):
     text: str = Field(min_length=1, max_length=500)
     description: str | None = Field(default=None, max_length=1000)
-    category: QuestionCategory
+    # Optional — questions are scoped by country/visa_type; category is for
+    # result breakdown only when provided.
+    category: QuestionCategory | None = None
     country_code: str | None = Field(default=None, min_length=2, max_length=2)
     visa_type: OptionalVisaType = None
     weight: float = Field(default=1.0, gt=0, le=10)
@@ -109,7 +111,7 @@ class QuestionAdminRead(BaseModel):
     id: uuid.UUID
     text: str
     description: str | None
-    category: QuestionCategory
+    category: QuestionCategory | None
     country_code: str | None
     visa_type: OptionalVisaType
     weight: float
@@ -147,9 +149,12 @@ class CategoryScoreRead(BaseModel):
 class AdvisorMatchRead(BaseModel):
     user_id: uuid.UUID
     full_name: str | None
+    email: str | None = None
     title: str | None
     profile_photo_url: str | None
     years_of_experience: int | None
+    average_rating: float | None = None
+    starting_price_usd: float | None = None
     match_score: float
     public_profile_slug: str | None
 
@@ -190,23 +195,22 @@ class AssessmentSummaryRead(BaseModel):
 
 
 class AssessmentVolumePoint(BaseModel):
-    date: str  # ISO date (YYYY-MM-DD)
-    count: int
+    """Area-chart point — month axis label + assessment count."""
+
+    month: str  # e.g. "Jan"
+    value: int
 
 
 class AssessmentDropOffPoint(BaseModel):
-    question_id: uuid.UUID | None
-    label: str
-    count: int
+    """Bar-chart point — question stage + drop-off % of assessments started."""
+
+    stage: str  # e.g. "Q1", "Q2"
+    value: float
 
 
 class AssessmentAnalyticsRead(BaseModel):
     window_days: int
-    total_started: int
-    total_completed: int
-    volume: list[AssessmentVolumePoint]
-    pass_rate: float
-    fail_rate: float
-    drop_off_count: int
-    drop_off_rate: float
+    pass_rate: float  # 0–100
+    fail_rate: float  # 0–100
+    assessment_volume: list[AssessmentVolumePoint]
     drop_off_points: list[AssessmentDropOffPoint]

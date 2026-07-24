@@ -105,7 +105,7 @@ async def _ensure_booking(
         seeker_id=seeker.id,
         advisor_id=advisor.id,
         appointment_number=await booking_service._next_appointment_number(session),
-        service_type="consultation",
+        service_type="immigration_specialist",
         duration_minutes=30,
         price_usd=75.0,
         scheduled_start=start,

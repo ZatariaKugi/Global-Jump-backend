@@ -1,18 +1,18 @@
-"""Seed assessment traffic for the admin AI Analytics panel.
+"""Seed assessment + match traffic for the admin AI Analytics panel.
 
 Populates ``GET /api/v1/admin/analytics/ai`` with:
-  - pass_rate / fail_rate (completed assessments by tier)
-  - assessment_volume (started counts by month)
-  - drop_off_points (abandoned at Q1…Qn as % of started)
+  - assessment_distribution (7 visa-type donut slices + change_pct)
+  - advisor_match_funnel (impressions → matches → clicks → booked)
+  - eligibility_breakdown (stacked low/medium/high % per visa type)
 
-Creates a dedicated CA/student questionnaire (if missing) so drop-off stages
-work even when the global question bank is empty or differently scoped::
+Creates a dedicated CA/student questionnaire (if missing) for abandoned
+assessments, plus a seed advisor so funnel bookings can attach::
 
     uv run python -m scripts.seed_ai_analytics
 
-Idempotent: deletes prior assessments for the seed seeker and recreates them.
-Covers 8 calendar months. The AI analytics endpoint defaults to ``days=270``
-so the volume chart shows the full series without an extra query param.
+Idempotent: deletes prior assessments/leads/bookings for the seed seeker
+and recreates them. Covers the current and previous ~9-month windows so
+``change_pct`` is non-zero.
 """
 
 from __future__ import annotations
@@ -25,7 +25,10 @@ from sqlalchemy import delete, func, select
 
 from app.core.logging import get_logger
 from app.core.security import hash_password
+from app.core.visa_types import VISA_TYPE_LABELS
 from app.db.session import async_session_factory, engine
+from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
+from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import (
     Assessment,
     AssessmentAnswer,
@@ -35,58 +38,68 @@ from app.models.assessment import (
     EligibilityTier,
     QuestionCategory,
 )
-from app.models.user import User, UserRole
+from app.models.booking import Booking, BookingStatus, PaymentStatus
+from app.models.user import User, UserRole, VerificationStatus
+from app.models.visa_type import VisaType
+from app.services import booking_service
 from app.services.assessment_service import list_questions
 
 logger = get_logger(__name__)
 
 PASSWORD = "TestPass123!"
 COUNTRY = "CA"
-VISA = "student"
 SEEKER_EMAIL = "ai.analytics.seeker@globlejump.test"
+ADVISOR_EMAIL = "ai.analytics.advisor@globlejump.test"
 
-# Minimal questionnaire used only for analytics drop-off staging (Q1–Q4).
+# Stable order matching the AI analytics API / FE donut.
+VISA_TYPES: tuple[VisaType, ...] = (
+    VisaType.student,
+    VisaType.work,
+    VisaType.tourist,
+    VisaType.pr,
+    VisaType.family,
+    VisaType.investment,
+    VisaType.asylum,
+)
+
+# Relative weights for the donut (current window).
+VISA_WEIGHTS: dict[VisaType, float] = {
+    VisaType.student: 0.28,
+    VisaType.work: 0.22,
+    VisaType.tourist: 0.14,
+    VisaType.pr: 0.12,
+    VisaType.family: 0.10,
+    VisaType.investment: 0.08,
+    VisaType.asylum: 0.06,
+}
+
+# Current window volumes by months-ago (sum ≈ distribution value).
+CURRENT_MONTHLY: list[tuple[int, int]] = [
+    (2, 40),
+    (1, 48),
+    (0, 52),
+]
+
+# Previous window (for change_pct) — outside the default 270-day lookback.
+PREV_MONTHLY: list[tuple[int, int]] = [
+    (12, 28),
+    (11, 30),
+    (10, 32),
+]
+
+# Of completed: high / medium / low tier mix.
+HIGH_SHARE = 0.35
+MEDIUM_SHARE = 0.40
+# remainder → low
+
+ABANDON_SHARE = 0.18
+
 ANALYTICS_QUESTIONS: list[tuple[QuestionCategory, str]] = [
     (QuestionCategory.purpose, "What is your primary reason for immigrating?"),
     (QuestionCategory.education, "What is your highest education level?"),
     (QuestionCategory.employment, "How many years of relevant work experience do you have?"),
     (QuestionCategory.financial, "Can you show proof of funds for the first year?"),
 ]
-
-# Months ago → started count (8 months of volume for the area chart).
-MONTHLY_VOLUME: list[tuple[int, int]] = [
-    (7, 22),
-    (6, 26),
-    (5, 28),
-    (4, 34),
-    (3, 40),
-    (2, 36),
-    (1, 44),
-    (0, 48),
-]
-
-# Of completed assessments: ~78% pass / ~22% fail (matches FE donut examples).
-PASS_SHARE = 0.78
-
-# Of started: ~22% abandon; remainder complete.
-ABANDON_SHARE = 0.22
-
-# Abandoned assessments distributed across early stages (Q1–Q4).
-DROP_STAGE_WEIGHTS: list[tuple[int, float]] = [
-    (1, 0.35),  # Q1
-    (2, 0.28),  # Q2
-    (3, 0.22),  # Q3
-    (4, 0.15),  # Q4
-]
-
-PASS_TIERS = (
-    EligibilityTier.highly_eligible,
-    EligibilityTier.likely_eligible,
-)
-FAIL_TIERS = (
-    EligibilityTier.borderline,
-    EligibilityTier.low_eligibility,
-)
 
 
 async def _ensure_seeker(session) -> User:
@@ -107,9 +120,37 @@ async def _ensure_seeker(session) -> User:
     return user
 
 
+async def _ensure_advisor(session) -> User:
+    user = await session.scalar(select(User).where(User.email == ADVISOR_EMAIL))
+    if user is not None:
+        return user
+    user = User(
+        email=ADVISOR_EMAIL,
+        full_name="AI Analytics Seed Advisor",
+        hashed_password=hash_password(PASSWORD),
+        role=UserRole.advisor,
+        is_active=True,
+        verification_status=VerificationStatus.approved,
+        email_verified_at=datetime.now(UTC),
+    )
+    session.add(user)
+    await session.flush()
+    session.add(
+        AdvisorProfile(
+            user_id=user.id,
+            title="Immigration Consultant",
+            years_of_experience=8,
+            bio="Temporary seed profile for admin AI analytics.",
+        )
+    )
+    await session.flush()
+    logger.info("ai_analytics_advisor_created", email=ADVISOR_EMAIL)
+    return user
+
+
 async def _ensure_questions(session) -> int:
     """Ensure ≥4 active questions for CA/student (creates scoped ones if needed)."""
-    existing = await list_questions(session, COUNTRY, VISA)
+    existing = await list_questions(session, COUNTRY, VisaType.student.value)
     if len(existing) >= len(ANALYTICS_QUESTIONS):
         return 0
 
@@ -121,12 +162,11 @@ async def _ensure_questions(session) -> int:
         or -1
     ) + 1
     for i, (category, text) in enumerate(ANALYTICS_QUESTIONS):
-        # Skip if an identical scoped question already exists.
         dup = await session.scalar(
             select(AssessmentQuestion.id).where(
                 AssessmentQuestion.text == text,
                 AssessmentQuestion.country_code == COUNTRY,
-                AssessmentQuestion.visa_type == VISA,
+                AssessmentQuestion.visa_type == VisaType.student.value,
             )
         )
         if dup is not None:
@@ -136,7 +176,7 @@ async def _ensure_questions(session) -> int:
                 text=text,
                 category=category,
                 country_code=COUNTRY,
-                visa_type=VISA,
+                visa_type=VisaType.student.value,
                 weight=1.0,
                 display_order=start_order + i,
                 is_active=True,
@@ -166,8 +206,8 @@ async def _ensure_questions(session) -> int:
     return created
 
 
-async def _clear_prior(session, seeker_id: uuid.UUID) -> int:
-    ids = list(
+async def _clear_prior(session, seeker_id: uuid.UUID) -> tuple[int, int, int]:
+    assessment_ids = list(
         (
             await session.execute(
                 select(Assessment.id).where(Assessment.user_id == seeker_id)
@@ -176,16 +216,26 @@ async def _clear_prior(session, seeker_id: uuid.UUID) -> int:
         .scalars()
         .all()
     )
-    if not ids:
-        return 0
-    await session.execute(delete(AssessmentAnswer).where(AssessmentAnswer.assessment_id.in_(ids)))
-    await session.execute(delete(Assessment).where(Assessment.id.in_(ids)))
+    leads_deleted = 0
+    if assessment_ids:
+        leads_deleted = (
+            await session.execute(
+                delete(AdvisorLead).where(AdvisorLead.assessment_id.in_(assessment_ids))
+            )
+        ).rowcount or 0
+        await session.execute(
+            delete(AssessmentAnswer).where(AssessmentAnswer.assessment_id.in_(assessment_ids))
+        )
+        await session.execute(delete(Assessment).where(Assessment.id.in_(assessment_ids)))
+
+    bookings_deleted = (
+        await session.execute(delete(Booking).where(Booking.seeker_id == seeker_id))
+    ).rowcount or 0
     await session.flush()
-    return len(ids)
+    return len(assessment_ids), leads_deleted, bookings_deleted
 
 
 def _month_anchor(months_ago: int) -> datetime:
-    """Mid-month UTC timestamp ``months_ago`` calendar months back from now."""
     now = datetime.now(UTC)
     year = now.year
     month = now.month - months_ago
@@ -196,42 +246,33 @@ def _month_anchor(months_ago: int) -> datetime:
     return datetime(year, month, day, 12, 0, 0, tzinfo=UTC)
 
 
-def _split_counts(total: int) -> tuple[int, int, dict[int, int]]:
-    """Return (pass_completed, fail_completed, {stage: abandon_count})."""
-    abandon = max(1, round(total * ABANDON_SHARE)) if total >= 5 else max(0, total // 5)
-    completed = total - abandon
-    pass_n = round(completed * PASS_SHARE)
-    fail_n = completed - pass_n
+def _split_visa_volumes(total: int) -> dict[VisaType, int]:
+    raw = {vt: int(total * VISA_WEIGHTS[vt]) for vt in VISA_TYPES}
+    drift = total - sum(raw.values())
+    raw[VisaType.student] += drift
+    return raw
 
-    stage_counts: dict[int, int] = {}
-    remaining = abandon
-    for i, (stage, weight) in enumerate(DROP_STAGE_WEIGHTS):
-        if i == len(DROP_STAGE_WEIGHTS) - 1:
-            stage_counts[stage] = remaining
-        else:
-            n = round(abandon * weight)
-            stage_counts[stage] = n
-            remaining -= n
-    # Fix rounding drift so stages sum to abandon.
-    drift = abandon - sum(stage_counts.values())
-    if drift and stage_counts:
-        first = next(iter(stage_counts))
-        stage_counts[first] = max(0, stage_counts[first] + drift)
-    return pass_n, fail_n, stage_counts
+
+def _tier_counts(completed: int) -> tuple[int, int, int]:
+    high = round(completed * HIGH_SHARE)
+    medium = round(completed * MEDIUM_SHARE)
+    low = max(0, completed - high - medium)
+    return high, medium, low
 
 
 async def _add_completed(
     session,
     *,
     seeker_id: uuid.UUID,
+    visa: VisaType,
     created_at: datetime,
     tier: EligibilityTier,
     score: float,
-) -> None:
+) -> Assessment:
     assessment = Assessment(
         user_id=seeker_id,
         destination_country=COUNTRY,
-        visa_type=VISA,
+        visa_type=visa.value,
         status=AssessmentStatus.completed,
         score=score,
         tier=tier,
@@ -241,39 +282,135 @@ async def _add_completed(
     )
     assessment.created_at = created_at
     session.add(assessment)
+    await session.flush()
+    return assessment
 
 
 async def _add_abandoned(
     session,
     *,
     seeker_id: uuid.UUID,
+    visa: VisaType,
     created_at: datetime,
     questions: list[AssessmentQuestion],
-    drop_at_stage: int,
 ) -> None:
-    """Leave unanswered from ``drop_at_stage`` onward (1-based Q index)."""
     assessment = Assessment(
         user_id=seeker_id,
         destination_country=COUNTRY,
-        visa_type=VISA,
+        visa_type=visa.value,
         status=AssessmentStatus.in_progress,
         created_by=seeker_id,
     )
     assessment.created_at = created_at
     session.add(assessment)
     await session.flush()
-
-    answered_through = max(0, drop_at_stage - 1)
-    for q in questions[:answered_through]:
-        if not q.options:
-            continue
+    if questions and questions[0].options:
         session.add(
             AssessmentAnswer(
                 assessment_id=assessment.id,
-                question_id=q.id,
-                option_id=q.options[0].id,
+                question_id=questions[0].id,
+                option_id=questions[0].options[0].id,
             )
         )
+
+
+async def _seed_window(
+    session,
+    *,
+    seeker_id: uuid.UUID,
+    advisor_id: uuid.UUID,
+    monthly: list[tuple[int, int]],
+    questions: list[AssessmentQuestion],
+    make_funnel: bool,
+) -> tuple[int, int, int, int]:
+    """Returns (started, completed, leads, bookings)."""
+    started = 0
+    completed = 0
+    leads = 0
+    bookings = 0
+    hour = 0
+
+    for months_ago, volume in monthly:
+        anchor = _month_anchor(months_ago)
+        by_visa = _split_visa_volumes(volume)
+        for visa, n in by_visa.items():
+            abandon = max(0, round(n * ABANDON_SHARE))
+            done = n - abandon
+            high_n, med_n, low_n = _tier_counts(done)
+            started += n
+            completed += done
+
+            tiers = (
+                [(EligibilityTier.highly_eligible, 90.0)] * high_n
+                + [(EligibilityTier.likely_eligible, 72.0)] * med_n
+                + [(EligibilityTier.borderline, 45.0)] * (low_n // 2)
+                + [(EligibilityTier.low_eligibility, 25.0)] * (low_n - low_n // 2)
+            )
+            for i, (tier, score) in enumerate(tiers):
+                assessment = await _add_completed(
+                    session,
+                    seeker_id=seeker_id,
+                    visa=visa,
+                    created_at=anchor + timedelta(hours=hour + i),
+                    tier=tier,
+                    score=score,
+                )
+                if make_funnel and i % 2 == 0:
+                    session.add(
+                        AdvisorLead(
+                            seeker_id=seeker_id,
+                            advisor_id=advisor_id,
+                            assessment_id=assessment.id,
+                            match_score=0.82,
+                            match_reasons=f"Specializes in {VISA_TYPE_LABELS[visa]}",
+                            status=AdvisorLeadStatus.new,
+                            created_by=seeker_id,
+                        )
+                    )
+                    leads += 1
+                if make_funnel and i % 3 == 0:
+                    start = anchor + timedelta(days=7, hours=i)
+                    # Mix pending (clicked) vs confirmed/completed (session booked).
+                    if i % 9 == 0:
+                        status = BookingStatus.completed
+                        payment = PaymentStatus.paid
+                    elif i % 6 == 0:
+                        status = BookingStatus.confirmed
+                        payment = PaymentStatus.paid
+                    else:
+                        status = BookingStatus.pending
+                        payment = PaymentStatus.unpaid
+                    booking = Booking(
+                        seeker_id=seeker_id,
+                        advisor_id=advisor_id,
+                        appointment_number=await booking_service._next_appointment_number(
+                            session
+                        ),
+                        scheduled_start=start,
+                        scheduled_end=start + timedelta(minutes=30),
+                        duration_minutes=30,
+                        service_type="immigration_specialist",
+                        price_usd=49.0,
+                        status=status,
+                        payment_status=payment,
+                        created_by=seeker_id,
+                    )
+                    booking.created_at = anchor + timedelta(hours=hour + i, minutes=30)
+                    session.add(booking)
+                    bookings += 1
+
+            hour += done
+            for j in range(abandon):
+                await _add_abandoned(
+                    session,
+                    seeker_id=seeker_id,
+                    visa=visa,
+                    created_at=anchor + timedelta(hours=hour + j),
+                    questions=questions,
+                )
+            hour += abandon
+
+    return started, completed, leads, bookings
 
 
 async def seed_ai_analytics() -> list[str]:
@@ -281,74 +418,40 @@ async def seed_ai_analytics() -> list[str]:
 
     async with async_session_factory() as session:
         seeker = await _ensure_seeker(session)
-        cleared = await _clear_prior(session, seeker.id)
-        lines.append(f"cleared_prior_assessments={cleared}")
+        advisor = await _ensure_advisor(session)
+        cleared_a, cleared_l, cleared_b = await _clear_prior(session, seeker.id)
+        lines.append(
+            f"cleared assessments={cleared_a} leads={cleared_l} bookings={cleared_b}"
+        )
 
         q_created = await _ensure_questions(session)
         lines.append(f"questions_created={q_created}")
-
-        questions = await list_questions(session, COUNTRY, VISA)
-        if not questions:
-            lines.append("error=no_questions_configured")
-            await session.commit()
-            return lines
+        questions = await list_questions(session, COUNTRY, VisaType.student.value)
         lines.append(f"questions_for_scope={len(questions)}")
 
-        total_started = 0
-        total_pass = 0
-        total_fail = 0
-        total_abandon = 0
-
-        for months_ago, volume in MONTHLY_VOLUME:
-            anchor = _month_anchor(months_ago)
-            pass_n, fail_n, stage_counts = _split_counts(volume)
-            total_started += volume
-            total_pass += pass_n
-            total_fail += fail_n
-            total_abandon += sum(stage_counts.values())
-
-            for i in range(pass_n):
-                tier = PASS_TIERS[i % len(PASS_TIERS)]
-                score = 88.0 if tier == EligibilityTier.highly_eligible else 72.0
-                await _add_completed(
-                    session,
-                    seeker_id=seeker.id,
-                    created_at=anchor + timedelta(hours=i),
-                    tier=tier,
-                    score=score,
-                )
-            for i in range(fail_n):
-                tier = FAIL_TIERS[i % len(FAIL_TIERS)]
-                score = 45.0 if tier == EligibilityTier.borderline else 25.0
-                await _add_completed(
-                    session,
-                    seeker_id=seeker.id,
-                    created_at=anchor + timedelta(hours=pass_n + i),
-                    tier=tier,
-                    score=score,
-                )
-            offset = pass_n + fail_n
-            for stage, count in stage_counts.items():
-                for j in range(count):
-                    await _add_abandoned(
-                        session,
-                        seeker_id=seeker.id,
-                        created_at=anchor + timedelta(hours=offset + j),
-                        questions=questions,
-                        drop_at_stage=stage,
-                    )
-                offset += count
-
+        prev_s, prev_c, prev_l, prev_b = await _seed_window(
+            session,
+            seeker_id=seeker.id,
+            advisor_id=advisor.id,
+            monthly=PREV_MONTHLY,
+            questions=questions,
+            make_funnel=True,
+        )
+        cur_s, cur_c, cur_l, cur_b = await _seed_window(
+            session,
+            seeker_id=seeker.id,
+            advisor_id=advisor.id,
+            monthly=CURRENT_MONTHLY,
+            questions=questions,
+            make_funnel=True,
+        )
         await session.commit()
-        completed = total_pass + total_fail
-        pass_rate = round(100 * total_pass / completed, 1) if completed else 0.0
-        fail_rate = round(100 * total_fail / completed, 1) if completed else 0.0
-        lines.append(f"started={total_started}")
-        lines.append(f"completed={completed} pass={total_pass} fail={total_fail}")
-        lines.append(f"abandoned={total_abandon}")
-        lines.append(f"approx_pass_rate={pass_rate} fail_rate={fail_rate}")
-        lines.append(f"months={len(MONTHLY_VOLUME)}")
+
+        lines.append(f"prev_window started={prev_s} completed={prev_c} leads={prev_l} bookings={prev_b}")
+        lines.append(f"curr_window started={cur_s} completed={cur_c} leads={cur_l} bookings={cur_b}")
+        lines.append(f"visa_types={','.join(vt.value for vt in VISA_TYPES)}")
         lines.append(f"seeker={SEEKER_EMAIL}")
+        lines.append(f"advisor={ADVISOR_EMAIL}")
     return lines
 
 
@@ -358,7 +461,7 @@ async def main() -> None:
             print(line)
         print()
         print("AI Analytics: GET /api/v1/admin/analytics/ai")
-        print("  default window: ?days=270 (8 months of volume)")
+        print("  default window: ?days=270")
     finally:
         await engine.dispose()
 

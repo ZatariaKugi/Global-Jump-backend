@@ -8,7 +8,9 @@ from typing import Literal
 from sqlalchemy import Select, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
+from app.core.file_storage import resolve_media_url
 from app.models.advisor_bookmark import AdvisorBookmark
 from app.models.advisor_profile import AdvisorProfile, AdvisorVisaSpecialization
 from app.models.user import User, UserRole, VerificationStatus
@@ -16,6 +18,7 @@ from app.models.visa_type import VisaType
 from app.schemas.bookmark import BookmarkRead
 from app.services import (
     advisor_matching_service,
+    advisor_profile_service,
     advisor_search_service,
     conversation_service,
     review_service,
@@ -177,6 +180,7 @@ async def build_list_reads(
     session: AsyncSession,
     seeker_id: uuid.UUID,
     bookmarks: list[AdvisorBookmark],
+    settings: Settings,
 ) -> list[BookmarkRead]:
     if not bookmarks:
         return []
@@ -227,10 +231,16 @@ async def build_list_reads(
                 advisor_id=advisor.id,
                 full_name=advisor.full_name,
                 email=advisor.email,
-                profile_photo_url=profile.profile_photo_url if profile else None,
+                profile_photo_url=resolve_media_url(
+                    profile.profile_photo_url if profile else None, settings
+                ),
                 expertise=expertise,
                 average_rating=avg,
                 years_of_experience=profile.years_of_experience if profile else None,
+                offered_services=(
+                    advisor_profile_service.offered_service_types(profile) if profile else []
+                ),
+                starting_price_usd=advisor_profile_service.starting_price_usd(profile),
                 match_percentage=match_percentage,
                 status=_advisor_status(advisor),
                 public_profile_slug=profile.public_profile_slug if profile else None,

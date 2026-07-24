@@ -13,13 +13,13 @@ from pydantic import BeforeValidator
 
 from app.models.visa_type import VisaType
 
-# Display label for each canonical enum member.
+# Display label for each canonical enum member (admin charts / UI copy).
 VISA_TYPE_LABELS: dict[VisaType, str] = {
-    VisaType.tourist: "Tourist Visa",
+    VisaType.student: "Study Visa",
     VisaType.work: "Work Visa",
-    VisaType.student: "Student Visa",
-    VisaType.pr: "PR",
-    VisaType.family: "Family",
+    VisaType.tourist: "Tourist Visa",
+    VisaType.pr: "Permanent Residency",
+    VisaType.family: "Family Sponsorship",
     VisaType.investment: "Investment Visa",
     VisaType.asylum: "Asylum",
 }

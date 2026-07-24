@@ -154,7 +154,8 @@ def advisor_order_by(
     """
     order_by: list[Any] = []
     if recommended:
-        # AI-suggested / featured advisors float to the top; secondary sort still applies.
+        # Prefer featured when no seeker match context; list_advisors re-sorts by
+        # AI match_percentage when destination/visa are known.
         order_by.append(func.coalesce(AdvisorProfile.is_featured, False).desc())
 
     if sort == "price_asc":

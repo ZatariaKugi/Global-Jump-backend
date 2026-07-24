@@ -4,17 +4,28 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.models.advisor_profile import AdvisorServiceType
 from app.models.booking import BookingStatus, PaymentStatus
 from app.schemas.booking_document_request import DocumentRequestRead
 from app.schemas.booking_note import BookingNoteRead
+from app.schemas.response import Meta
+
+# List sort: leading ``-`` = descending. Appointments default is ``-updated_at``.
+BookingSort = Literal[
+    "scheduled_start",
+    "-scheduled_start",
+    "updated_at",
+    "-updated_at",
+]
 
 
 class BookingCreate(BaseModel):
     advisor_id: uuid.UUID
-    service_type: str = Field(min_length=1, max_length=100)
+    service_type: AdvisorServiceType
     scheduled_start: datetime
     seeker_note: str | None = Field(default=None, max_length=1000)
 
@@ -23,15 +34,32 @@ class AdvisorBookingCreate(BaseModel):
     """Advisor books a consultation directly for one of their existing clients."""
 
     seeker_id: uuid.UUID
-    service_type: str = Field(min_length=1, max_length=100)
+    service_type: AdvisorServiceType
     scheduled_start: datetime
     seeker_note: str | None = Field(default=None, max_length=1000)
 
 
 class ClientRead(BaseModel):
+    """Advisor Clients table / picker row.
+
+    ``id`` and ``seeker_id`` are the same seeker user UUID (``id`` kept for the
+    calendar picker). Booking identifiers are separate when a booking exists.
+    """
+
     id: uuid.UUID
+    seeker_id: uuid.UUID
     full_name: str | None
     email: str
+    seeker_profile_photo_url: str | None = None
+    booking_id: uuid.UUID | None = None
+    # Human-readable appointment id (FE "consultation_number").
+    consultation_number: str | None = None
+    appointment_id: str | None = None
+    consultation_type: str | None = None
+    match_score: float | None = None
+    status: BookingStatus | None = None
+    # From the latest booking — drives Clients-table bookmark / red-dot.
+    is_important: bool = False
 
 
 class BookingReschedule(BaseModel):
@@ -63,9 +91,15 @@ class BookingRead(BaseModel):
     advisor_id: uuid.UUID
     seeker_name: str | None
     seeker_email: str | None
+    seeker_profile_photo_url: str | None
     advisor_name: str | None
+    advisor_email: str | None
+    advisor_profile_photo_url: str | None
     service_type: str
     duration_minutes: int
+    # ``price_usd`` is the total charge; fee split uses PLATFORM_COMMISSION_RATE.
+    advisor_fee_usd: float
+    platform_fee_usd: float
     price_usd: float
     scheduled_start: datetime
     scheduled_end: datetime
@@ -79,6 +113,16 @@ class BookingRead(BaseModel):
     interpreter_contact: str | None
     interpreter_language: str | None
     created_at: datetime
+    updated_at: datetime
+
+
+class BookingsListResponse(BaseModel):
+    """Appointments list + dedicated banner booking (do not use ``data[0]`` for Chat Now)."""
+
+    success: bool = True
+    data: list[BookingRead]
+    next_upcoming: BookingRead | None = None
+    meta: Meta = Field(default_factory=Meta)
 
 
 class BookingHistoryRead(BaseModel):

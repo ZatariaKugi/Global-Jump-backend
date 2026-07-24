@@ -242,7 +242,7 @@ async def get_advisor_detail(
 
 
 async def build_session_reads(
-    session: AsyncSession, bookings: list[Booking]
+    session: AsyncSession, bookings: list[Booking], settings: Settings
 ) -> list[AdvisorSessionRead]:
     """Session History tab — bulk seeker name + consultation counts (not N+1)."""
     if not bookings:
@@ -254,6 +254,11 @@ async def build_session_reads(
     seekers: dict[uuid.UUID, User] = {}
     rows = (await session.execute(select(User).where(User.id.in_(seeker_ids)))).scalars().all()
     seekers = {u.id: u for u in rows}
+
+    advisor = await session.get(User, advisor_id)
+    photos = await booking_service.advisor_photo_keys(session, {advisor_id})
+    photo_key = photos.get(advisor_id)
+    seeker_photos = await booking_service.seeker_photo_keys(session, set(seeker_ids))
 
     count_rows = (
         await session.execute(
@@ -275,7 +280,14 @@ async def build_session_reads(
 
     out: list[AdvisorSessionRead] = []
     for b in bookings:
-        base = booking_service.build_read(b, seekers.get(b.seeker_id), None)
+        base = booking_service.build_read(
+            b,
+            seekers.get(b.seeker_id),
+            advisor,
+            settings=settings,
+            advisor_profile_photo_key=photo_key,
+            seeker_profile_photo_key=seeker_photos.get(b.seeker_id),
+        )
         out.append(
             AdvisorSessionRead(
                 **base.model_dump(),

@@ -5,16 +5,19 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import Select, cast, func, or_, select
+from sqlalchemy import Select, and_, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.types import String
 
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
+from app.core.file_storage import resolve_media_url
 from app.core.visa_types import humanize_slug
+from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorProfile, AdvisorService
 from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus, PaymentStatus
 from app.models.booking_document_request import DocumentRequestStatus
+from app.models.seeker_profile import SeekerProfile
 from app.models.transaction import Transaction
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.booking import (
@@ -26,11 +29,14 @@ from app.schemas.booking import (
     BookingHistoryRead,
     BookingMeetingRead,
     BookingRead,
+    BookingSort,
+    ClientRead,
 )
 from app.services import availability_service, booking_document_service, booking_note_service
 from app.services.availability_service import as_utc
 
 DEFAULT_NOTICE_HOURS = 24
+_ACTIVE_UPCOMING = (BookingStatus.pending, BookingStatus.confirmed)
 
 
 async def _next_appointment_number(session: AsyncSession) -> int:
@@ -46,7 +52,17 @@ def appointment_id_str(booking: Booking) -> str:
     return str(booking.appointment_number)
 
 
-def build_read(booking: Booking, seeker: User | None, advisor: User | None) -> BookingRead:
+def build_read(
+    booking: Booking,
+    seeker: User | None,
+    advisor: User | None,
+    *,
+    settings: Settings,
+    advisor_profile_photo_key: str | None = None,
+    seeker_profile_photo_key: str | None = None,
+) -> BookingRead:
+    platform_fee = round(booking.price_usd * settings.PLATFORM_COMMISSION_RATE, 2)
+    advisor_fee = round(booking.price_usd - platform_fee, 2)
     return BookingRead(
         id=booking.id,
         appointment_id=appointment_id_str(booking),
@@ -54,9 +70,14 @@ def build_read(booking: Booking, seeker: User | None, advisor: User | None) -> B
         advisor_id=booking.advisor_id,
         seeker_name=seeker.full_name if seeker else None,
         seeker_email=seeker.email if seeker else None,
+        seeker_profile_photo_url=resolve_media_url(seeker_profile_photo_key, settings),
         advisor_name=advisor.full_name if advisor else None,
+        advisor_email=advisor.email if advisor else None,
+        advisor_profile_photo_url=resolve_media_url(advisor_profile_photo_key, settings),
         service_type=booking.service_type,
         duration_minutes=booking.duration_minutes,
+        advisor_fee_usd=advisor_fee,
+        platform_fee_usd=platform_fee,
         price_usd=booking.price_usd,
         scheduled_start=as_utc(booking.scheduled_start),
         scheduled_end=as_utc(booking.scheduled_end),
@@ -70,7 +91,44 @@ def build_read(booking: Booking, seeker: User | None, advisor: User | None) -> B
         interpreter_contact=booking.interpreter_contact,
         interpreter_language=booking.interpreter_language,
         created_at=booking.created_at,
+        updated_at=booking.updated_at,
     )
+
+
+async def advisor_photo_keys(
+    session: AsyncSession, advisor_ids: set[uuid.UUID]
+) -> dict[uuid.UUID, str | None]:
+    if not advisor_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(AdvisorProfile.user_id, AdvisorProfile.profile_photo_url).where(
+                AdvisorProfile.user_id.in_(advisor_ids)
+            )
+        )
+    ).all()
+    out: dict[uuid.UUID, str | None] = {}
+    for user_id, photo in rows:
+        out[user_id] = photo
+    return out
+
+
+async def seeker_photo_keys(
+    session: AsyncSession, seeker_ids: set[uuid.UUID]
+) -> dict[uuid.UUID, str | None]:
+    if not seeker_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(SeekerProfile.user_id, SeekerProfile.profile_photo_url).where(
+                SeekerProfile.user_id.in_(seeker_ids)
+            )
+        )
+    ).all()
+    out: dict[uuid.UUID, str | None] = {}
+    for user_id, photo in rows:
+        out[user_id] = photo
+    return out
 
 
 async def _resolve_advisor(session: AsyncSession, advisor_id: uuid.UUID) -> User:
@@ -131,7 +189,7 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
         raise AppError("Cannot book yourself", code="invalid_booking")
 
     await _resolve_advisor(session, data.advisor_id)
-    service = await _resolve_service(session, data.advisor_id, data.service_type)
+    service = await _resolve_service(session, data.advisor_id, str(data.service_type))
 
     start_utc = as_utc(data.scheduled_start)
     if start_utc <= datetime.now(UTC):
@@ -149,6 +207,8 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
         scheduled_start=start_utc,
         scheduled_end=end_utc,
         status=BookingStatus.pending,  # advisor must accept/reject before it's confirmed
+        # Surface new requests on the Clients table (bookmark / red-dot).
+        is_important=True,
         seeker_note=data.seeker_note,
         created_by=seeker.id,
     )
@@ -174,7 +234,7 @@ async def create_by_advisor(
     if seeker is None or seeker.role != UserRole.seeker or not seeker.is_active:
         raise NotFoundError("Client not found")
 
-    service = await _resolve_service(session, advisor.id, data.service_type)
+    service = await _resolve_service(session, advisor.id, str(data.service_type))
 
     start_utc = as_utc(data.scheduled_start)
     if start_utc <= datetime.now(UTC):
@@ -210,9 +270,16 @@ def list_for_user_stmt(
     date_to: date | None = None,
     service_types: list[str] | None = None,
     q: str | None = None,
+    sort: BookingSort = "-updated_at",
 ) -> Select[tuple[Booking]]:
     column = Booking.advisor_id if role == UserRole.advisor else Booking.seeker_id
-    stmt = select(Booking).where(column == user_id).order_by(Booking.scheduled_start.desc())
+    order_map = {
+        "scheduled_start": Booking.scheduled_start.asc(),
+        "-scheduled_start": Booking.scheduled_start.desc(),
+        "updated_at": Booking.updated_at.asc(),
+        "-updated_at": Booking.updated_at.desc(),
+    }
+    stmt = select(Booking).where(column == user_id).order_by(order_map[sort])
     if status is not None:
         stmt = stmt.where(Booking.status == status)
     if seeker_id is not None and role == UserRole.advisor:
@@ -233,8 +300,10 @@ def list_for_user_stmt(
         stmt = stmt.where(Booking.service_type.in_(service_types))
     if q:
         pattern = f"%{q.strip()}%"
-        # Search appointment ID, consultation type, and client name/email.
-        stmt = stmt.join(User, User.id == Booking.seeker_id).where(
+        # Advisor searches their clients; seeker searches the advisor side
+        # (name/email) — never the seeker's own name when role is seeker.
+        counterpart = Booking.seeker_id if role == UserRole.advisor else Booking.advisor_id
+        stmt = stmt.join(User, User.id == counterpart).where(
             or_(
                 cast(Booking.appointment_number, String).ilike(pattern),
                 Booking.service_type.ilike(pattern),
@@ -243,6 +312,23 @@ def list_for_user_stmt(
             )
         )
     return stmt
+
+
+async def get_next_upcoming(
+    session: AsyncSession, user_id: uuid.UUID, role: UserRole
+) -> Booking | None:
+    """Soonest pending/confirmed booking with ``scheduled_start`` >= now."""
+    column = Booking.advisor_id if role == UserRole.advisor else Booking.seeker_id
+    now = datetime.now(UTC)
+    result = await session.execute(
+        select(Booking)
+        .where(column == user_id)
+        .where(Booking.scheduled_start >= now)
+        .where(Booking.status.in_(_ACTIVE_UPCOMING))
+        .order_by(Booking.scheduled_start.asc())
+        .limit(1)
+    )
+    return result.scalars().first()
 
 
 async def get_for_party(
@@ -549,23 +635,126 @@ async def build_details(
     )
 
 
-def list_clients_stmt(advisor_id: uuid.UUID, q: str | None = None) -> Select[tuple[User]]:
+def list_clients_stmt(
+    advisor_id: uuid.UUID,
+    q: str | None = None,
+    *,
+    service_types: list[str] | None = None,
+    status: BookingStatus | None = None,
+) -> Select[tuple[User]]:
     """Distinct seekers with at least one prior booking with this advisor.
 
-    Powers the calendar's "Select Client" / "Search Client" picker — deliberately
-    scoped to existing clients only, not an open search across every seeker.
+    Powers the calendar's "Select Client" / "Search Client" picker and the
+    Clients table — deliberately scoped to existing clients only, not an open
+    search across every seeker.
+
+    When ``service_types`` / ``status`` are set, filter on the seeker's
+    *latest* booking (max ``scheduled_start``) with this advisor.
     """
+    latest_starts = (
+        select(
+            Booking.seeker_id.label("seeker_id"),
+            func.max(Booking.scheduled_start).label("max_start"),
+        )
+        .where(Booking.advisor_id == advisor_id)
+        .group_by(Booking.seeker_id)
+    ).subquery()
+
     stmt = (
         select(User)
         .join(Booking, Booking.seeker_id == User.id)
-        .where(Booking.advisor_id == advisor_id)
+        .join(
+            latest_starts,
+            and_(
+                Booking.seeker_id == latest_starts.c.seeker_id,
+                Booking.scheduled_start == latest_starts.c.max_start,
+                Booking.advisor_id == advisor_id,
+            ),
+        )
         .distinct()
         .order_by(User.full_name)
     )
     if q:
         pattern = f"%{q.strip()}%"
         stmt = stmt.where(or_(User.full_name.ilike(pattern), User.email.ilike(pattern)))
+    if service_types:
+        stmt = stmt.where(Booking.service_type.in_(service_types))
+    if status is not None:
+        stmt = stmt.where(Booking.status == status)
     return stmt
+
+
+async def build_client_reads(
+    session: AsyncSession,
+    advisor_id: uuid.UUID,
+    clients: list[User],
+    settings: Settings,
+) -> list[ClientRead]:
+    """Enrich client picker rows with latest booking + optional lead match_score."""
+    if not clients:
+        return []
+
+    seeker_ids = [c.id for c in clients]
+
+    bookings = (
+        (
+            await session.execute(
+                select(Booking)
+                .where(Booking.advisor_id == advisor_id)
+                .where(Booking.seeker_id.in_(seeker_ids))
+                .order_by(Booking.scheduled_start.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    latest_booking: dict[uuid.UUID, Booking] = {}
+    for booking in bookings:
+        if booking.seeker_id not in latest_booking:
+            latest_booking[booking.seeker_id] = booking
+
+    leads = (
+        (
+            await session.execute(
+                select(AdvisorLead)
+                .where(AdvisorLead.advisor_id == advisor_id)
+                .where(AdvisorLead.seeker_id.in_(seeker_ids))
+                .where(AdvisorLead.status != AdvisorLeadStatus.dismissed)
+                .order_by(AdvisorLead.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    latest_lead: dict[uuid.UUID, AdvisorLead] = {}
+    for lead in leads:
+        if lead.seeker_id not in latest_lead:
+            latest_lead[lead.seeker_id] = lead
+
+    photos = await seeker_photo_keys(session, set(seeker_ids))
+
+    rows: list[ClientRead] = []
+    for client in clients:
+        latest = latest_booking.get(client.id)
+        lead_row = latest_lead.get(client.id)
+        appt = appointment_id_str(latest) if latest is not None else None
+        rows.append(
+            ClientRead(
+                id=client.id,
+                seeker_id=client.id,
+                full_name=client.full_name,
+                email=client.email,
+                seeker_profile_photo_url=resolve_media_url(photos.get(client.id), settings),
+                booking_id=latest.id if latest is not None else None,
+                consultation_number=appt,
+                appointment_id=appt,
+                consultation_type=latest.service_type if latest is not None else None,
+                match_score=lead_row.match_score if lead_row is not None else None,
+                status=latest.status if latest is not None else None,
+                is_important=latest.is_important if latest is not None else False,
+            )
+        )
+    return rows
 
 
 async def has_client_relationship(

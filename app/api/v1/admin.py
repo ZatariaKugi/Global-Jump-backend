@@ -466,13 +466,14 @@ async def list_advisor_sessions(
     advisor_id: uuid.UUID,
     params: PaginationDep,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     status: BookingStatus | None = None,
 ) -> ResponseEnvelope[list[AdvisorSessionRead]]:
     """Detail page's Session History tab."""
     stmt = booking_service.list_for_user_stmt(advisor_id, UserRole.advisor, status=status)
     bookings, total = await paginate(session, stmt, params)
-    data = await advisor_admin_service.build_session_reads(session, bookings)
+    data = await advisor_admin_service.build_session_reads(session, bookings, settings)
     return ResponseEnvelope[list[AdvisorSessionRead]](
         data=data, meta=page_meta(params, total, request_id)
     )
@@ -500,12 +501,13 @@ async def list_advisor_earnings_transactions(
     advisor_id: uuid.UUID,
     params: PaginationDep,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[TransactionFinanceRead]]:
     """Detail page's Earnings tab — transaction history sub-list."""
     stmt = payment_service.list_for_advisor_stmt(advisor_id)
     txns, total = await paginate(session, stmt, params)
-    data = [await payment_service.finance_read(session, t) for t in txns]
+    data = [await payment_service.finance_read(session, t, settings) for t in txns]
     return ResponseEnvelope[list[TransactionFinanceRead]](
         data=data, meta=page_meta(params, total, request_id)
     )
@@ -1147,6 +1149,7 @@ async def get_payments_summary(
 async def list_all_payments(
     params: PaginationDep,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     status: TransactionStatus | None = None,
     date_from: datetime | None = None,
@@ -1156,7 +1159,7 @@ async def list_all_payments(
     """Full transaction list across the platform, optionally filtered."""
     stmt = payment_service.list_all_stmt(status, date_from, date_to, search)
     txns, total = await paginate(session, stmt, params)
-    data = [await payment_service.finance_read(session, t) for t in txns]
+    data = [await payment_service.finance_read(session, t, settings) for t in txns]
     return ResponseEnvelope[list[TransactionFinanceRead]](
         data=data,
         meta=page_meta(params, total, request_id),
@@ -1167,11 +1170,12 @@ async def list_all_payments(
 async def get_payment(
     transaction_id: uuid.UUID,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[TransactionFinanceRead]:
     """Transaction Information modal — full detail with customer/advisor parties."""
     txn = await payment_service.get_by_id(session, transaction_id)
-    data = await payment_service.finance_read(session, txn)
+    data = await payment_service.finance_read(session, txn, settings)
     return ResponseEnvelope[TransactionFinanceRead](
         data=data,
         meta=Meta(request_id=request_id),
@@ -1218,16 +1222,25 @@ async def send_payment_receipt(
     "/payments/{transaction_id}/timeline",
     response_model=ResponseEnvelope[list[TransactionEventRead]],
 )
+@router.get(
+    "/payments/{transaction_id}/logs",
+    response_model=ResponseEnvelope[list[TransactionEventRead]],
+    include_in_schema=True,
+)
 async def get_payment_timeline(
     transaction_id: uuid.UUID,
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[TransactionEventRead]]:
-    """Timeline & Logs modal — ordered lifecycle events for a transaction."""
+    """Timeline & Logs modal — same ordered events for both tabs.
+
+    Logs table columns: ``occurred_at`` (TimeStamp), ``title`` + ``description``
+    (Event), ``source``, ``status``.
+    """
     await payment_service.get_by_id(session, transaction_id)  # 404s if missing
     events = await payment_service.list_events(session, transaction_id)
     return ResponseEnvelope[list[TransactionEventRead]](
-        data=[TransactionEventRead.model_validate(e) for e in events],
+        data=[TransactionEventRead.build(e) for e in events],
         meta=Meta(request_id=request_id),
     )
 
@@ -1248,7 +1261,7 @@ async def refund_payment(
     txn = await payment_service.refund_transaction(
         session, transaction_id, principal.id, body.reason, settings, body.amount_usd
     )
-    data = await payment_service.finance_read(session, txn)
+    data = await payment_service.finance_read(session, txn, settings)
     return ResponseEnvelope[TransactionFinanceRead](
         data=data,
         meta=Meta(request_id=request_id),
@@ -1308,10 +1321,20 @@ async def list_flagged_messages(
     """Moderation queue: messages reported by users, awaiting a decision."""
     stmt = conversation_service.list_flagged_stmt()
     messages, total = await paginate(session, stmt, params)
+    photos = await conversation_service.profile_photo_keys(
+        session, list({m.sender_id for m in messages})
+    )
     data = []
     for message in messages:
         sender = await session.get(User, message.sender_id)
-        data.append(conversation_service.build_flagged_read(message, sender, settings))
+        data.append(
+            conversation_service.build_flagged_read(
+                message,
+                sender,
+                settings,
+                sender_photo_key=photos.get(message.sender_id),
+            )
+        )
     return ResponseEnvelope[list[FlaggedMessageRead]](
         data=data,
         meta=page_meta(params, total, request_id),
@@ -1334,8 +1357,14 @@ async def moderate_message(
     message = await conversation_service.get_by_id(session, message_id)
     message = await conversation_service.moderate(session, message, body.action, principal.id)
     sender = await session.get(User, message.sender_id)
+    photos = await conversation_service.profile_photo_keys(session, [message.sender_id])
     return ResponseEnvelope[FlaggedMessageRead](
-        data=conversation_service.build_flagged_read(message, sender, settings),
+        data=conversation_service.build_flagged_read(
+            message,
+            sender,
+            settings,
+            sender_photo_key=photos.get(message.sender_id),
+        ),
         meta=Meta(request_id=request_id),
     )
 

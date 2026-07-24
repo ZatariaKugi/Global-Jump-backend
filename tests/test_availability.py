@@ -29,7 +29,11 @@ async def _setup_advisor(client: AsyncClient, engine, email: str = "avail@test.c
         "Avail Advisor",
         {
             "services": [
-                {"service_type": "consultation_30", "duration_minutes": 30, "price_usd": 50.0}
+                {
+                    "service_type": "immigration_specialist",
+                    "duration_minutes": 30,
+                    "price_usd": 50.0,
+                }
             ]
         },
     )

@@ -25,6 +25,8 @@ class CheckoutResponse(BaseModel):
 
 class PaymentConfigRead(BaseModel):
     publishable_key: str | None
+    # FE derives platform fee = price * platform_commission_rate before checkout.
+    platform_commission_rate: float
 
 
 class TransactionRead(BaseModel):
@@ -68,6 +70,9 @@ class TransactionFinanceRead(TransactionAdminRead):
     seeker_email: str | None = None
     advisor_email: str | None = None
     seeker_country: str | None = None
+    # Fully-qualified (presigned S3 or absolute) URLs for Next.js <Image>; null → initials.
+    seeker_photo_url: str | None = None
+    advisor_photo_url: str | None = None
 
 
 class TransactionAdvisorRead(TransactionRead):
@@ -101,6 +106,7 @@ class SeekerPaymentRead(BaseModel):
     platform_fee_usd: float
     consultant_fee_usd: float
     amount_usd: float
+    total_amount: float  # same as amount_usd — grand total charged (FE column name)
     status: TransactionStatus
     display_status: PaymentDisplayStatus
     payment_method: str
@@ -161,9 +167,11 @@ class InvoiceRead(BaseModel):
     booking_id: uuid.UUID
     from_name: str
     from_address: str | None = None
+    from_phone: str | None = None
     to_name: str | None
     to_email: str
     to_address: str | None = None
+    to_phone: str | None = None
     line_items: list[InvoiceLineItem]
     subtotal_usd: float
     tax_usd: float

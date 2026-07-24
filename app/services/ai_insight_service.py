@@ -176,7 +176,7 @@ def _build_user_prompt(
     lines.append("")
     lines.append("Questionnaire answers:")
     for question, option in answered:
-        category = question.category.value
+        category = question.category.value if question.category is not None else "uncategorized"
         score_note = (
             f" (category score {cat_scores[category]}/100)" if category in cat_scores else ""
         )

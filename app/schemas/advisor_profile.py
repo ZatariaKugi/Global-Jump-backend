@@ -34,7 +34,7 @@ class LanguageEntry(BaseModel):
 class ServiceOffering(BaseModel):
     """Bookable offering (duration + price) — managed via profile, not onboarding."""
 
-    service_type: str = Field(min_length=1, max_length=100)
+    service_type: AdvisorServiceType
     duration_minutes: int = Field(ge=15, le=480)
     price_usd: float = Field(ge=0)
 
@@ -85,6 +85,7 @@ class AdvisorProfileRead(BaseModel):
     country_expertise: list[str]
     languages: list[LanguageEntry]
     services: list[ServiceOffering]
+    starting_price_usd: float | None = None
     is_featured: bool
     public_profile_slug: str | None
     # Read-only / derived
@@ -230,6 +231,7 @@ class AdvisorProfilePublicRead(BaseModel):
     country_expertise: list[str]
     languages: list[LanguageEntry]
     services: list[ServiceOffering]
+    starting_price_usd: float | None = None
     is_featured: bool
     public_profile_slug: str | None
     match_percentage: int | None = None  # 0–100 for seeker; null without destination/visa context

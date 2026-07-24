@@ -3,22 +3,33 @@
 from __future__ import annotations
 
 import uuid
+from collections import defaultdict
 from datetime import UTC, datetime
 
-from sqlalchemy import Select, select
+from sqlalchemy import ColumnElement, Select, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.core.exceptions import NotFoundError
-from app.core.file_storage import resolve_url
-from app.models.seeker_document import SeekerDocument, SeekerDocumentComment
-from app.models.user import User
+from app.core.exceptions import ConflictError, NotFoundError
+from app.core.file_storage import resolve_media_url, resolve_url
+from app.models.booking import Booking
+from app.models.seeker_document import (
+    SeekerDocument,
+    SeekerDocumentComment,
+    SeekerDocumentStatus,
+)
+from app.models.user import User, UserRole
+from app.schemas.booking import BookingSort
 from app.schemas.seeker_document import (
+    ClientSeekerBrief,
+    CustomerDocumentsRowRead,
+    CustomerDocumentsRowStatus,
     DocumentCommentRead,
     SeekerDocumentCreate,
     SeekerDocumentRead,
     SeekerDocumentStatusUpdate,
 )
+from app.services import booking_service
 
 
 async def create(
@@ -80,6 +91,32 @@ async def set_status(
     return document
 
 
+async def is_portfolio_completed(session: AsyncSession, seeker_id: uuid.UUID) -> bool:
+    """True when the seeker has ≥1 active doc and every doc is approved."""
+    rows = list(
+        (
+            await session.execute(
+                select(SeekerDocument.status).where(
+                    SeekerDocument.seeker_id == seeker_id,
+                    SeekerDocument.is_archived.is_(False),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return bool(rows) and all(s == SeekerDocumentStatus.approved for s in rows)
+
+
+async def assert_portfolio_editable(session: AsyncSession, seeker_id: uuid.UUID) -> None:
+    """Block review mutations once the portfolio is fully approved (completed)."""
+    if await is_portfolio_completed(session, seeker_id):
+        raise ConflictError(
+            "All documents are approved; this portfolio is locked",
+            code="portfolio_completed",
+        )
+
+
 async def add_comment(
     session: AsyncSession, document: SeekerDocument, author_id: uuid.UUID, body: str
 ) -> SeekerDocumentComment:
@@ -119,6 +156,22 @@ def build_read(document: SeekerDocument, settings: Settings) -> SeekerDocumentRe
     )
 
 
+async def build_client_seeker_brief(
+    session: AsyncSession, seeker_id: uuid.UUID, settings: Settings
+) -> ClientSeekerBrief | None:
+    """Seeker name/email/photo for the client-documents detail header."""
+    seeker = await session.get(User, seeker_id)
+    if seeker is None:
+        return None
+    photos = await booking_service.seeker_photo_keys(session, {seeker_id})
+    return ClientSeekerBrief(
+        seeker_id=seeker.id,
+        seeker_name=seeker.full_name,
+        seeker_email=seeker.email,
+        seeker_profile_photo_url=resolve_media_url(photos.get(seeker.id), settings),
+    )
+
+
 def build_comment_read(comment: SeekerDocumentComment, author: User | None) -> DocumentCommentRead:
     return DocumentCommentRead(
         id=comment.id,
@@ -128,3 +181,174 @@ def build_comment_read(comment: SeekerDocumentComment, author: User | None) -> D
         body=comment.body,
         created_at=comment.created_at,
     )
+
+
+def _row_documents_status(
+    count: int, under_review: int, approved: int, rejected: int
+) -> CustomerDocumentsRowStatus:
+    """Map portfolio tallies to the FE Pending / Completed / Rejected badge."""
+    if count == 0:
+        return "pending"
+    if under_review > 0:
+        return "pending"
+    if rejected == count:
+        return "rejected"
+    if approved == count:
+        return "completed"
+    return "pending"
+
+
+def _portfolio_has_docs_clause() -> ColumnElement[bool]:
+    return exists(
+        select(SeekerDocument.id).where(
+            SeekerDocument.seeker_id == Booking.seeker_id,
+            SeekerDocument.is_archived.is_(False),
+        )
+    )
+
+
+def _portfolio_completed_clause() -> ColumnElement[bool]:
+    """Seeker has ≥1 doc and none under_review/rejected (all approved)."""
+    has_open = exists(
+        select(SeekerDocument.id).where(
+            SeekerDocument.seeker_id == Booking.seeker_id,
+            SeekerDocument.is_archived.is_(False),
+            SeekerDocument.status.in_(
+                (SeekerDocumentStatus.under_review, SeekerDocumentStatus.rejected)
+            ),
+        )
+    )
+    return _portfolio_has_docs_clause() & ~has_open
+
+
+def _portfolio_rejected_clause() -> ColumnElement[bool]:
+    """Seeker has ≥1 doc, none under_review, and every doc is rejected."""
+    has_under_review = exists(
+        select(SeekerDocument.id).where(
+            SeekerDocument.seeker_id == Booking.seeker_id,
+            SeekerDocument.is_archived.is_(False),
+            SeekerDocument.status == SeekerDocumentStatus.under_review,
+        )
+    )
+    has_non_rejected = exists(
+        select(SeekerDocument.id).where(
+            SeekerDocument.seeker_id == Booking.seeker_id,
+            SeekerDocument.is_archived.is_(False),
+            SeekerDocument.status != SeekerDocumentStatus.rejected,
+        )
+    )
+    return _portfolio_has_docs_clause() & ~has_under_review & ~has_non_rejected
+
+
+def list_customer_documents_stmt(
+    advisor_id: uuid.UUID,
+    *,
+    q: str | None = None,
+    service_types: list[str] | None = None,
+    documents_status: CustomerDocumentsRowStatus | None = None,
+    sort: BookingSort = "-scheduled_start",
+) -> Select[tuple[Booking]]:
+    """Advisor bookings that back the Documents-of-customers table (one row each)."""
+    stmt = booking_service.list_for_user_stmt(
+        advisor_id,
+        UserRole.advisor,
+        status=None,
+        seeker_id=None,
+        date_from=None,
+        date_to=None,
+        service_types=service_types,
+        q=q,
+        sort=sort,
+    )
+    if documents_status == "completed":
+        stmt = stmt.where(_portfolio_completed_clause())
+    elif documents_status == "rejected":
+        stmt = stmt.where(_portfolio_rejected_clause())
+    elif documents_status == "pending":
+        stmt = stmt.where(
+            ~_portfolio_completed_clause() & ~_portfolio_rejected_clause()
+        )
+    return stmt
+
+
+async def build_customer_document_rows(
+    session: AsyncSession,
+    bookings: list[Booking],
+    settings: Settings,
+) -> list[CustomerDocumentsRowRead]:
+    """Enrich bookings with seeker identity + portfolio document tallies."""
+    if not bookings:
+        return []
+
+    seeker_ids = list({b.seeker_id for b in bookings})
+    seekers = {
+        u.id: u
+        for u in (await session.execute(select(User).where(User.id.in_(seeker_ids))))
+        .scalars()
+        .all()
+    }
+    photos = await booking_service.seeker_photo_keys(session, set(seeker_ids))
+
+    doc_rows = (
+        await session.execute(
+            select(
+                SeekerDocument.seeker_id,
+                SeekerDocument.status,
+                func.count(),
+                func.max(SeekerDocument.updated_at),
+            )
+            .where(
+                SeekerDocument.seeker_id.in_(seeker_ids),
+                SeekerDocument.is_archived.is_(False),
+            )
+            .group_by(SeekerDocument.seeker_id, SeekerDocument.status)
+        )
+    ).all()
+
+    counts: dict[uuid.UUID, dict[str, int]] = defaultdict(
+        lambda: {"total": 0, "under_review": 0, "approved": 0, "rejected": 0}
+    )
+    latest_doc_at: dict[uuid.UUID, datetime] = {}
+    for seeker_id, status, n, max_updated in doc_rows:
+        bucket = counts[seeker_id]
+        bucket["total"] += int(n)
+        if status == SeekerDocumentStatus.under_review:
+            bucket["under_review"] += int(n)
+        elif status == SeekerDocumentStatus.approved:
+            bucket["approved"] += int(n)
+        elif status == SeekerDocumentStatus.rejected:
+            bucket["rejected"] += int(n)
+        if max_updated is not None:
+            prev = latest_doc_at.get(seeker_id)
+            if prev is None or max_updated > prev:
+                latest_doc_at[seeker_id] = max_updated
+
+    rows: list[CustomerDocumentsRowRead] = []
+    for booking in bookings:
+        seeker = seekers.get(booking.seeker_id)
+        if seeker is None:
+            continue
+        tallies = counts[booking.seeker_id]
+        status = _row_documents_status(
+            tallies["total"],
+            tallies["under_review"],
+            tallies["approved"],
+            tallies["rejected"],
+        )
+        updated = latest_doc_at.get(booking.seeker_id) or booking.updated_at or booking.created_at
+        rows.append(
+            CustomerDocumentsRowRead(
+                booking_id=booking.id,
+                appointment_id=booking_service.appointment_id_str(booking),
+                seeker_id=seeker.id,
+                seeker_name=seeker.full_name,
+                seeker_email=seeker.email,
+                seeker_profile_photo_url=resolve_media_url(photos.get(seeker.id), settings),
+                service_type=booking.service_type,
+                booking_status=booking.status,
+                documents_count=tallies["total"],
+                documents_status=status,
+                updated_at=updated,
+            )
+        )
+    return rows

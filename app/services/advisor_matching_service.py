@@ -22,6 +22,7 @@ from app.models.seeker_profile import SeekerProfile
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.assessment import AdvisorMatchRead
 from app.services import matching_weights_service, review_service
+from app.services.advisor_profile_service import starting_price_usd
 from app.services.matching_weights_service import DEFAULT_CONFIG, MatchingWeightConfig
 
 DEFAULT_LIMIT = 5
@@ -117,9 +118,17 @@ def match_percentage(
 
 
 async def match(
-    session: AsyncSession, assessment: Assessment, limit: int = DEFAULT_LIMIT
-) -> list[AdvisorMatchRead]:
-    """Rank approved advisors for the assessment's destination and visa type."""
+    session: AsyncSession,
+    assessment: Assessment,
+    *,
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+) -> tuple[list[AdvisorMatchRead], int]:
+    """Rank approved advisors for the assessment's destination and visa type.
+
+    Returns ``(page_items, total_matching)`` so callers can embed a short list
+    on the assessment result or paginate via a dedicated endpoint.
+    """
     weights = await matching_weights_service.get_config(session)
     stmt = (
         select(User, AdvisorProfile)
@@ -147,9 +156,12 @@ async def match(
         AdvisorMatchRead(
             user_id=user.id,
             full_name=user.full_name,
+            email=user.email,
             title=profile.title,
             profile_photo_url=profile.profile_photo_url,
             years_of_experience=profile.years_of_experience,
+            average_rating=ratings[user.id][0] if user.id in ratings else None,
+            starting_price_usd=starting_price_usd(profile),
             match_score=score_advisor_for_assessment(
                 profile,
                 assessment.destination_country,
@@ -164,4 +176,7 @@ async def match(
     ]
     matches = [m for m in matches if m.match_score > 0]
     matches.sort(key=lambda m: m.match_score, reverse=True)
-    return matches[:limit]
+    total = len(matches)
+    if limit <= 0:
+        return [], total
+    return matches[offset : offset + limit], total

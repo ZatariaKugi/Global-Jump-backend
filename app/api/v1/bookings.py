@@ -10,9 +10,11 @@ from fastapi import APIRouter, Query
 
 from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.api.pagination import PaginationDep, page_meta, paginate
+from app.core.config import Settings
 from app.core.exceptions import PermissionDeniedError
 from app.core.file_storage import resolve_url
 from app.db.session import SessionDep
+from app.models.advisor_profile import AdvisorServiceType
 from app.models.booking import Booking, BookingStatus
 from app.models.booking_note import BookingNoteAttachment
 from app.models.user import User
@@ -26,6 +28,8 @@ from app.schemas.booking import (
     BookingRead,
     BookingReject,
     BookingReschedule,
+    BookingsListResponse,
+    BookingSort,
 )
 from app.schemas.booking_document_request import (
     DocumentRequestCreate,
@@ -52,8 +56,42 @@ async def _party_names(session: SessionDep, booking: Booking) -> tuple[User | No
     return seeker, advisor
 
 
-def _read(booking: Booking, seeker: User | None, advisor: User | None) -> BookingRead:
-    return booking_service.build_read(booking, seeker, advisor)
+def _read(
+    booking: Booking,
+    seeker: User | None,
+    advisor: User | None,
+    settings: Settings,
+    *,
+    advisor_profile_photo_key: str | None = None,
+    seeker_profile_photo_key: str | None = None,
+) -> BookingRead:
+    return booking_service.build_read(
+        booking,
+        seeker,
+        advisor,
+        settings=settings,
+        advisor_profile_photo_key=advisor_profile_photo_key,
+        seeker_profile_photo_key=seeker_profile_photo_key,
+    )
+
+
+async def _read_booking(
+    session: SessionDep,
+    booking: Booking,
+    seeker: User | None,
+    advisor: User | None,
+    settings: Settings,
+) -> BookingRead:
+    advisor_photos = await booking_service.advisor_photo_keys(session, {booking.advisor_id})
+    seeker_photos = await booking_service.seeker_photo_keys(session, {booking.seeker_id})
+    return _read(
+        booking,
+        seeker,
+        advisor,
+        settings,
+        advisor_profile_photo_key=advisor_photos.get(booking.advisor_id),
+        seeker_profile_photo_key=seeker_photos.get(booking.seeker_id),
+    )
 
 
 async def _send_confirmations(session: SessionDep, booking: Booking, settings: SettingsDep) -> None:
@@ -124,43 +162,106 @@ async def create_booking(
     await _send_new_request_notification(session, booking, settings)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
 
-@router.get("", response_model=ResponseEnvelope[list[BookingRead]])
+@router.get("", response_model=BookingsListResponse)
 async def list_my_bookings(
     params: PaginationDep,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     status: BookingStatus | None = None,
     seeker_id: uuid.UUID | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
-    service_type: Annotated[list[str] | None, Query()] = None,
+    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
     q: Annotated[
         str | None,
-        Query(max_length=100, description="Search appointment ID, client name/email, type"),
+        Query(
+            max_length=100,
+            description=(
+                "Search appointment ID, service_type, and counterpart name/email "
+                "(advisor→client when advisor; advisor when seeker)"
+            ),
+        ),
     ] = None,
-) -> ResponseEnvelope[list[BookingRead]]:
+    sort: Annotated[BookingSort, Query()] = "-updated_at",
+) -> BookingsListResponse:
+    """Appointments table (newest ``updated_at`` first) + ``next_upcoming`` for Chat Now.
+
+    ``next_upcoming`` is the soonest pending/confirmed booking with
+    ``scheduled_start >= now`` — independent of list filters/sort. Do not use
+    ``data[0]`` for the banner.
+    """
     role = current_user.role
+    types = [t.value for t in service_type] if service_type else None
     stmt = booking_service.list_for_user_stmt(
-        current_user.id, role, status, seeker_id, date_from, date_to, service_type, q
+        current_user.id, role, status, seeker_id, date_from, date_to, types, q, sort
     )
     bookings, total = await paginate(session, stmt, params)
 
+    next_booking = await booking_service.get_next_upcoming(
+        session, current_user.id, role
+    )
+
     user_ids = {b.seeker_id for b in bookings} | {b.advisor_id for b in bookings}
+    if next_booking is not None:
+        user_ids.add(next_booking.seeker_id)
+        user_ids.add(next_booking.advisor_id)
     users: dict[uuid.UUID, User] = {}
     for uid in user_ids:
         user = await session.get(User, uid)
         if user is not None:
             users[uid] = user
 
-    return ResponseEnvelope[list[BookingRead]](
-        data=[_read(b, users.get(b.seeker_id), users.get(b.advisor_id)) for b in bookings],
+    advisor_ids = {b.advisor_id for b in bookings}
+    seeker_ids = {b.seeker_id for b in bookings}
+    if next_booking is not None:
+        advisor_ids.add(next_booking.advisor_id)
+        seeker_ids.add(next_booking.seeker_id)
+    photos = await booking_service.advisor_photo_keys(session, advisor_ids)
+    seeker_photos = await booking_service.seeker_photo_keys(session, seeker_ids)
+
+    def _row(b: Booking) -> BookingRead:
+        return _read(
+            b,
+            users.get(b.seeker_id),
+            users.get(b.advisor_id),
+            settings,
+            advisor_profile_photo_key=photos.get(b.advisor_id),
+            seeker_profile_photo_key=seeker_photos.get(b.seeker_id),
+        )
+
+    return BookingsListResponse(
+        data=[_row(b) for b in bookings],
+        next_upcoming=_row(next_booking) if next_booking is not None else None,
         meta=page_meta(params, total, request_id),
+    )
+
+
+@router.get("/next", response_model=ResponseEnvelope[BookingRead | None])
+async def get_next_upcoming_booking(
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[BookingRead | None]:
+    """Next pending/confirmed meeting for banner — soonest ``scheduled_start`` >= now."""
+    booking = await booking_service.get_next_upcoming(
+        session, current_user.id, current_user.role
+    )
+    if booking is None:
+        return ResponseEnvelope[BookingRead | None](
+            data=None, meta=Meta(request_id=request_id)
+        )
+    seeker, advisor = await _party_names(session, booking)
+    return ResponseEnvelope[BookingRead | None](
+        data=await _read_booking(session, booking, seeker, advisor, settings),
+        meta=Meta(request_id=request_id),
     )
 
 
@@ -169,12 +270,13 @@ async def get_booking(
     booking_id: uuid.UUID,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -206,7 +308,7 @@ async def accept_booking(
     await _send_confirmations(session, booking, settings)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -225,7 +327,7 @@ async def reject_booking(
     await _send_rejection_notification(session, booking, settings)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -235,6 +337,7 @@ async def deal_later_booking(
     booking_id: uuid.UUID,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
     """Defer Accept/Reject on a pending consultation request (Booking Detail "Deal Later")."""
@@ -242,7 +345,7 @@ async def deal_later_booking(
     booking = await booking_service.deal_later(session, booking, current_user.id)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -270,6 +373,7 @@ async def update_booking_important(
     data: BookingImportantUpdate,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
@@ -278,7 +382,7 @@ async def update_booking_important(
     )
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -289,6 +393,7 @@ async def update_booking_interpreter(
     data: BookingInterpreterUpdate,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
@@ -297,7 +402,7 @@ async def update_booking_interpreter(
     )
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -308,13 +413,14 @@ async def cancel_booking(
     data: BookingCancel,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
     booking = await booking_service.cancel(session, booking, current_user.id, data.reason)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -335,7 +441,7 @@ async def reschedule_booking(
     await _send_confirmations(session, booking, settings)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -345,13 +451,14 @@ async def complete_booking(
     booking_id: uuid.UUID,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
     booking = await booking_service.complete(session, booking, current_user.id)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -361,13 +468,14 @@ async def mark_booking_no_show(
     booking_id: uuid.UUID,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
     booking = await booking_service.mark_no_show(session, booking, current_user.id)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=_read(booking, seeker, advisor),
+        data=await _read_booking(session, booking, seeker, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 

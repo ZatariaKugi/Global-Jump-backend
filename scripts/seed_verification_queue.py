@@ -54,7 +54,7 @@ QUEUE_ADVISORS: list[dict[str, Any]] = [
         "specializations": ["student", "work"],
         "countries": ["CA"],
         "languages": [("English", "fluent"), ("Arabic", "native")],
-        "services": [("consultation", 30, 45.0)],
+        "services": [("immigration_specialist", 30, 45.0)],
         "verification_status": VerificationStatus.under_review,
         "document_types": [
             DocumentType.government_id,
@@ -75,7 +75,7 @@ QUEUE_ADVISORS: list[dict[str, Any]] = [
         "specializations": ["family", "work"],
         "countries": ["US", "MX"],
         "languages": [("English", "fluent"), ("Spanish", "native")],
-        "services": [("consultation", 30, 65.0)],
+        "services": [("career_coach", 30, 65.0)],
         "verification_status": VerificationStatus.under_review,
         "document_types": [
             DocumentType.government_id,
@@ -94,7 +94,7 @@ QUEUE_ADVISORS: list[dict[str, Any]] = [
         "specializations": ["work", "student"],
         "countries": ["GB"],
         "languages": [("English", "fluent"), ("Mandarin", "native")],
-        "services": [("consultation", 30, 50.0)],
+        "services": [("resume_writer", 30, 50.0)],
         "verification_status": VerificationStatus.pending,
         "document_types": [
             DocumentType.government_id,
