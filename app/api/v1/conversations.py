@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
@@ -15,6 +16,7 @@ from app.core.exceptions import AppError, PermissionDeniedError
 from app.core.file_storage import storage_path_from_key
 from app.core.security import decode_token
 from app.db.session import SessionDep
+from app.models.conversation import Conversation
 from app.models.message import Message, MessageAttachment
 from app.models.user import User
 from app.schemas.conversation import (
@@ -28,7 +30,7 @@ from app.schemas.conversation import (
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.token import TokenPayload
 from app.services import conversation_service, user_service
-from app.services.ws_manager import manager
+from app.services.ws_manager import inbox_manager, manager
 
 router = APIRouter(tags=["conversations"])
 
@@ -40,6 +42,27 @@ async def _resolve_senders(session: AsyncSession, messages: list[Message]) -> di
         if user is not None:
             senders[sender_id] = user
     return senders
+
+
+async def _inbox_push_to_participants(
+    session: AsyncSession,
+    conversation: Conversation,
+    *,
+    event_type: str,
+    base_payload: dict[str, Any],
+) -> None:
+    """Send a per-user inbox event (includes that user's ``unread_count``)."""
+    for user_id in (conversation.seeker_id, conversation.advisor_id):
+        unread = await conversation_service.unread_count(session, conversation.id, user_id)
+        await inbox_manager.send_user(
+            user_id,
+            {
+                **base_payload,
+                "type": event_type,
+                "conversation_id": str(conversation.id),
+                "unread_count": unread,
+            },
+        )
 
 
 @router.post("/conversations", status_code=201, response_model=ResponseEnvelope[ConversationRead])
@@ -157,9 +180,22 @@ async def send_message(
         settings,
         sender_photo_key=photos.get(current_user.id),
     )
+    encoded = jsonable_encoder(message_read)
 
-    await manager.broadcast(
-        conversation_id, {"type": "message", "data": jsonable_encoder(message_read)}
+    await manager.broadcast(conversation_id, {"type": "message", "data": encoded})
+    await _inbox_push_to_participants(
+        session,
+        conversation,
+        event_type="inbox_message",
+        base_payload={
+            "preview": conversation_service.message_preview(message),
+            "data": encoded,
+            "last_message_at": (
+                conversation.last_message_at.isoformat()
+                if conversation.last_message_at
+                else None
+            ),
+        },
     )
 
     return ResponseEnvelope[MessageRead](data=message_read, meta=Meta(request_id=request_id))
@@ -184,14 +220,24 @@ async def mark_message_read(
         sender_photo_key=photos.get(message.sender_id),
     )
 
-    await manager.broadcast(
-        message.conversation_id,
-        {
-            "type": "read",
-            "message_id": str(message.id),
-            "read_at": data.read_at.isoformat() if data.read_at else None,
-        },
-    )
+    read_payload = {
+        "type": "read",
+        "message_id": str(message.id),
+        "read_at": data.read_at.isoformat() if data.read_at else None,
+    }
+    await manager.broadcast(message.conversation_id, read_payload)
+
+    conversation = await session.get(Conversation, message.conversation_id)
+    if conversation is not None:
+        await _inbox_push_to_participants(
+            session,
+            conversation,
+            event_type="inbox_read",
+            base_payload={
+                "message_id": str(message.id),
+                "read_at": data.read_at.isoformat() if data.read_at else None,
+            },
+        )
 
     return ResponseEnvelope[MessageRead](data=data, meta=Meta(request_id=request_id))
 
@@ -214,11 +260,30 @@ async def edit_message(
         settings,
         sender_photo_key=photos.get(current_user.id),
     )
+    encoded = jsonable_encoder(message_read)
 
     await manager.broadcast(
         message.conversation_id,
-        {"type": "message_edited", "data": jsonable_encoder(message_read)},
+        {"type": "message_edited", "data": encoded},
     )
+
+    conversation = await session.get(Conversation, message.conversation_id)
+    if conversation is not None:
+        last = await conversation_service.last_message(session, conversation.id)
+        await _inbox_push_to_participants(
+            session,
+            conversation,
+            event_type="inbox_message_edited",
+            base_payload={
+                "preview": conversation_service.message_preview(last),
+                "data": encoded,
+                "last_message_at": (
+                    conversation.last_message_at.isoformat()
+                    if conversation.last_message_at
+                    else None
+                ),
+            },
+        )
 
     return ResponseEnvelope[MessageRead](data=message_read, meta=Meta(request_id=request_id))
 
@@ -236,6 +301,30 @@ async def delete_message(
         message.conversation_id,
         {"type": "message_deleted", "message_id": str(message.id)},
     )
+
+    conversation = await session.get(Conversation, message.conversation_id)
+    if conversation is not None:
+        last = await conversation_service.last_message(session, conversation.id)
+        if last is not None:
+            conversation.last_message_at = last.created_at
+        else:
+            conversation.last_message_at = None
+        session.add(conversation)
+        await session.flush()
+        await _inbox_push_to_participants(
+            session,
+            conversation,
+            event_type="inbox_message_deleted",
+            base_payload={
+                "message_id": str(message.id),
+                "preview": conversation_service.message_preview(last),
+                "last_message_at": (
+                    conversation.last_message_at.isoformat()
+                    if conversation.last_message_at
+                    else None
+                ),
+            },
+        )
 
 
 @router.post("/messages/{message_id}/report", response_model=ResponseEnvelope[MessageRead])
@@ -295,6 +384,37 @@ async def _authenticate_websocket(
     return user
 
 
+@router.websocket("/conversations/ws")
+async def inbox_websocket(
+    websocket: WebSocket,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> None:
+    """User inbox socket — list preview + unread while browsing Chats.
+
+    Keep this route registered *before* ``/conversations/{conversation_id}/ws``
+    so ``ws`` is not parsed as a conversation UUID.
+    """
+    await websocket.accept()
+
+    user = await _authenticate_websocket(websocket, session, settings)
+    if user is None:
+        await websocket.close(code=4401)
+        return
+
+    inbox_manager.register(user.id, websocket)
+    try:
+        while True:
+            # Any client frame (ping/keepalive/JSON) — reads stay on thread WS / REST.
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+    except WebSocketDisconnect:
+        pass
+    finally:
+        inbox_manager.unregister(user.id, websocket)
+
+
 @router.websocket("/conversations/{conversation_id}/ws")
 async def conversation_websocket(
     websocket: WebSocket,
@@ -339,6 +459,19 @@ async def conversation_websocket(
                 },
                 exclude=websocket,
             )
+            conversation = await session.get(Conversation, conversation_id)
+            if conversation is not None:
+                await _inbox_push_to_participants(
+                    session,
+                    conversation,
+                    event_type="inbox_read",
+                    base_payload={
+                        "message_id": str(message.id),
+                        "read_at": (
+                            message.read_at.isoformat() if message.read_at else None
+                        ),
+                    },
+                )
     except WebSocketDisconnect:
         pass
     finally:

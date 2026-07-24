@@ -286,10 +286,23 @@ async def last_message(session: AsyncSession, conversation_id: uuid.UUID) -> Mes
         select(Message)
         .where(Message.conversation_id == conversation_id)
         .where(Message.moderation_status.in_(PUBLIC_STATUSES))
+        .where(Message.deleted_at.is_(None))
         .order_by(Message.created_at.desc())
         .limit(1)
     )
     return result.scalars().first()
+
+
+def message_preview(message: Message | None) -> str | None:
+    """Short list-row preview: body snippet or first attachment file name."""
+    if message is None:
+        return None
+    if message.body:
+        return message.body[:140]
+    if message.attachments:
+        name = message.attachments[0].file_name
+        return (name[:140] if name else None) or "Attachment"
+    return None
 
 
 async def report(
@@ -414,7 +427,7 @@ async def build_conversation_read(
         other_party_title=other_title,
         other_party_online=manager.is_online(conversation.id, other_id),
         last_message_at=conversation.last_message_at,
-        last_message_preview=last.body[:140] if last and last.body else None,
+        last_message_preview=message_preview(last),
         unread_count=unread,
         created_at=conversation.created_at,
     )

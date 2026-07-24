@@ -15,6 +15,7 @@ from app.models.conversation import Conversation
 from app.models.message import Message
 from app.models.payout_request import PayoutMethod, PayoutRequest, PayoutStatus
 from app.models.review import Review
+from app.models.seeker_document import DocumentCategory, SeekerDocument, SeekerDocumentStatus
 from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import SignupSource, User, UserRole, VerificationStatus
 
@@ -466,7 +467,7 @@ async def test_ai_analytics_distribution_funnel_and_eligibility(
 # ── Engagement Analytics ─────────────────────────────────────────────────────
 
 
-async def test_engagement_response_time_and_call_hours(
+async def test_engagement_stats_and_trends(
     client: AsyncClient, admin_token: str, engine
 ) -> None:
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
@@ -506,6 +507,24 @@ async def test_engagement_response_time_and_call_hours(
                     body="thanks",
                     created_at=now + timedelta(hours=3),
                 ),
+                SeekerDocument(
+                    seeker_id=seeker_id,
+                    category=DocumentCategory.passport,
+                    document_name="passport.pdf",
+                    file_url="/uploads/passport.pdf",
+                    content_type="application/pdf",
+                    status=SeekerDocumentStatus.under_review,
+                    created_at=now,
+                ),
+                SeekerDocument(
+                    seeker_id=seeker_id,
+                    category=DocumentCategory.educational,
+                    document_name="transcript.pdf",
+                    file_url="/uploads/transcript.pdf",
+                    content_type="application/pdf",
+                    status=SeekerDocumentStatus.under_review,
+                    created_at=now,
+                ),
             ]
         )
         await session.commit()
@@ -521,15 +540,34 @@ async def test_engagement_response_time_and_call_hours(
     assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
 
-    assert data["avg_response_time_hours"] == 1.5
+    assert set(data.keys()) >= {
+        "window_days",
+        "messages_sent",
+        "messages_sent_change_pct",
+        "video_call_hours",
+        "video_call_hours_change_pct",
+        "documents_uploaded",
+        "documents_uploaded_change_pct",
+        "messages_sent_trend",
+        "video_call_hours_trend",
+        "documents_uploaded_trend",
+    }
+    assert "avg_response_time_hours" not in data
+    assert "session_completed" not in data
+    assert "session_duration_trend" not in data
+    assert "session_completed_trend" not in data
+
     assert data["messages_sent"] == 3
-    assert data["session_completed"] == 2
+    assert data["video_call_hours"] == 2.0
+    assert data["documents_uploaded"] == 2
 
     month = now.strftime("%Y-%m")
-    video_by_month = {p["month"]: p["amount_usd"] for p in data["video_call_hours_trend"]}
-    duration_by_month = {p["month"]: p["amount_usd"] for p in data["session_duration_trend"]}
+    messages_by_month = {p["month"]: p["value"] for p in data["messages_sent_trend"]}
+    video_by_month = {p["month"]: p["value"] for p in data["video_call_hours_trend"]}
+    docs_by_month = {p["month"]: p["value"] for p in data["documents_uploaded_trend"]}
+    assert messages_by_month[month] == 3
     assert video_by_month[month] == 2.0
-    assert duration_by_month[month] == 1.0
+    assert docs_by_month[month] == 2
 
 
 # ── Signup source default ────────────────────────────────────────────────────

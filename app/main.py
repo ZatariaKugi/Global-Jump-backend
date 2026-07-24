@@ -46,8 +46,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
 
-    # Middleware (added outermost-first; request-id wraps everything).
+    # Middleware is applied outermost-last. CORS must sit outside metrics /
+    # request-id so OPTIONS preflight is answered with ACAO headers (and not
+    # turned into a bare 405 from the route). allow_private_network is required
+    # when the FE is on localhost and the API is on a LAN IP (Chrome PNA).
     app.add_middleware(RequestContextMiddleware)
+    register_exception_handlers(app)
+    instrument_metrics(app)
+
     if settings.CORS_ORIGINS:
         app.add_middleware(
             CORSMiddleware,
@@ -55,10 +61,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
+            allow_private_network=True,
         )
-
-    register_exception_handlers(app)
-    instrument_metrics(app)
 
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
