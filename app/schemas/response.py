@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
 
+from app.schemas.seeker_document import ClientSeekerBrief
+
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
@@ -40,6 +42,8 @@ class Meta(BaseModel):
     request_id: str | None = None
     timestamp: datetime = Field(default_factory=_utcnow)
     pagination: PageMeta | None = None
+    # Set on advisor client-documents detail so FE can skip a second list call.
+    seeker: ClientSeekerBrief | None = None
 
 
 class ResponseEnvelope[T](BaseModel):

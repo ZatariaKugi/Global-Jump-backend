@@ -924,12 +924,16 @@ async def list_client_documents(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[SeekerDocumentRead]]:
+    """Document rows for one client, plus ``meta.seeker`` for the detail header."""
     await _assert_advisor_client_relationship(session, current_user.id, seeker_id)
     stmt = seeker_document_service.list_by_seeker_stmt(seeker_id)
     documents, total = await paginate(session, stmt, params)
+    seeker = await seeker_document_service.build_client_seeker_brief(
+        session, seeker_id, settings
+    )
     return ResponseEnvelope[list[SeekerDocumentRead]](
         data=[seeker_document_service.build_read(d, settings) for d in documents],
-        meta=page_meta(params, total, request_id),
+        meta=page_meta(params, total, request_id, seeker=seeker),
     )
 
 
