@@ -27,7 +27,7 @@ class AdvisorWeeklySlot(Base):
 
 
 class AdvisorAvailabilityOverride(Base):
-    """A one-off date the advisor blocks out (whole day)."""
+    """A one-off block: whole day when times are null, else a local time window."""
 
     __tablename__ = "advisor_availability_overrides"
 
@@ -38,3 +38,7 @@ class AdvisorAvailabilityOverride(Base):
     date: Mapped[date] = mapped_column(Date, nullable=False)
     is_available: Mapped[bool] = mapped_column(default=False, nullable=False)
     reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Advisor-local window; both null ⇒ all-day block (legacy behaviour).
+    start_time: Mapped[time | None] = mapped_column(Time, nullable=True)
+    end_time: Mapped[time | None] = mapped_column(Time, nullable=True)
+    timezone: Mapped[str | None] = mapped_column(String(50), nullable=True)  # IANA

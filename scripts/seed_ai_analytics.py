@@ -447,8 +447,14 @@ async def seed_ai_analytics() -> list[str]:
         )
         await session.commit()
 
-        lines.append(f"prev_window started={prev_s} completed={prev_c} leads={prev_l} bookings={prev_b}")
-        lines.append(f"curr_window started={cur_s} completed={cur_c} leads={cur_l} bookings={cur_b}")
+        lines.append(
+            f"prev_window started={prev_s} completed={prev_c} "
+            f"leads={prev_l} bookings={prev_b}"
+        )
+        lines.append(
+            f"curr_window started={cur_s} completed={cur_c} "
+            f"leads={cur_l} bookings={cur_b}"
+        )
         lines.append(f"visa_types={','.join(vt.value for vt in VISA_TYPES)}")
         lines.append(f"seeker={SEEKER_EMAIL}")
         lines.append(f"advisor={ADVISOR_EMAIL}")

@@ -407,7 +407,19 @@ async def update_booking_interpreter(
     )
 
 
-@router.post("/{booking_id}/cancel", response_model=ResponseEnvelope[BookingRead])
+@router.post(
+    "/{booking_id}/cancel",
+    response_model=ResponseEnvelope[BookingRead],
+    summary="Cancel a booking",
+    description=(
+        "Allowed only when status is ``pending`` or ``confirmed``; otherwise "
+        "``400 invalid_state`` (\"Booking is no longer active\"). "
+        "Not cancellable: ``completed``, ``cancelled``, ``rejected``, ``no_show``. "
+        "Seekers must act outside the advisor's ``cancellation_notice_hours`` "
+        "(default 24) or receive ``400 late_cancellation``. Advisors may cancel anytime. "
+        "Sets status to ``cancelled``."
+    ),
+)
 async def cancel_booking(
     booking_id: uuid.UUID,
     data: BookingCancel,

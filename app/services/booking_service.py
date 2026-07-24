@@ -171,10 +171,16 @@ async def _assert_slot_free(
     advisor_id: uuid.UUID,
     start_utc: datetime,
     duration_minutes: int,
+    exclude_booking_id: uuid.UUID | None = None,
 ) -> datetime:
     """Validate the requested start against the advisor's free slots; return end."""
     free = await availability_service.free_slots(
-        session, advisor_id, start_utc.date(), start_utc.date(), duration_minutes
+        session,
+        advisor_id,
+        start_utc.date(),
+        start_utc.date(),
+        duration_minutes,
+        exclude_booking_id=exclude_booking_id,
     )
     for slot_start, slot_end in free:
         if slot_start == start_utc:
@@ -385,7 +391,11 @@ async def reschedule(
     if start_utc <= datetime.now(UTC):
         raise AppError("Booking must be in the future", code="invalid_booking")
     end_utc = await _assert_slot_free(
-        session, booking.advisor_id, start_utc, booking.duration_minutes
+        session,
+        booking.advisor_id,
+        start_utc,
+        booking.duration_minutes,
+        exclude_booking_id=booking.id,
     )
 
     booking.scheduled_start = start_utc

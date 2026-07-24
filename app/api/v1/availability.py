@@ -18,12 +18,13 @@ from app.api.deps import (
     RequestIdDep,
     require_verified_advisor,
 )
-from app.core.exceptions import AppError, NotFoundError
+from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
 from app.db.session import SessionDep
 from app.models.advisor_availability import (
     AdvisorAvailabilityOverride,
     AdvisorWeeklySlot,
 )
+from app.models.booking import Booking
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.availability import (
     FreeSlotRead,
@@ -40,6 +41,8 @@ router = APIRouter(prefix="/advisors", tags=["availability"])
 VerifiedAdvisorDep = Annotated[Principal, Depends(require_verified_advisor)]
 
 MAX_RANGE_DAYS = 60
+# Default increment when ``duration_minutes`` is omitted. Pass the booked service
+# duration when booking/rescheduling a specific service.
 DEFAULT_SLOT_MINUTES = 30
 
 
@@ -54,11 +57,16 @@ def _slot_read(slot: AdvisorWeeklySlot) -> WeeklySlotRead:
 
 
 def _override_read(override: AdvisorAvailabilityOverride) -> OverrideRead:
+    all_day = override.start_time is None or override.end_time is None
     return OverrideRead(
         id=override.id,
         date=override.date,
         is_available=override.is_available,
         reason=override.reason,
+        all_day=all_day,
+        start_time=override.start_time,
+        end_time=override.end_time,
+        timezone=override.timezone,
     )
 
 
@@ -138,15 +146,38 @@ async def delete_my_override(
 @router.get(
     "/{advisor_id}/availability",
     response_model=ResponseEnvelope[list[FreeSlotRead]],
+    summary="List free bookable slots",
+    description=(
+        "Returns UTC increments of ``duration_minutes`` (default **30**, range 15–480) "
+        "within the date range. Pass the booking/service duration when scheduling a "
+        "specific service. Use ``exclude_booking_id`` when rescheduling so the current "
+        "booking's slot remains selectable."
+    ),
 )
 async def get_advisor_free_slots(
     advisor_id: uuid.UUID,
-    _principal: CurrentPrincipal,
+    principal: CurrentPrincipal,
     session: SessionDep,
     request_id: RequestIdDep,
     date_from: Annotated[date, Query()],
     date_to: Annotated[date, Query()],
-    duration_minutes: Annotated[int, Query(ge=15, le=480)] = DEFAULT_SLOT_MINUTES,
+    duration_minutes: Annotated[
+        int,
+        Query(
+            ge=15,
+            le=480,
+            description="Slot length in minutes. Default 30 when omitted.",
+        ),
+    ] = DEFAULT_SLOT_MINUTES,
+    exclude_booking_id: Annotated[
+        uuid.UUID | None,
+        Query(
+            description=(
+                "Omit this booking from the busy set (reschedule picker). "
+                "Caller must be the seeker or advisor on that booking."
+            ),
+        ),
+    ] = None,
 ) -> ResponseEnvelope[list[FreeSlotRead]]:
     if date_to < date_from:
         raise AppError("date_to must be on or after date_from", code="invalid_range")
@@ -162,8 +193,22 @@ async def get_advisor_free_slots(
     ):
         raise NotFoundError("Advisor not found")
 
+    if exclude_booking_id is not None:
+        booking = await session.get(Booking, exclude_booking_id)
+        if (
+            booking is None
+            or booking.advisor_id != advisor_id
+            or principal.id not in (booking.seeker_id, booking.advisor_id)
+        ):
+            raise PermissionDeniedError("Cannot exclude this booking")
+
     slots = await availability_service.free_slots(
-        session, advisor_id, date_from, date_to, duration_minutes
+        session,
+        advisor_id,
+        date_from,
+        date_to,
+        duration_minutes,
+        exclude_booking_id=exclude_booking_id,
     )
     return ResponseEnvelope[list[FreeSlotRead]](
         data=[FreeSlotRead(start_utc=s, end_utc=e) for s, e in slots],
