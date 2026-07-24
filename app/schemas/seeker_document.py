@@ -14,6 +14,15 @@ from app.models.seeker_document import DocumentCategory, SeekerDocumentStatus
 CustomerDocumentsRowStatus = Literal["pending", "completed", "rejected"]
 
 
+class ClientSeekerBrief(BaseModel):
+    """Seeker identity for the advisor client-documents detail header."""
+
+    seeker_id: uuid.UUID
+    seeker_name: str | None
+    seeker_email: str
+    seeker_profile_photo_url: str | None
+
+
 class SeekerDocumentCreate(BaseModel):
     """Reference to a file already uploaded via ``POST /uploads``
     (``category=seeker_document``)."""
