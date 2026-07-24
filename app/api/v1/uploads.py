@@ -63,6 +63,9 @@ async def upload_file(
     - ``profile_photo`` — advisor or seeker profile picture.  Pass the
       returned key in ``PATCH /advisors/me/profile`` or
       ``PATCH /users/me/profile`` → ``profile_photo_url``.
+    - ``profile_banner`` — advisor or seeker profile banner/cover image.  Pass the
+      returned URL or key in ``PATCH /advisors/me/profile`` → ``banner_url`` or
+      ``PATCH /users/me/profile`` → ``banner_url``.
     - ``message_attachment`` — files attached to a conversation message.
       Pass the returned key in ``POST /conversations/{id}/messages``
       → ``attachments[].file_key``.

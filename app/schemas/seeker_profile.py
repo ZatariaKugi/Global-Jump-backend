@@ -26,6 +26,11 @@ class SeekerProfileUpdate(BaseModel):
     nationality: CountryCode | None = None
     country_of_residence: CountryCode | None = None
     profile_photo_url: str | None = None
+    banner_url: str | None = None
+    phone: str | None = Field(default=None, max_length=40)
+    timezone: str | None = Field(default=None, max_length=50)
+    preferred_language: str | None = Field(default=None, max_length=100)
+    about: str | None = Field(default=None, max_length=2000)
     intended_visa_type: OptionalVisaType = None
     intended_destination: CountryCode | None = None
     passport_number: str | None = Field(default=None, min_length=5, max_length=20)
@@ -109,6 +114,11 @@ class SeekerProfileRead(BaseModel):
     nationality: str | None
     country_of_residence: str | None
     profile_photo_url: str | None
+    banner_url: str | None
+    phone: str | None
+    timezone: str | None
+    preferred_language: str | None
+    about: str | None
     intended_visa_type: OptionalVisaType
     intended_destination: str | None
     passport_number_masked: str | None = None

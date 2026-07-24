@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
 from sqlalchemy import Select, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -294,15 +296,44 @@ async def last_message(session: AsyncSession, conversation_id: uuid.UUID) -> Mes
 
 
 def message_preview(message: Message | None) -> str | None:
-    """Short list-row preview: body snippet or first attachment file name."""
+    """Short list-row preview: body snippet or a friendly attachment label.
+
+    Storage filenames like ``<uuid>.png`` are replaced with Photo / PDF /
+    Document / Attachment so the chat list matches advisor UX.
+    """
     if message is None:
         return None
     if message.body:
         return message.body[:140]
     if message.attachments:
-        name = message.attachments[0].file_name
-        return (name[:140] if name else None) or "Attachment"
+        att = message.attachments[0]
+        return _attachment_preview_label(att.file_name, att.content_type)
     return None
+
+
+_STORAGE_FILE_NAME = re.compile(
+    r"^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    r"\.[a-z0-9]+$",
+    re.IGNORECASE,
+)
+
+
+def _attachment_preview_label(file_name: str | None, content_type: str | None) -> str:
+    name = (file_name or "").strip()
+    ct = (content_type or "").lower()
+    ext = Path(name).suffix.lower() if name else ""
+    looks_storage_id = bool(name) and bool(_STORAGE_FILE_NAME.match(name))
+
+    if name and not looks_storage_id:
+        return name[:140]
+
+    if ct.startswith("image/") or ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        return "Photo"
+    if ct == "application/pdf" or ext == ".pdf":
+        return "PDF"
+    if ext in {".doc", ".docx"} or "word" in ct or "document" in ct:
+        return "Document"
+    return "Attachment"
 
 
 async def report(
