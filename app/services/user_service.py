@@ -7,11 +7,15 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.core.exceptions import AuthenticationError, ConflictError
+from app.core.file_storage import resolve_media_url
 from app.core.security import hash_password, verify_password
+from app.models.advisor_profile import AdvisorProfile
+from app.models.seeker_profile import SeekerProfile
 from app.models.user import SignupSource, User, UserRole, VerificationStatus
 from app.schemas.advisor import AdvisorCreate
-from app.schemas.user import UserCreate, UserUpdate
+from app.schemas.user import UserCreate, UserRead, UserUpdate
 
 # Pre-computed Argon2id hash used as a timing sentinel when a login email is
 # not found.  Always verifying against a real hash prevents response-time
@@ -26,6 +30,39 @@ async def get_by_id(session: AsyncSession, user_id: uuid.UUID) -> User | None:
 async def get_by_email(session: AsyncSession, email: str) -> User | None:
     result = await session.execute(select(User).where(User.email == email))
     return result.scalar_one_or_none()
+
+
+async def profile_photo_key(session: AsyncSession, user: User) -> str | None:
+    """Raw stored photo key for seeker/advisor profiles; admins have none."""
+    if user.role == UserRole.seeker:
+        profile = (
+            await session.execute(
+                select(SeekerProfile).where(SeekerProfile.user_id == user.id)
+            )
+        ).scalar_one_or_none()
+        return profile.profile_photo_url if profile else None
+    if user.role == UserRole.advisor:
+        profile = (
+            await session.execute(
+                select(AdvisorProfile).where(AdvisorProfile.user_id == user.id)
+            )
+        ).scalar_one_or_none()
+        return profile.profile_photo_url if profile else None
+    return None
+
+
+async def build_user_read(
+    session: AsyncSession, user: User, settings: Settings
+) -> UserRead:
+    """``UserRead`` with resolved ``profile_photo_url`` for session/sidebar UI."""
+    base = UserRead.model_validate(user)
+    return base.model_copy(
+        update={
+            "profile_photo_url": resolve_media_url(
+                await profile_photo_key(session, user), settings
+            )
+        }
+    )
 
 
 async def create_user(session: AsyncSession, data: UserCreate) -> User:

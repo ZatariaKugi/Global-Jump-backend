@@ -29,6 +29,9 @@ class UserUpdate(BaseModel):
 class UserRead(BaseModel):
     """Response schema — ``email`` is ``str`` so reserved TLDs (e.g. ``.test``
     seed accounts) stored in the DB can be returned without EmailStr rejection.
+
+    ``profile_photo_url`` is the shared sidebar/session avatar for seeker and
+    advisor (resolved media URL). Admins have no profile photo → ``null``.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -39,5 +42,6 @@ class UserRead(BaseModel):
     role: UserRole
     is_active: bool
     is_email_verified: bool
+    profile_photo_url: str | None = None
     created_at: datetime
     updated_at: datetime
