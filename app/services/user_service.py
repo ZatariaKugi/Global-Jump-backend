@@ -35,19 +35,19 @@ async def get_by_email(session: AsyncSession, email: str) -> User | None:
 async def profile_photo_key(session: AsyncSession, user: User) -> str | None:
     """Raw stored photo key for seeker/advisor profiles; admins have none."""
     if user.role == UserRole.seeker:
-        profile = (
+        seeker_profile = (
             await session.execute(
                 select(SeekerProfile).where(SeekerProfile.user_id == user.id)
             )
         ).scalar_one_or_none()
-        return profile.profile_photo_url if profile else None
+        return seeker_profile.profile_photo_url if seeker_profile else None
     if user.role == UserRole.advisor:
-        profile = (
+        advisor_profile = (
             await session.execute(
                 select(AdvisorProfile).where(AdvisorProfile.user_id == user.id)
             )
         ).scalar_one_or_none()
-        return profile.profile_photo_url if profile else None
+        return advisor_profile.profile_photo_url if advisor_profile else None
     return None
 
 
