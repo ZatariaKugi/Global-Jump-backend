@@ -1222,16 +1222,25 @@ async def send_payment_receipt(
     "/payments/{transaction_id}/timeline",
     response_model=ResponseEnvelope[list[TransactionEventRead]],
 )
+@router.get(
+    "/payments/{transaction_id}/logs",
+    response_model=ResponseEnvelope[list[TransactionEventRead]],
+    include_in_schema=True,
+)
 async def get_payment_timeline(
     transaction_id: uuid.UUID,
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[TransactionEventRead]]:
-    """Timeline & Logs modal — ordered lifecycle events for a transaction."""
+    """Timeline & Logs modal — same ordered events for both tabs.
+
+    Logs table columns: ``occurred_at`` (TimeStamp), ``title`` + ``description``
+    (Event), ``source``, ``status``.
+    """
     await payment_service.get_by_id(session, transaction_id)  # 404s if missing
     events = await payment_service.list_events(session, transaction_id)
     return ResponseEnvelope[list[TransactionEventRead]](
-        data=[TransactionEventRead.model_validate(e) for e in events],
+        data=[TransactionEventRead.build(e) for e in events],
         meta=Meta(request_id=request_id),
     )
 
