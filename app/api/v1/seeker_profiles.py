@@ -3,21 +3,27 @@
 from __future__ import annotations
 
 import uuid
+from datetime import date
+from typing import Annotated
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.api.pagination import PaginationDep, page_meta, paginate
 from app.core.exceptions import PermissionDeniedError
 from app.core.file_storage import resolve_url
+from app.core.visa_types import OptionalVisaType
 from app.db.session import SessionDep
+from app.models.seeker_document import DocumentCategory, SeekerDocumentStatus
 from app.models.user import User, UserRole
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.seeker_document import (
     DocumentCommentCreate,
     DocumentCommentRead,
+    DocumentPortfolioSummary,
     SeekerDocumentCreate,
     SeekerDocumentRead,
+    SeekerDocumentUpdate,
 )
 from app.schemas.seeker_profile import (
     OnboardingCompleteRead,
@@ -126,21 +132,109 @@ async def upload_document(
     )
 
 
-@router.get("/documents", response_model=ResponseEnvelope[list[SeekerDocumentRead]])
+@router.get(
+    "/documents/summary",
+    response_model=ResponseEnvelope[DocumentPortfolioSummary],
+    summary="Document portfolio overview",
+    description=(
+        "Totals for overview cards (total / approved / under_review / missing) plus "
+        "the required-category checklist and progress percent. "
+        "Optional ``visa_type`` scopes tallies to that visa (untagged docs included)."
+    ),
+)
+async def get_my_documents_summary(
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+    visa_type: Annotated[OptionalVisaType, Query()] = None,
+) -> ResponseEnvelope[DocumentPortfolioSummary]:
+    _require_seeker(current_user)
+    summary = await seeker_document_service.portfolio_summary(
+        session, current_user.id, visa_type=visa_type
+    )
+    return ResponseEnvelope[DocumentPortfolioSummary](
+        data=summary,
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.get(
+    "/documents",
+    response_model=ResponseEnvelope[list[SeekerDocumentRead]],
+    summary="List my documents",
+    description=(
+        "Paginated portfolio list. Filter by ``category``, ``status``, ``visa_type``, "
+        "``expiring_within_days``, or ``expires_before``. Untagged docs match any visa filter."
+    ),
+)
 async def list_my_documents(
     params: PaginationDep,
     current_user: CurrentUser,
     session: SessionDep,
     settings: SettingsDep,
     request_id: RequestIdDep,
+    category: Annotated[DocumentCategory | None, Query()] = None,
+    status: Annotated[SeekerDocumentStatus | None, Query()] = None,
+    visa_type: Annotated[OptionalVisaType, Query()] = None,
+    expiring_within_days: Annotated[
+        int | None,
+        Query(ge=0, le=3650, description="Include docs with expires_at on or before today+N"),
+    ] = None,
+    expires_before: Annotated[date | None, Query()] = None,
 ) -> ResponseEnvelope[list[SeekerDocumentRead]]:
     _require_seeker(current_user)
-    stmt = seeker_document_service.list_by_seeker_stmt(current_user.id)
+    stmt = seeker_document_service.list_by_seeker_stmt(
+        current_user.id,
+        category=category,
+        status=status,
+        visa_type=visa_type,
+        expiring_within_days=expiring_within_days,
+        expires_before=expires_before,
+    )
     documents, total = await paginate(session, stmt, params)
     return ResponseEnvelope[list[SeekerDocumentRead]](
         data=[seeker_document_service.build_read(d, settings) for d in documents],
         meta=page_meta(params, total, request_id),
     )
+
+
+@router.patch(
+    "/documents/{document_id}",
+    response_model=ResponseEnvelope[SeekerDocumentRead],
+)
+async def update_my_document(
+    document_id: uuid.UUID,
+    data: SeekerDocumentUpdate,
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[SeekerDocumentRead]:
+    _require_seeker(current_user)
+    document = await seeker_document_service.get_for_seeker(
+        session, document_id, current_user.id
+    )
+    document = await seeker_document_service.update_document(
+        session, document, data, current_user.id
+    )
+    return ResponseEnvelope[SeekerDocumentRead](
+        data=seeker_document_service.build_read(document, settings),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.delete("/documents/{document_id}", status_code=204)
+async def delete_my_document(
+    document_id: uuid.UUID,
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> None:
+    """Soft-archive the document (removed from list/summary; file retained)."""
+    _require_seeker(current_user)
+    document = await seeker_document_service.get_for_seeker(
+        session, document_id, current_user.id
+    )
+    await seeker_document_service.archive_document(session, document, current_user.id)
 
 
 @router.post(

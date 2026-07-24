@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.core.visa_types import OptionalVisaType
 from app.models.booking import BookingStatus
 from app.models.seeker_document import DocumentCategory, SeekerDocumentStatus
 
 CustomerDocumentsRowStatus = Literal["pending", "completed", "rejected"]
+ChecklistItemStatus = Literal["approved", "under_review", "rejected", "missing"]
 
 
 class ClientSeekerBrief(BaseModel):
@@ -33,6 +35,18 @@ class SeekerDocumentCreate(BaseModel):
     content_type: str = Field(default="application/octet-stream", max_length=100)
     category: DocumentCategory
     document_name: str = Field(min_length=1, max_length=255)
+    expires_at: date | None = None
+    visa_type: OptionalVisaType = None
+
+
+class SeekerDocumentUpdate(BaseModel):
+    """Patch expiry / visa scope / display name without re-uploading."""
+
+    document_name: str | None = Field(default=None, min_length=1, max_length=255)
+    expires_at: date | None = None
+    clear_expires_at: bool = False
+    visa_type: OptionalVisaType = None
+    clear_visa_type: bool = False
 
 
 class SeekerDocumentStatusUpdate(BaseModel):
@@ -48,9 +62,30 @@ class SeekerDocumentRead(BaseModel):
     file_size_bytes: int | None
     content_type: str
     status: SeekerDocumentStatus
+    expires_at: date | None
+    visa_type: OptionalVisaType
     reviewed_at: datetime | None
     reviewed_by: uuid.UUID | None
     created_at: datetime
+
+
+class DocumentChecklistItem(BaseModel):
+    category: DocumentCategory
+    label: str
+    status: ChecklistItemStatus
+    document_id: uuid.UUID | None = None
+
+
+class DocumentPortfolioSummary(BaseModel):
+    """Overview cards + required-doc checklist for the seeker Documents page."""
+
+    total: int
+    approved: int
+    under_review: int
+    missing: int
+    rejected: int
+    progress_percent: int
+    checklist: list[DocumentChecklistItem]
 
 
 class CustomerDocumentsRowRead(BaseModel):
