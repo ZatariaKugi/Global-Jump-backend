@@ -21,6 +21,7 @@ from app.models.seeker_document import (
 from app.models.user import User, UserRole
 from app.schemas.booking import BookingSort
 from app.schemas.seeker_document import (
+    ClientSeekerBrief,
     CustomerDocumentsRowRead,
     CustomerDocumentsRowStatus,
     DocumentCommentRead,
@@ -152,6 +153,22 @@ def build_read(document: SeekerDocument, settings: Settings) -> SeekerDocumentRe
         reviewed_at=document.reviewed_at,
         reviewed_by=document.reviewed_by,
         created_at=document.created_at,
+    )
+
+
+async def build_client_seeker_brief(
+    session: AsyncSession, seeker_id: uuid.UUID, settings: Settings
+) -> ClientSeekerBrief | None:
+    """Seeker name/email/photo for the client-documents detail header."""
+    seeker = await session.get(User, seeker_id)
+    if seeker is None:
+        return None
+    photos = await booking_service.seeker_photo_keys(session, {seeker_id})
+    return ClientSeekerBrief(
+        seeker_id=seeker.id,
+        seeker_name=seeker.full_name,
+        seeker_email=seeker.email,
+        seeker_profile_photo_url=resolve_media_url(photos.get(seeker.id), settings),
     )
 
 

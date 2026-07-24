@@ -11,6 +11,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.response import Meta, PageMeta
+from app.schemas.seeker_document import ClientSeekerBrief
 
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
@@ -56,7 +57,13 @@ async def paginate(
     return list(result.scalars().all()), total
 
 
-def page_meta(params: PaginationParams, total: int, request_id: str | None = None) -> Meta:
+def page_meta(
+    params: PaginationParams,
+    total: int,
+    request_id: str | None = None,
+    *,
+    seeker: ClientSeekerBrief | None = None,
+) -> Meta:
     pages = ceil(total / params.page_size) if total else 0
     return Meta(
         request_id=request_id,
@@ -66,4 +73,5 @@ def page_meta(params: PaginationParams, total: int, request_id: str | None = Non
             page_size=params.page_size,
             pages=pages,
         ),
+        seeker=seeker,
     )
