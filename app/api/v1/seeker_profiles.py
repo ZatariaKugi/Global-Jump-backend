@@ -10,9 +10,10 @@ from fastapi import APIRouter, Query
 
 from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.api.pagination import PaginationDep, page_meta, paginate
-from app.core.exceptions import PermissionDeniedError
+from app.core.countries import country_code
+from app.core.exceptions import AppError, PermissionDeniedError
 from app.core.file_storage import resolve_url
-from app.core.visa_types import OptionalVisaType
+from app.core.visa_types import OptionalVisaType, parse_visa_type
 from app.db.session import SessionDep
 from app.models.seeker_document import DocumentCategory, SeekerDocumentStatus
 from app.models.user import User, UserRole
@@ -31,7 +32,13 @@ from app.schemas.seeker_profile import (
     SeekerProfileRead,
     SeekerProfileUpdate,
 )
-from app.services import ai_insight_service, seeker_document_service, seeker_profile_service
+from app.schemas.visa_journey import VisaJourneyRead
+from app.services import (
+    ai_insight_service,
+    seeker_document_service,
+    seeker_profile_service,
+    visa_journey_service,
+)
 
 router = APIRouter(prefix="/users/me", tags=["seeker-profile"])
 
@@ -105,6 +112,57 @@ async def update_my_profile(
     profile = await seeker_profile_service.update(session, profile, data, settings)
     return ResponseEnvelope[SeekerProfileRead](
         data=seeker_profile_service.build_read(profile, settings),
+        meta=Meta(request_id=request_id),
+    )
+
+
+# ── Visa journey tracking ────────────────────────────────────────────────────
+
+
+@router.get(
+    "/visa-journey",
+    response_model=ResponseEnvelope[VisaJourneyRead],
+    summary="Visa Journey Tracking",
+    description=(
+        "Derived stepper for Assessment → Advisor → Documentation → "
+        "Application preparation → Submission. Defaults ``visa_type`` / ``country`` "
+        "from the seeker profile when omitted. "
+        "``advisor_suggestion`` prefers open document requests, then the latest "
+        "advisor chat message, then missing checklist items."
+    ),
+)
+async def get_my_visa_journey(
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+    visa_type: Annotated[OptionalVisaType, Query()] = None,
+    country: Annotated[
+        str | None,
+        Query(min_length=2, max_length=2, description="ISO 3166-1 alpha-2 destination"),
+    ] = None,
+) -> ResponseEnvelope[VisaJourneyRead]:
+    _require_seeker(current_user)
+    if country is not None and country_code(country) is None:
+        raise AppError("Unknown country code", code="invalid_country")
+
+    profile = await seeker_profile_service.get_or_create(session, current_user.id)
+    resolved_visa = visa_type
+    if resolved_visa is None and profile.intended_visa_type:
+        resolved_visa = parse_visa_type(profile.intended_visa_type)
+    resolved_country = country.upper() if country else None
+    if resolved_country is None and profile.intended_destination:
+        resolved_country = profile.intended_destination.upper()
+
+    journey = await visa_journey_service.get_journey(
+        session,
+        current_user.id,
+        settings,
+        visa_type=resolved_visa,
+        country=resolved_country,
+    )
+    return ResponseEnvelope[VisaJourneyRead](
+        data=journey,
         meta=Meta(request_id=request_id),
     )
 
