@@ -193,9 +193,7 @@ async def _get_or_create_seed_seeker(session: AsyncSession, password_hash: str) 
 
 
 async def _ensure_country(session: AsyncSession, user: User, country: str) -> None:
-    profile = await session.scalar(
-        select(AdvisorProfile).where(AdvisorProfile.user_id == user.id)
-    )
+    profile = await session.scalar(select(AdvisorProfile).where(AdvisorProfile.user_id == user.id))
     if profile is None:
         return
     if profile.country_of_residence == country:
@@ -207,9 +205,7 @@ async def _ensure_country(session: AsyncSession, user: User, country: str) -> No
 
 
 async def _ensure_success_rate(session: AsyncSession, user: User, rate: float) -> None:
-    profile = await session.scalar(
-        select(AdvisorProfile).where(AdvisorProfile.user_id == user.id)
-    )
+    profile = await session.scalar(select(AdvisorProfile).where(AdvisorProfile.user_id == user.id))
     if profile is None:
         return
     if profile.successful_application_rate is not None:
@@ -404,9 +400,7 @@ async def _ensure_reviews(
     )
 
 
-async def _create_advisor(
-    session: AsyncSession, data: dict[str, Any], password_hash: str
-) -> User:
+async def _create_advisor(session: AsyncSession, data: dict[str, Any], password_hash: str) -> User:
     user = User(
         email=data["email"],
         full_name=data["full_name"],

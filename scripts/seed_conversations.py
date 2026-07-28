@@ -87,9 +87,7 @@ async def _get_user(session: AsyncSession, email: str, role: UserRole) -> User |
     return user
 
 
-async def _ensure_booking(
-    session: AsyncSession, seeker: User, advisor: User
-) -> Booking:
+async def _ensure_booking(session: AsyncSession, seeker: User, advisor: User) -> Booking:
     existing = await session.scalar(
         select(Booking)
         .where(Booking.seeker_id == seeker.id)
@@ -121,9 +119,7 @@ async def _ensure_booking(
     return booking
 
 
-async def _ensure_conversation(
-    session: AsyncSession, seeker: User, advisor: User
-) -> Conversation:
+async def _ensure_conversation(session: AsyncSession, seeker: User, advisor: User) -> Conversation:
     conversation = await session.scalar(
         select(Conversation)
         .where(Conversation.seeker_id == seeker.id)
@@ -151,10 +147,10 @@ async def _replace_messages(
     thread: list[tuple[str, str, int, bool]],
 ) -> int:
     existing = (
-        await session.execute(
-            select(Message).where(Message.conversation_id == conversation.id)
-        )
-    ).scalars().all()
+        (await session.execute(select(Message).where(Message.conversation_id == conversation.id)))
+        .scalars()
+        .all()
+    )
     for msg in existing:
         await session.delete(msg)
     await session.flush()

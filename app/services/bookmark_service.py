@@ -41,9 +41,7 @@ async def _require_approved_advisor(session: AsyncSession, advisor_id: uuid.UUID
     return advisor
 
 
-async def create(
-    session: AsyncSession, seeker: User, advisor_id: uuid.UUID
-) -> AdvisorBookmark:
+async def create(session: AsyncSession, seeker: User, advisor_id: uuid.UUID) -> AdvisorBookmark:
     if seeker.role != UserRole.seeker:
         raise PermissionDeniedError("Seeker account required")
     await _require_approved_advisor(session, advisor_id)
@@ -76,9 +74,7 @@ async def create(
     return bookmark
 
 
-async def delete(
-    session: AsyncSession, seeker: User, advisor_id: uuid.UUID
-) -> None:
+async def delete(session: AsyncSession, seeker: User, advisor_id: uuid.UUID) -> None:
     if seeker.role != UserRole.seeker:
         raise PermissionDeniedError("Seeker account required")
     bookmark = (
@@ -97,9 +93,7 @@ async def delete(
     await session.flush()
 
 
-async def is_bookmarked(
-    session: AsyncSession, seeker_id: uuid.UUID, advisor_id: uuid.UUID
-) -> bool:
+async def is_bookmarked(session: AsyncSession, seeker_id: uuid.UUID, advisor_id: uuid.UUID) -> bool:
     result = await session.execute(
         select(AdvisorBookmark.id).where(
             AdvisorBookmark.seeker_id == seeker_id,
@@ -119,14 +113,18 @@ async def bookmarked_advisor_ids(
     if not advisor_ids:
         return set()
     rows = (
-        await session.execute(
-            select(AdvisorBookmark.advisor_id).where(
-                AdvisorBookmark.seeker_id == seeker_id,
-                AdvisorBookmark.advisor_id.in_(advisor_ids),
-                AdvisorBookmark.is_archived.is_(False),
+        (
+            await session.execute(
+                select(AdvisorBookmark.advisor_id).where(
+                    AdvisorBookmark.seeker_id == seeker_id,
+                    AdvisorBookmark.advisor_id.in_(advisor_ids),
+                    AdvisorBookmark.is_archived.is_(False),
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return set(rows)
 
 
@@ -188,9 +186,9 @@ async def build_list_reads(
     advisor_ids = [b.advisor_id for b in bookmarks]
     advisors = {
         u.id: u
-        for u in (
-            await session.execute(select(User).where(User.id.in_(advisor_ids)))
-        ).scalars().all()
+        for u in (await session.execute(select(User).where(User.id.in_(advisor_ids))))
+        .scalars()
+        .all()
     }
     profiles = {
         p.user_id: p
@@ -198,7 +196,9 @@ async def build_list_reads(
             await session.execute(
                 select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     }
     ratings = await review_service.rating_summaries(session, advisor_ids)
     destination, visa_type = await advisor_matching_service.match_context_for_seeker(

@@ -410,9 +410,7 @@ def list_customer_documents_stmt(
     elif documents_status == "rejected":
         stmt = stmt.where(_portfolio_rejected_clause())
     elif documents_status == "pending":
-        stmt = stmt.where(
-            ~_portfolio_completed_clause() & ~_portfolio_rejected_clause()
-        )
+        stmt = stmt.where(~_portfolio_completed_clause() & ~_portfolio_rejected_clause())
     return stmt
 
 

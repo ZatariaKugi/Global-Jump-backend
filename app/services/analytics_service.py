@@ -58,9 +58,7 @@ _AI_VISA_ORDER: tuple[VisaType, ...] = (
 
 _ELIGIBILITY_HIGH = frozenset({EligibilityTier.highly_eligible})
 _ELIGIBILITY_MEDIUM = frozenset({EligibilityTier.likely_eligible})
-_ELIGIBILITY_LOW = frozenset(
-    {EligibilityTier.borderline, EligibilityTier.low_eligibility}
-)
+_ELIGIBILITY_LOW = frozenset({EligibilityTier.borderline, EligibilityTier.low_eligibility})
 
 _FUNNEL_STAGES: tuple[tuple[str, str], ...] = (
     ("impressions", "Impressions"),
@@ -69,9 +67,7 @@ _FUNNEL_STAGES: tuple[tuple[str, str], ...] = (
     ("session_booked", "Session Booked"),
 )
 
-_SESSION_BOOKED_STATUSES = frozenset(
-    {BookingStatus.confirmed, BookingStatus.completed}
-)
+_SESSION_BOOKED_STATUSES = frozenset({BookingStatus.confirmed, BookingStatus.completed})
 
 _GROSS_STATUSES = (
     TransactionStatus.succeeded,
@@ -414,8 +410,7 @@ def _finance_window_totals(
     gross_txns = [
         t
         for t in transactions
-        if t.status in _GROSS_STATUSES
-        and window_start <= _as_utc(t.created_at) < window_end
+        if t.status in _GROSS_STATUSES and window_start <= _as_utc(t.created_at) < window_end
     ]
     gross = round(sum(t.amount_usd for t in gross_txns), 2)
 
@@ -443,11 +438,7 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
 
     # Load both current and previous windows in one pass.
     transactions = (
-        (
-            await session.execute(
-                select(Transaction).where(Transaction.created_at >= prev_since)
-            )
-        )
+        (await session.execute(select(Transaction).where(Transaction.created_at >= prev_since)))
         .scalars()
         .all()
     )
@@ -493,9 +484,7 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
 
     # Trends: current window only.
     current_gross = [
-        t
-        for t in transactions
-        if t.status in _GROSS_STATUSES and _as_utc(t.created_at) >= since
+        t for t in transactions if t.status in _GROSS_STATUSES and _as_utc(t.created_at) >= since
     ]
     revenue_trend_map: dict[str, float] = defaultdict(float)
     for t in current_gross:
@@ -621,20 +610,14 @@ def _ai_funnel_values(
     session_booked  — those bookings that reached confirmed/completed
     """
     completed_ids = {a.id for a in assessments if a.status == AssessmentStatus.completed}
-    completed_seekers = {
-        a.user_id for a in assessments if a.status == AssessmentStatus.completed
-    }
+    completed_seekers = {a.user_id for a in assessments if a.status == AssessmentStatus.completed}
     # Prefer lead-backed matches when present; fall back to completed count.
     matched_assessments = {lead.assessment_id for lead in leads} & completed_ids
     matches_shown = len(matched_assessments) if matched_assessments else len(completed_ids)
 
-    post_match_bookings = [
-        b for b in bookings if b.seeker_id in completed_seekers
-    ]
+    post_match_bookings = [b for b in bookings if b.seeker_id in completed_seekers]
     advisors_clicked = len({(b.seeker_id, b.advisor_id) for b in post_match_bookings})
-    session_booked = sum(
-        1 for b in post_match_bookings if b.status in _SESSION_BOOKED_STATUSES
-    )
+    session_booked = sum(1 for b in post_match_bookings if b.status in _SESSION_BOOKED_STATUSES)
     return {
         "impressions": len(assessments),
         "matches_shown": matches_shown,
@@ -670,37 +653,23 @@ async def get_ai_analytics(session: AsyncSession, days: int = 270) -> AIAnalytic
     prev_since = since - timedelta(days=days)
 
     assessments = list(
-        (
-            await session.execute(
-                select(Assessment).where(Assessment.created_at >= prev_since)
-            )
-        )
+        (await session.execute(select(Assessment).where(Assessment.created_at >= prev_since)))
         .scalars()
         .all()
     )
     cur_assessments = [a for a in assessments if _as_utc(a.created_at) >= since]
-    prev_assessments = [
-        a for a in assessments if prev_since <= _as_utc(a.created_at) < since
-    ]
+    prev_assessments = [a for a in assessments if prev_since <= _as_utc(a.created_at) < since]
 
     leads = list(
-        (
-            await session.execute(
-                select(AdvisorLead).where(AdvisorLead.created_at >= prev_since)
-            )
-        )
+        (await session.execute(select(AdvisorLead).where(AdvisorLead.created_at >= prev_since)))
         .scalars()
         .all()
     )
     cur_leads = [lead for lead in leads if _as_utc(lead.created_at) >= since]
-    prev_leads = [
-        lead for lead in leads if prev_since <= _as_utc(lead.created_at) < since
-    ]
+    prev_leads = [lead for lead in leads if prev_since <= _as_utc(lead.created_at) < since]
 
     bookings = list(
-        (
-            await session.execute(select(Booking).where(Booking.created_at >= prev_since))
-        )
+        (await session.execute(select(Booking).where(Booking.created_at >= prev_since)))
         .scalars()
         .all()
     )
@@ -711,9 +680,7 @@ async def get_ai_analytics(session: AsyncSession, days: int = 270) -> AIAnalytic
 
     return AIAnalyticsRead(
         window_days=days,
-        assessment_distribution=_ai_assessment_distribution(
-            cur_assessments, prev_assessments
-        ),
+        assessment_distribution=_ai_assessment_distribution(cur_assessments, prev_assessments),
         advisor_match_funnel=_ai_advisor_match_funnel(
             cur_assessments,
             prev_assessments,
@@ -741,11 +708,7 @@ async def get_engagement_analytics(
     prev_since = now - timedelta(days=2 * days)
 
     messages = (
-        (
-            await session.execute(
-                select(Message).where(Message.created_at >= prev_since)
-            )
-        )
+        (await session.execute(select(Message).where(Message.created_at >= prev_since)))
         .scalars()
         .all()
     )

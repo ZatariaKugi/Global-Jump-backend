@@ -156,9 +156,7 @@ async def _ensure_questions(session) -> int:
 
     created = 0
     start_order = (
-        await session.scalar(
-            select(func.coalesce(func.max(AssessmentQuestion.display_order), -1))
-        )
+        await session.scalar(select(func.coalesce(func.max(AssessmentQuestion.display_order), -1)))
         or -1
     ) + 1
     for i, (category, text) in enumerate(ANALYTICS_QUESTIONS):
@@ -208,11 +206,7 @@ async def _ensure_questions(session) -> int:
 
 async def _clear_prior(session, seeker_id: uuid.UUID) -> tuple[int, int, int]:
     assessment_ids = list(
-        (
-            await session.execute(
-                select(Assessment.id).where(Assessment.user_id == seeker_id)
-            )
-        )
+        (await session.execute(select(Assessment.id).where(Assessment.user_id == seeker_id)))
         .scalars()
         .all()
     )
@@ -383,9 +377,7 @@ async def _seed_window(
                     booking = Booking(
                         seeker_id=seeker_id,
                         advisor_id=advisor_id,
-                        appointment_number=await booking_service._next_appointment_number(
-                            session
-                        ),
+                        appointment_number=await booking_service._next_appointment_number(session),
                         scheduled_start=start,
                         scheduled_end=start + timedelta(minutes=30),
                         duration_minutes=30,
@@ -420,9 +412,7 @@ async def seed_ai_analytics() -> list[str]:
         seeker = await _ensure_seeker(session)
         advisor = await _ensure_advisor(session)
         cleared_a, cleared_l, cleared_b = await _clear_prior(session, seeker.id)
-        lines.append(
-            f"cleared assessments={cleared_a} leads={cleared_l} bookings={cleared_b}"
-        )
+        lines.append(f"cleared assessments={cleared_a} leads={cleared_l} bookings={cleared_b}")
 
         q_created = await _ensure_questions(session)
         lines.append(f"questions_created={q_created}")
@@ -448,12 +438,10 @@ async def seed_ai_analytics() -> list[str]:
         await session.commit()
 
         lines.append(
-            f"prev_window started={prev_s} completed={prev_c} "
-            f"leads={prev_l} bookings={prev_b}"
+            f"prev_window started={prev_s} completed={prev_c} leads={prev_l} bookings={prev_b}"
         )
         lines.append(
-            f"curr_window started={cur_s} completed={cur_c} "
-            f"leads={cur_l} bookings={cur_b}"
+            f"curr_window started={cur_s} completed={cur_c} leads={cur_l} bookings={cur_b}"
         )
         lines.append(f"visa_types={','.join(vt.value for vt in VISA_TYPES)}")
         lines.append(f"seeker={SEEKER_EMAIL}")

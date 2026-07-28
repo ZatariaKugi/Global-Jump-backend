@@ -467,9 +467,7 @@ async def test_ai_analytics_distribution_funnel_and_eligibility(
 # ── Engagement Analytics ─────────────────────────────────────────────────────
 
 
-async def test_engagement_stats_and_trends(
-    client: AsyncClient, admin_token: str, engine
-) -> None:
+async def test_engagement_stats_and_trends(client: AsyncClient, admin_token: str, engine) -> None:
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
     seeker_id = await _seed_user(engine, "seeker-eng@test.com", "Seeker", UserRole.seeker)
     advisor_id = await _seed_user(

@@ -45,19 +45,12 @@ _COLUMNS: list[tuple[str, str]] = [
 def upgrade() -> None:
     for table, column in _COLUMNS:
         for old, new in _REMAP:
-            op.execute(
-                f"UPDATE {table} SET {column} = '{new}' "
-                f"WHERE lower({column}) = '{old}'"
-            )
+            op.execute(f"UPDATE {table} SET {column} = '{new}' WHERE lower({column}) = '{old}'")
         # Drop unsupported legacy value ``other`` from specialization/intent columns.
         if table in {"advisor_visa_specializations"}:
-            op.execute(
-                f"DELETE FROM {table} WHERE lower({column}) = 'other'"
-            )
+            op.execute(f"DELETE FROM {table} WHERE lower({column}) = 'other'")
         elif table == "seeker_profiles":
-            op.execute(
-                f"UPDATE {table} SET {column} = NULL WHERE lower({column}) = 'other'"
-            )
+            op.execute(f"UPDATE {table} SET {column} = NULL WHERE lower({column}) = 'other'")
 
 
 def downgrade() -> None:
@@ -68,7 +61,4 @@ def downgrade() -> None:
     ]
     for table, column in _COLUMNS:
         for new, old in reverse:
-            op.execute(
-                f"UPDATE {table} SET {column} = '{old}' "
-                f"WHERE lower({column}) = '{new}'"
-            )
+            op.execute(f"UPDATE {table} SET {column} = '{old}' WHERE lower({column}) = '{new}'")

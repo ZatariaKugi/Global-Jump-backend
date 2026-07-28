@@ -34,9 +34,7 @@ DEFAULT_CONFIG = MatchingWeightConfig(
 
 
 async def get_config(session: AsyncSession) -> MatchingWeightConfig:
-    row = (
-        await session.execute(select(AdvisorMatchingWeights).limit(1))
-    ).scalar_one_or_none()
+    row = (await session.execute(select(AdvisorMatchingWeights).limit(1))).scalar_one_or_none()
     if row is None:
         return DEFAULT_CONFIG
     return MatchingWeightConfig(
@@ -48,9 +46,7 @@ async def get_config(session: AsyncSession) -> MatchingWeightConfig:
 
 
 async def get_read(session: AsyncSession) -> MatchingWeightsRead:
-    row = (
-        await session.execute(select(AdvisorMatchingWeights).limit(1))
-    ).scalar_one_or_none()
+    row = (await session.execute(select(AdvisorMatchingWeights).limit(1))).scalar_one_or_none()
     if row is None:
         return MatchingWeightsRead(
             id=None,
@@ -71,9 +67,7 @@ async def get_read(session: AsyncSession) -> MatchingWeightsRead:
 async def upsert(
     session: AsyncSession, data: MatchingWeightsUpdate, admin_id: uuid.UUID
 ) -> MatchingWeightsRead:
-    row = (
-        await session.execute(select(AdvisorMatchingWeights).limit(1))
-    ).scalar_one_or_none()
+    row = (await session.execute(select(AdvisorMatchingWeights).limit(1))).scalar_one_or_none()
     if row is None:
         row = AdvisorMatchingWeights(
             country_weight=data.country_weight,

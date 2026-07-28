@@ -153,9 +153,7 @@ async def _ensure_seeker(session: AsyncSession, password_hash: str) -> User:
     return user
 
 
-async def _create_advisor(
-    session: AsyncSession, spec: AdvisorSpec, password_hash: str
-) -> User:
+async def _create_advisor(session: AsyncSession, spec: AdvisorSpec, password_hash: str) -> User:
     user = User(
         email=_email(spec.local),
         full_name=spec.full_name,

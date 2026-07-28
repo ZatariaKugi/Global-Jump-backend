@@ -36,31 +36,23 @@ async def profile_photo_key(session: AsyncSession, user: User) -> str | None:
     """Raw stored photo key for seeker/advisor profiles; admins have none."""
     if user.role == UserRole.seeker:
         seeker_profile = (
-            await session.execute(
-                select(SeekerProfile).where(SeekerProfile.user_id == user.id)
-            )
+            await session.execute(select(SeekerProfile).where(SeekerProfile.user_id == user.id))
         ).scalar_one_or_none()
         return seeker_profile.profile_photo_url if seeker_profile else None
     if user.role == UserRole.advisor:
         advisor_profile = (
-            await session.execute(
-                select(AdvisorProfile).where(AdvisorProfile.user_id == user.id)
-            )
+            await session.execute(select(AdvisorProfile).where(AdvisorProfile.user_id == user.id))
         ).scalar_one_or_none()
         return advisor_profile.profile_photo_url if advisor_profile else None
     return None
 
 
-async def build_user_read(
-    session: AsyncSession, user: User, settings: Settings
-) -> UserRead:
+async def build_user_read(session: AsyncSession, user: User, settings: Settings) -> UserRead:
     """``UserRead`` with resolved ``profile_photo_url`` for session/sidebar UI."""
     base = UserRead.model_validate(user)
     return base.model_copy(
         update={
-            "profile_photo_url": resolve_media_url(
-                await profile_photo_key(session, user), settings
-            )
+            "profile_photo_url": resolve_media_url(await profile_photo_key(session, user), settings)
         }
     )
 
@@ -131,9 +123,7 @@ async def authenticate(session: AsyncSession, email: str, password: str) -> User
     ):
         raise AuthenticationError("Account is suspended")
     if user.role == UserRole.advisor and user.verification_status == VerificationStatus.rejected:
-        raise AuthenticationError(
-            "Your account was rejected by an admin. Please contact support."
-        )
+        raise AuthenticationError("Your account was rejected by an admin. Please contact support.")
     if not user.is_active:
         if user.role == UserRole.advisor and user.verification_status in (
             VerificationStatus.pending,

@@ -144,9 +144,7 @@ async def _ensure_seeker(
         user.is_active = True
         session.add(user)
 
-    profile = await session.scalar(
-        select(SeekerProfile).where(SeekerProfile.user_id == user.id)
-    )
+    profile = await session.scalar(select(SeekerProfile).where(SeekerProfile.user_id == user.id))
     if profile is None:
         session.add(
             SeekerProfile(
@@ -184,9 +182,7 @@ async def _clear_seed_for_seeker(
     if doc_ids:
         comments = (
             await session.execute(
-                delete(SeekerDocumentComment).where(
-                    SeekerDocumentComment.document_id.in_(doc_ids)
-                )
+                delete(SeekerDocumentComment).where(SeekerDocumentComment.document_id.in_(doc_ids))
             )
         ).rowcount or 0
         await session.execute(delete(SeekerDocument).where(SeekerDocument.id.in_(doc_ids)))
@@ -301,9 +297,7 @@ async def seed_customer_documents(advisor_id: uuid.UUID) -> list[str]:
                 visa=visa,
                 destination=dest,
             )
-            cleared_b, cleared_d = await _clear_seed_for_seeker(
-                session, seeker.id, advisor.id
-            )
+            cleared_b, cleared_d = await _clear_seed_for_seeker(session, seeker.id, advisor.id)
             booking = await _add_booking(
                 session,
                 seeker=seeker,
@@ -311,9 +305,7 @@ async def seed_customer_documents(advisor_id: uuid.UUID) -> list[str]:
                 status=status,
                 hours_ahead=24 + i * 48,
             )
-            created_docs = await _add_documents(
-                session, seeker=seeker, advisor=advisor, docs=docs
-            )
+            created_docs = await _add_documents(session, seeker=seeker, advisor=advisor, docs=docs)
             total_bookings += 1
             total_docs += len(created_docs)
             lines.append(

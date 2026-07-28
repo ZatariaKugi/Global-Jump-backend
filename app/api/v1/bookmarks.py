@@ -37,9 +37,7 @@ async def create_bookmark(
     """Bookmark an approved advisor."""
     _require_seeker(current_user)
     bookmark = await bookmark_service.create(session, current_user, data.advisor_id)
-    rows = await bookmark_service.build_list_reads(
-        session, current_user.id, [bookmark], settings
-    )
+    rows = await bookmark_service.build_list_reads(session, current_user.id, [bookmark], settings)
     return ResponseEnvelope[BookmarkRead](data=rows[0], meta=Meta(request_id=request_id))
 
 
@@ -72,9 +70,7 @@ async def list_bookmarks(
         recommended=recommended,
     )
     bookmarks, total = await paginate(session, stmt, params)
-    data = await bookmark_service.build_list_reads(
-        session, current_user.id, bookmarks, settings
-    )
+    data = await bookmark_service.build_list_reads(session, current_user.id, bookmarks, settings)
     return ResponseEnvelope[list[BookmarkRead]](
         data=data, meta=page_meta(params, total, request_id)
     )

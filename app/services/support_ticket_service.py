@@ -231,30 +231,36 @@ async def build_list_reads(
     users: dict[uuid.UUID, User] = {}
     if all_user_ids:
         rows = (
-            await session.execute(select(User).where(User.id.in_(all_user_ids)))
-        ).scalars().all()
+            (await session.execute(select(User).where(User.id.in_(all_user_ids)))).scalars().all()
+        )
         users = {u.id: u for u in rows}
 
     advisor_photos: dict[uuid.UUID, str | None] = {}
     seeker_photos: dict[uuid.UUID, str | None] = {}
     if user_ids:
         for adv in (
-            await session.execute(
-                select(AdvisorProfile).where(AdvisorProfile.user_id.in_(user_ids))
+            (
+                await session.execute(
+                    select(AdvisorProfile).where(AdvisorProfile.user_id.in_(user_ids))
+                )
             )
-        ).scalars().all():
+            .scalars()
+            .all()
+        ):
             advisor_photos[adv.user_id] = adv.profile_photo_url
         for seeker in (
-            await session.execute(
-                select(SeekerProfile).where(SeekerProfile.user_id.in_(user_ids))
+            (
+                await session.execute(
+                    select(SeekerProfile).where(SeekerProfile.user_id.in_(user_ids))
+                )
             )
-        ).scalars().all():
+            .scalars()
+            .all()
+        ):
             seeker_photos[seeker.user_id] = seeker.profile_photo_url
 
     ticket_ids = [t.id for t in tickets]
-    msg_stats: dict[uuid.UUID, tuple[int, datetime | None]] = dict.fromkeys(
-        ticket_ids, (0, None)
-    )
+    msg_stats: dict[uuid.UUID, tuple[int, datetime | None]] = dict.fromkeys(ticket_ids, (0, None))
     attachments_by_ticket: dict[uuid.UUID, list[TicketAttachmentRead]] = {
         tid: [] for tid in ticket_ids
     }
@@ -274,10 +280,14 @@ async def build_list_reads(
             msg_stats[ticket_id] = (int(count), last_at)
 
         messages = (
-            await session.execute(
-                select(TicketMessage).where(TicketMessage.ticket_id.in_(ticket_ids))
+            (
+                await session.execute(
+                    select(TicketMessage).where(TicketMessage.ticket_id.in_(ticket_ids))
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         for message in messages:
             for att in message.attachments or []:
                 attachments_by_ticket[message.ticket_id].append(

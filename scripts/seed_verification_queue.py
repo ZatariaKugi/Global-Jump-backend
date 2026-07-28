@@ -105,9 +105,7 @@ QUEUE_ADVISORS: list[dict[str, Any]] = [
 
 
 async def _ensure_profile(session: AsyncSession, user: User, data: dict[str, Any]) -> None:
-    profile = await session.scalar(
-        select(AdvisorProfile).where(AdvisorProfile.user_id == user.id)
-    )
+    profile = await session.scalar(select(AdvisorProfile).where(AdvisorProfile.user_id == user.id))
     if profile is not None:
         return
 
@@ -144,10 +142,14 @@ async def _reset_pending_credentials(
 ) -> None:
     """Replace credentials with a fresh pending set for queue membership."""
     existing = (
-        await session.execute(
-            select(AdvisorCredential).where(AdvisorCredential.user_id == user.id)
+        (
+            await session.execute(
+                select(AdvisorCredential).where(AdvisorCredential.user_id == user.id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for cred in existing:
         await session.delete(cred)
     await session.flush()
@@ -171,9 +173,7 @@ async def _reset_pending_credentials(
     await session.flush()
 
 
-async def _seed_one(
-    session: AsyncSession, data: dict[str, Any], password_hash: str
-) -> User:
+async def _seed_one(session: AsyncSession, data: dict[str, Any], password_hash: str) -> User:
     user = await session.scalar(select(User).where(User.email == data["email"]))
     status: VerificationStatus = data["verification_status"]
 

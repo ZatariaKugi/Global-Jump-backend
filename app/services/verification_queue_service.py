@@ -78,9 +78,7 @@ def _package_score(doc_types: set[DocumentType]) -> tuple[float, _VerificationRe
     """0–100 completeness over the three required onboarding document types."""
     present = {_normalize_doc_type(t) for t in doc_types} & _REQUIRED_DOC_TYPES
     score = round((len(present) / len(_REQUIRED_DOC_TYPES)) * 100, 1)
-    result: _VerificationResult = (
-        "all_passed" if present == _REQUIRED_DOC_TYPES else "needs_review"
-    )
+    result: _VerificationResult = "all_passed" if present == _REQUIRED_DOC_TYPES else "needs_review"
     return score, result
 
 
@@ -95,9 +93,7 @@ async def build_list_read(
         .scalars()
         .all()
     )
-    photos = {
-        p.user_id: resolve_media_url(p.profile_photo_url, settings) for p in profile_rows
-    }
+    photos = {p.user_id: resolve_media_url(p.profile_photo_url, settings) for p in profile_rows}
 
     agg_rows = (
         await session.execute(

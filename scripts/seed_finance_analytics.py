@@ -80,9 +80,7 @@ async def _clear_prior(session: AsyncSession) -> int:
     if not users:
         return 0
     ids = [u.id for u in users]
-    await session.execute(
-        delete(PayoutRequest).where(PayoutRequest.advisor_id.in_(ids))
-    )
+    await session.execute(delete(PayoutRequest).where(PayoutRequest.advisor_id.in_(ids)))
     await session.execute(
         delete(Booking).where(Booking.advisor_id.in_(ids) | Booking.seeker_id.in_(ids))
     )
@@ -139,9 +137,7 @@ async def _add_paid_booking_txn(
         scheduled_start=when,
         scheduled_end=when + timedelta(minutes=45),
         status=BookingStatus.completed,
-        payment_status=(
-            PaymentStatus.refunded if refunded_at is not None else PaymentStatus.paid
-        ),
+        payment_status=(PaymentStatus.refunded if refunded_at is not None else PaymentStatus.paid),
     )
     session.add(booking)
     await session.flush()
@@ -299,9 +295,7 @@ async def seed_finance_analytics() -> list[str]:
             total_payouts += p
             months_seeded += 1
             ym = _month_anchor(months_ago).strftime("%Y-%m")
-            lines.append(
-                f"month={ym} gross≈{round(g, 2)} refunds≈{round(r, 2)} payout={payout}"
-            )
+            lines.append(f"month={ym} gross≈{round(g, 2)} refunds≈{round(r, 2)} payout={payout}")
 
         for offset, (n, avg, r_n, r_avg, payout) in enumerate(PRIOR_BASELINE):
             months_ago = 8 + offset

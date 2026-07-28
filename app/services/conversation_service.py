@@ -471,9 +471,7 @@ def build_flagged_read(
     *,
     sender_photo_key: str | None = None,
 ) -> FlaggedMessageRead:
-    base = build_message_read(
-        message, sender, settings, sender_photo_key=sender_photo_key
-    )
+    base = build_message_read(message, sender, settings, sender_photo_key=sender_photo_key)
     return FlaggedMessageRead(
         **base.model_dump(),
         moderation_status=message.moderation_status,

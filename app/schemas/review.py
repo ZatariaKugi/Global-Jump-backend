@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from app.models.review import ModerationStatus
 
@@ -47,12 +47,17 @@ class ReviewRead(BaseModel):
     advisor_response: str | None
     responded_at: datetime | None
     created_at: datetime
+    moderation_status: ModerationStatus
+    flag_reason: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def is_flagged(self) -> bool:
+        return self.moderation_status == ModerationStatus.flagged
 
 
 class ReviewAdminRead(ReviewRead):
     seeker_id: uuid.UUID
-    moderation_status: ModerationStatus
-    flag_reason: str | None
 
 
 class AdvisorRatingSummary(BaseModel):

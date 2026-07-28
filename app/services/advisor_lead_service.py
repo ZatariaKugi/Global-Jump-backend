@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.core.exceptions import NotFoundError
 from app.core.visa_types import parse_visa_type, visa_type_name
@@ -100,7 +101,10 @@ async def generate_for_assessment(
 
 
 def list_for_advisor_stmt(
-    advisor_id: uuid.UUID, status: AdvisorLeadStatus | None = None
+    advisor_id: uuid.UUID,
+    status: AdvisorLeadStatus | None = None,
+    q: str | None = None,
+    visa_type: str | None = None,
 ) -> Select[tuple[AdvisorLead]]:
     stmt = (
         select(AdvisorLead)
@@ -109,6 +113,21 @@ def list_for_advisor_stmt(
     )
     if status is not None:
         stmt = stmt.where(AdvisorLead.status == status)
+    if q:
+        seeker = aliased(User)
+        stmt = stmt.join(seeker, seeker.id == AdvisorLead.seeker_id)
+        term = f"%{q.strip()}%"
+        stmt = stmt.where(
+            or_(
+                seeker.full_name.ilike(term),
+                seeker.email.ilike(term),
+                AdvisorLead.match_reasons.ilike(term),
+            )
+        )
+    if visa_type:
+        stmt = stmt.join(Assessment, Assessment.id == AdvisorLead.assessment_id).where(
+            Assessment.visa_type == visa_type
+        )
     return stmt
 
 

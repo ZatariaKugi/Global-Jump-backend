@@ -33,9 +33,7 @@ class PayoutRequestCreate(BaseModel):
                 if not (value and value.strip())
             ]
             if missing:
-                raise ValueError(
-                    "Bank transfer requires: " + ", ".join(missing)
-                )
+                raise ValueError("Bank transfer requires: " + ", ".join(missing))
         return self
 
 

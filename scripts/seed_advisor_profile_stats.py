@@ -67,9 +67,7 @@ async def _ensure_seeker(session) -> User:
     return user
 
 
-async def _create_booking(
-    session, *, advisor: User, seeker: User, days_ago: int
-) -> Booking:
+async def _create_booking(session, *, advisor: User, seeker: User, days_ago: int) -> Booking:
     start = datetime.now(UTC) - timedelta(days=days_ago)
     booking = Booking(
         seeker_id=seeker.id,
@@ -113,17 +111,17 @@ async def seed_advisor_profile_stats(advisor_id: uuid.UUID) -> list[str]:
 
         # Remove prior seed reviews/bookings for this advisor so re-run is idempotent.
         existing_reviews = (
-            await session.execute(select(Review).where(Review.advisor_id == advisor_id))
-        ).scalars().all()
+            (await session.execute(select(Review).where(Review.advisor_id == advisor_id)))
+            .scalars()
+            .all()
+        )
         for rev in existing_reviews:
             await session.delete(rev)
         await session.flush()
 
         seeker = await _ensure_seeker(session)
         overalls: list[float] = []
-        for i, (expertise, communication, professionalism, value, text) in enumerate(
-            REVIEW_DIMS
-        ):
+        for i, (expertise, communication, professionalism, value, text) in enumerate(REVIEW_DIMS):
             booking = await _create_booking(
                 session, advisor=advisor, seeker=seeker, days_ago=2 + i * 3
             )

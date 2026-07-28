@@ -219,8 +219,7 @@ async def update_advisor_verification(
             reason=body.reason,
         )
     elif (
-        body.status == VerificationStatus.pending
-        and previous_status != VerificationStatus.pending
+        body.status == VerificationStatus.pending and previous_status != VerificationStatus.pending
     ):
         await send_advisor_pending_email(
             advisor.email,
@@ -258,9 +257,7 @@ async def update_advisor_featured(
     await session.flush()
     await session.refresh(profile)
     return ResponseEnvelope[AdvisorProfileRead](
-        data=await advisor_profile_service.build_enriched_read(
-            session, profile, advisor, settings
-        ),
+        data=await advisor_profile_service.build_enriched_read(session, profile, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -550,9 +547,7 @@ async def list_advisor_reviews(
     Pass ``flagged=true`` to return only reviews awaiting moderation.
     Pass ``visa_type`` (PRD enum) to filter by the seeker's intended visa type.
     """
-    stmt = review_service.list_public_stmt(
-        advisor_id, flagged=flagged, visa_type=visa_type
-    )
+    stmt = review_service.list_public_stmt(advisor_id, flagged=flagged, visa_type=visa_type)
     reviews, total = await paginate(session, stmt, params)
     items = await review_service.build_enriched_reads(session, reviews)
     summary = await review_service.build_tab_summary(session, advisor_id)
@@ -1085,10 +1080,8 @@ async def delete_ab_variant(
 def _review_admin_read(review: Review, seeker: User | None) -> ReviewAdminRead:
     base = review_service.build_read(review, seeker)
     return ReviewAdminRead(
-        **base.model_dump(),
+        **base.model_dump(exclude={"is_flagged"}),
         seeker_id=review.seeker_id,
-        moderation_status=review.moderation_status,
-        flag_reason=review.flag_reason,
     )
 
 
@@ -1194,9 +1187,7 @@ async def get_admin_payment_invoice(
 ) -> ResponseEnvelope[InvoiceRead]:
     """Admin invoice download — platform perspective."""
     txn = await payment_service.get_by_id(session, transaction_id)
-    invoice = await payment_service.build_invoice(
-        session, txn, settings, perspective="admin"
-    )
+    invoice = await payment_service.build_invoice(session, txn, settings, perspective="admin")
     return ResponseEnvelope[InvoiceRead](data=invoice, meta=Meta(request_id=request_id))
 
 
@@ -1213,9 +1204,7 @@ async def send_payment_receipt(
     """Resend the payment receipt email to the seeker."""
     txn = await payment_service.get_by_id(session, transaction_id)
     await payment_service.resend_receipt(session, txn, settings)
-    return ResponseEnvelope[dict[str, bool]](
-        data={"sent": True}, meta=Meta(request_id=request_id)
-    )
+    return ResponseEnvelope[dict[str, bool]](data={"sent": True}, meta=Meta(request_id=request_id))
 
 
 @router.get(

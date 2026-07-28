@@ -71,9 +71,7 @@ async def get_current_principal(
     if user is None:
         raise AuthenticationError("User not found or inactive")
     if user.role == UserRole.advisor and user.verification_status == VerificationStatus.rejected:
-        raise AuthenticationError(
-            "Your account was rejected by an admin. Please contact support."
-        )
+        raise AuthenticationError("Your account was rejected by an admin. Please contact support.")
     # Pending / under-review advisors are allowed through so they can complete
     # onboarding or view Approval Pending. Externally-facing advisor actions
     # are still gated by require_verified_advisor.

@@ -39,9 +39,7 @@ SEED_THRESHOLDS: list[tuple[str | None, str | None, float, float, float]] = [
 
 
 async def _admin_id(session) -> uuid.UUID:
-    admin = await session.scalar(
-        select(User).where(User.role == UserRole.admin).limit(1)
-    )
+    admin = await session.scalar(select(User).where(User.role == UserRole.admin).limit(1))
     if admin is not None:
         return admin.id
     return uuid.uuid4()
@@ -86,8 +84,7 @@ async def main() -> None:
         print()
         print("Global (your curl): GET /api/v1/admin/assessment-thresholds")
         print(
-            "Scoped example: GET /api/v1/admin/assessment-thresholds"
-            "?country=CA&visa_type=student"
+            "Scoped example: GET /api/v1/admin/assessment-thresholds?country=CA&visa_type=student"
         )
     finally:
         await engine.dispose()

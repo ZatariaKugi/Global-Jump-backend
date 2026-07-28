@@ -14,9 +14,10 @@ from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import resolve_media_url
 from app.core.visa_types import humanize_slug
 from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
-from app.models.advisor_profile import AdvisorProfile, AdvisorService
+from app.models.advisor_profile import AdvisorOfferedService, AdvisorProfile, AdvisorService
 from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus, PaymentStatus
 from app.models.booking_document_request import DocumentRequestStatus
+from app.models.review import Review
 from app.models.seeker_profile import SeekerProfile
 from app.models.transaction import Transaction
 from app.models.user import User, UserRole, VerificationStatus
@@ -60,6 +61,7 @@ def build_read(
     settings: Settings,
     advisor_profile_photo_key: str | None = None,
     seeker_profile_photo_key: str | None = None,
+    review_id: uuid.UUID | None = None,
 ) -> BookingRead:
     platform_fee = round(booking.price_usd * settings.PLATFORM_COMMISSION_RATE, 2)
     advisor_fee = round(booking.price_usd - platform_fee, 2)
@@ -90,6 +92,7 @@ def build_read(
         interpreter_name=booking.interpreter_name,
         interpreter_contact=booking.interpreter_contact,
         interpreter_language=booking.interpreter_language,
+        review_id=review_id,
         created_at=booking.created_at,
         updated_at=booking.updated_at,
     )
@@ -131,6 +134,29 @@ async def seeker_photo_keys(
     return out
 
 
+async def review_ids_by_booking(
+    session: AsyncSession, booking_ids: set[uuid.UUID]
+) -> dict[uuid.UUID, uuid.UUID]:
+    """Map booking_id -> review_id for bookings that already have a review.
+
+    Feeds ``has_review``/``review_id`` on ``BookingRead`` so the FE can hide
+    "Leave Review" across refresh/devices. There is at most one review per
+    booking (unique constraint), so a plain dict is safe.
+    """
+    if not booking_ids:
+        return {}
+    rows = (
+        (
+            await session.execute(
+                select(Review.booking_id, Review.id).where(Review.booking_id.in_(booking_ids))
+            )
+        )
+        .tuples()
+        .all()
+    )
+    return dict(rows)
+
+
 async def _resolve_advisor(session: AsyncSession, advisor_id: uuid.UUID) -> User:
     advisor = await session.get(User, advisor_id)
     if (
@@ -156,6 +182,24 @@ async def _resolve_service(
     if service is None:
         raise AppError("Advisor does not offer this service", code="unknown_service")
     return service
+
+
+async def _assert_service_offered(
+    session: AsyncSession, advisor_id: uuid.UUID, service_type: str
+) -> None:
+    """Validate a service type against the advisor's onboarding ``offered_services``.
+
+    Advisor-created bookings don't require a priced ``AdvisorService`` row — the
+    advisor only needs to have listed the category as one they offer.
+    """
+    result = await session.execute(
+        select(AdvisorOfferedService.id)
+        .join(AdvisorProfile, AdvisorProfile.id == AdvisorOfferedService.profile_id)
+        .where(AdvisorProfile.user_id == advisor_id)
+        .where(AdvisorOfferedService.service_type == service_type)
+    )
+    if result.scalars().first() is None:
+        raise AppError("Advisor does not offer this service", code="unknown_service")
 
 
 async def get_notice_hours(session: AsyncSession, advisor_id: uuid.UUID) -> int:
@@ -240,21 +284,22 @@ async def create_by_advisor(
     if seeker is None or seeker.role != UserRole.seeker or not seeker.is_active:
         raise NotFoundError("Client not found")
 
-    service = await _resolve_service(session, advisor.id, str(data.service_type))
+    await _assert_service_offered(session, advisor.id, str(data.service_type))
 
     start_utc = as_utc(data.scheduled_start)
     if start_utc <= datetime.now(UTC):
         raise AppError("Booking must be in the future", code="invalid_booking")
 
-    end_utc = await _assert_slot_free(session, advisor.id, start_utc, service.duration_minutes)
+    end_utc = await _assert_slot_free(session, advisor.id, start_utc, data.duration_minutes)
 
     booking = Booking(
         seeker_id=seeker.id,
         advisor_id=advisor.id,
         appointment_number=await _next_appointment_number(session),
-        service_type=service.service_type,
-        duration_minutes=service.duration_minutes,
-        price_usd=service.price_usd,
+        service_type=str(data.service_type),
+        duration_minutes=data.duration_minutes,
+        # Advisor-created bookings are not paid consultations.
+        price_usd=0.0,
         scheduled_start=start_utc,
         scheduled_end=end_utc,
         status=BookingStatus.confirmed,
@@ -574,8 +619,7 @@ def _meeting_read(booking: Booking) -> BookingMeetingRead:
     return BookingMeetingRead(
         label=label,
         time_range=(
-            f"{start.strftime('%I:%M %p').lstrip('0')} - "
-            f"{end.strftime('%I:%M %p').lstrip('0')} UTC"
+            f"{start.strftime('%I:%M %p').lstrip('0')} - {end.strftime('%I:%M %p').lstrip('0')} UTC"
         ),
         date=start.strftime("%d %b %Y"),
     )

@@ -70,9 +70,7 @@ async def rotate_refresh_token(
     if user is None:
         raise AuthenticationError("User not found or inactive")
     if user.role == UserRole.advisor and user.verification_status == VerificationStatus.rejected:
-        raise AuthenticationError(
-            "Your account was rejected by an admin. Please contact support."
-        )
+        raise AuthenticationError("Your account was rejected by an admin. Please contact support.")
     if not user.is_active and not (
         user.role == UserRole.advisor
         and user.verification_status

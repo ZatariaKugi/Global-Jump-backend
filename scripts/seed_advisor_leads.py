@@ -248,9 +248,7 @@ async def seed_advisor_leads(advisor_id: uuid.UUID) -> list[str]:
             session.add(lead)
             await session.flush()
 
-            appt = (
-                booking_service.appointment_id_str(booking) if booking is not None else None
-            )
+            appt = booking_service.appointment_id_str(booking) if booking is not None else None
             lines.append(
                 f"{status.value:10} score={score:5.1f} seeker={seeker.email} "
                 f"appointment_id={appt or 'null'}"

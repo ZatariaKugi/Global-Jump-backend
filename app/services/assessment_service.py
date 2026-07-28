@@ -347,9 +347,7 @@ def _build_options(data: list[QuestionOptionInput]) -> list[AssessmentQuestionOp
     ]
 
 
-def _merge_options(
-    question: AssessmentQuestion, incoming: list[QuestionOptionPatchInput]
-) -> None:
+def _merge_options(question: AssessmentQuestion, incoming: list[QuestionOptionPatchInput]) -> None:
     """Update by id, create when id absent, delete when an existing id is omitted."""
     if len(incoming) < 2:
         raise AppError(

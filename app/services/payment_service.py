@@ -1040,9 +1040,7 @@ async def advisor_earnings_payment_read(
     seeker_profile = None
     if seeker is not None:
         seeker_profile = (
-            await session.execute(
-                select(SeekerProfile).where(SeekerProfile.user_id == seeker.id)
-            )
+            await session.execute(select(SeekerProfile).where(SeekerProfile.user_id == seeker.id))
         ).scalar_one_or_none()
     return TransactionAdvisorRead(
         id=txn.id,
@@ -1074,9 +1072,7 @@ async def advisor_earnings_payment_read(
     )
 
 
-async def resend_receipt(
-    session: AsyncSession, txn: Transaction, settings: Settings
-) -> None:
+async def resend_receipt(session: AsyncSession, txn: Transaction, settings: Settings) -> None:
     if txn.status not in _INVOICE_ELIGIBLE_STATUSES or txn.invoice_number is None:
         raise AppError("Receipt is only available for a paid transaction", code="not_paid")
     booking = await session.get(Booking, txn.booking_id)
