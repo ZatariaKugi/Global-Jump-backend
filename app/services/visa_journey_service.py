@@ -16,12 +16,13 @@ from app.core.countries import country_name
 from app.core.file_storage import resolve_media_url
 from app.core.visa_types import parse_visa_type, visa_type_name
 from app.models.assessment import Assessment, AssessmentStatus
-from app.models.booking import Booking, BookingStatus
+from app.models.booking import Booking, BookingStatus, PaymentStatus
 from app.models.booking_document_request import BookingDocumentRequest, DocumentRequestStatus
 from app.models.conversation import Conversation
 from app.models.message import Message
 from app.models.user import User
 from app.models.visa_type import VisaType
+from app.schemas.seeker_document import DocumentPortfolioSummary
 from app.schemas.visa_journey import (
     AdvisorSuggestion,
     JourneyStepKey,
@@ -161,15 +162,21 @@ def _advisor_status(booking: Booking | None, unlocked: bool) -> JourneyStepStatu
         return JourneyStepStatus.pending
     if booking is None:
         return JourneyStepStatus.pending
-    if booking.status == BookingStatus.completed:
+    if booking.payment_status == PaymentStatus.paid:
         return JourneyStepStatus.completed
     return JourneyStepStatus.in_progress
 
 
-def _documentation_status(unlocked: bool, *, progress_percent: int) -> JourneyStepStatus:
+def _documentation_status(
+    unlocked: bool, *, summary: DocumentPortfolioSummary
+) -> JourneyStepStatus:
     if not unlocked:
         return JourneyStepStatus.pending
-    if progress_percent >= 100:
+    # Advisor rejected at least one document → send the seeker back to fix it.
+    if summary.rejected > 0:
+        return JourneyStepStatus.pending
+    # Every required document uploaded and approved by the advisor.
+    if summary.total > 0 and summary.approved == summary.total and summary.missing == 0:
         return JourneyStepStatus.completed
     return JourneyStepStatus.in_progress
 
@@ -182,9 +189,11 @@ def _app_prep_status(unlocked: bool, prep_done: bool) -> JourneyStepStatus:
     return JourneyStepStatus.in_progress
 
 
-def _submission_status(unlocked: bool) -> JourneyStepStatus:
+def _submission_status(unlocked: bool, *, done: bool) -> JourneyStepStatus:
     if not unlocked:
         return JourneyStepStatus.pending
+    if done:
+        return JourneyStepStatus.completed
     return JourneyStepStatus.in_progress
 
 
@@ -293,7 +302,7 @@ async def get_journey(
     )
     docs_st = _documentation_status(
         docs_unlocked,
-        progress_percent=summary.progress_percent,
+        summary=summary,
     )
 
     prep_unlocked = docs_st == JourneyStepStatus.completed
@@ -302,8 +311,11 @@ async def get_journey(
         prep_done = await _all_requests_fulfilled(session, booking.id)
     prep_st = _app_prep_status(prep_unlocked, prep_done)
 
-    submission_unlocked = prep_st == JourneyStepStatus.completed
-    submission_st = _submission_status(submission_unlocked)
+    # Documentation completing (all docs advisor-approved) also completes submission.
+    submission_unlocked = docs_st == JourneyStepStatus.completed
+    submission_st = _submission_status(
+        submission_unlocked, done=docs_st == JourneyStepStatus.completed
+    )
 
     statuses = {
         JourneyStepKey.assessment: assessment_st,
@@ -313,8 +325,12 @@ async def get_journey(
         JourneyStepKey.submission: submission_st,
     }
 
+    visible_step_copy = tuple(
+        item for item in _STEP_COPY if item[0] != JourneyStepKey.application_preparation
+    )
+
     steps: list[VisaJourneyStep] = []
-    for order, (key, title, description) in enumerate(_STEP_COPY, start=1):
+    for order, (key, title, description) in enumerate(visible_step_copy, start=1):
         status = statuses[key]
         action: str | None = None
         action_label: str | None = None

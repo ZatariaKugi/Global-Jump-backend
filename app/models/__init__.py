@@ -39,6 +39,7 @@ from app.models.conversation import Conversation
 from app.models.eligibility_rule import EligibilityRule
 from app.models.message import Message, MessageAttachment
 from app.models.payout_request import PayoutRequest
+from app.models.regulatory_update import RegulatoryUpdate
 from app.models.review import Review
 from app.models.seeker_document import SeekerDocument, SeekerDocumentComment
 from app.models.seeker_profile import (
@@ -91,6 +92,7 @@ __all__ = [
     "SeekerDocument",
     "SeekerDocumentComment",
     "EligibilityRule",
+    "RegulatoryUpdate",
     "Review",
     "Conversation",
     "Message",

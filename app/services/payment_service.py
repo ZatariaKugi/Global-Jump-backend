@@ -547,15 +547,39 @@ async def get_advisor_earnings(
     }
 
 
-def list_for_advisor_stmt(advisor_id: uuid.UUID) -> Select[tuple[Transaction]]:
-    """Non-archived transactions for an advisor's bookings (earnings / payments lists)."""
-    return (
+def list_for_advisor_stmt(
+    advisor_id: uuid.UUID,
+    *,
+    q: str | None = None,
+    service_types: list[str] | None = None,
+) -> Select[tuple[Transaction]]:
+    """Non-archived transactions for an advisor's bookings (earnings / payments lists).
+
+    ``q`` searches seeker name / email and the human-readable appointment id
+    (accepts the ``#0000000`` display form or a bare number); ``service_types``
+    filters on the booking's snapshotted service type.
+    """
+    stmt = (
         select(Transaction)
         .join(Booking, Booking.id == Transaction.booking_id)
+        .outerjoin(User, User.id == Booking.seeker_id)
         .where(Booking.advisor_id == advisor_id)
         .where(Transaction.is_archived.is_(False))
-        .order_by(Transaction.created_at.desc())
     )
+    if q:
+        needle = q.strip()
+        pattern = f"%{needle}%"
+        conditions = [
+            User.full_name.ilike(pattern),
+            User.email.ilike(pattern),
+        ]
+        digits = needle.lstrip("#").lstrip("0")
+        if digits.isdigit():
+            conditions.append(cast(Booking.appointment_number, String).like(f"%{digits}%"))
+        stmt = stmt.where(or_(*conditions))
+    if service_types:
+        stmt = stmt.where(Booking.service_type.in_(service_types))
+    return stmt.order_by(Transaction.created_at.desc())
 
 
 async def get_for_party(
@@ -1060,6 +1084,7 @@ async def advisor_earnings_payment_read(
         created_at=txn.created_at,
         seeker_id=booking.seeker_id,
         seeker_name=seeker.full_name if seeker else None,
+        seeker_email=seeker.email if seeker else None,
         service_type=booking.service_type,
         scheduled_start=booking.scheduled_start,
         appointment_id=format_appointment_id(booking.appointment_number),

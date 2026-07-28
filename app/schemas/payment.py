@@ -80,6 +80,7 @@ class TransactionAdvisorRead(TransactionRead):
 
     seeker_id: uuid.UUID
     seeker_name: str | None
+    seeker_email: str | None = None
     service_type: str
     scheduled_start: datetime
     appointment_id: str | None = None
