@@ -63,9 +63,7 @@ def starting_price_usd(profile: AdvisorProfile | None) -> float | None:
     """Lowest bookable service price, or None when the advisor has no services."""
     if profile is None or not profile.services:
         return None
-    prices = [
-        s.price_usd for s in profile.services if s.service_type in _VALID_SERVICE_TYPES
-    ]
+    prices = [s.price_usd for s in profile.services if s.service_type in _VALID_SERVICE_TYPES]
     return min(prices) if prices else None
 
 
@@ -220,25 +218,25 @@ async def compute_avg_response_time_hours(
 
     seeker_by_conv = {row[0]: row[1] for row in conv_ids}
     messages = (
-        await session.execute(
-            select(Message)
-            .where(Message.conversation_id.in_(seeker_by_conv.keys()))
-            .where(Message.deleted_at.is_(None))
-            .where(Message.moderation_status != ModerationStatus.removed)
-            .order_by(Message.conversation_id, Message.created_at)
+        (
+            await session.execute(
+                select(Message)
+                .where(Message.conversation_id.in_(seeker_by_conv.keys()))
+                .where(Message.deleted_at.is_(None))
+                .where(Message.moderation_status != ModerationStatus.removed)
+                .order_by(Message.conversation_id, Message.created_at)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     gaps: list[float] = []
     prev_by_conv: dict[uuid.UUID, Message] = {}
     for msg in messages:
         prev = prev_by_conv.get(msg.conversation_id)
         seeker_id = seeker_by_conv[msg.conversation_id]
-        if (
-            prev is not None
-            and prev.sender_id == seeker_id
-            and msg.sender_id == advisor_id
-        ):
+        if prev is not None and prev.sender_id == seeker_id and msg.sender_id == advisor_id:
             gaps.append((msg.created_at - prev.created_at).total_seconds() / 3600.0)
         prev_by_conv[msg.conversation_id] = msg
 

@@ -122,14 +122,18 @@ async def _latest_advisor_message(
     session: AsyncSession, seeker_id: uuid.UUID, advisor_id: uuid.UUID
 ) -> Message | None:
     conversation = (
-        await session.execute(
-            select(Conversation).where(
-                Conversation.seeker_id == seeker_id,
-                Conversation.advisor_id == advisor_id,
-                Conversation.is_archived.is_(False),
+        (
+            await session.execute(
+                select(Conversation).where(
+                    Conversation.seeker_id == seeker_id,
+                    Conversation.advisor_id == advisor_id,
+                    Conversation.is_archived.is_(False),
+                )
             )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     if conversation is None:
         return None
     result = await session.execute(
@@ -343,17 +347,11 @@ async def get_journey(
     )
 
     missing_labels = [i.label for i in summary.checklist if i.status == "missing"]
-    suggestion = await _build_suggestion(
-        session, settings, seeker_id, booking, missing_labels
-    )
+    suggestion = await _build_suggestion(session, settings, seeker_id, booking, missing_labels)
 
-    resolved_visa = visa_type or (
-        parse_visa_type(assessment.visa_type) if assessment else None
-    )
+    resolved_visa = visa_type or (parse_visa_type(assessment.visa_type) if assessment else None)
     resolved_country = (
-        country.upper()
-        if country
-        else (assessment.destination_country if assessment else None)
+        country.upper() if country else (assessment.destination_country if assessment else None)
     )
 
     return VisaJourneyRead(

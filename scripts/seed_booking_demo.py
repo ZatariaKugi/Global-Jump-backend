@@ -101,8 +101,14 @@ async def _seed_services_and_slots(session: AsyncSession, advisor: User) -> None
 
     # Replace bookable services
     existing_services = (
-        await session.execute(select(AdvisorService).where(AdvisorService.profile_id == profile.id))
-    ).scalars().all()
+        (
+            await session.execute(
+                select(AdvisorService).where(AdvisorService.profile_id == profile.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
     for row in existing_services:
         await session.delete(row)
     await session.flush()
@@ -118,10 +124,14 @@ async def _seed_services_and_slots(session: AsyncSession, advisor: User) -> None
 
     # Replace offered category tags
     existing_offered = (
-        await session.execute(
-            select(AdvisorOfferedService).where(AdvisorOfferedService.profile_id == profile.id)
+        (
+            await session.execute(
+                select(AdvisorOfferedService).where(AdvisorOfferedService.profile_id == profile.id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for row in existing_offered:
         await session.delete(row)
     await session.flush()

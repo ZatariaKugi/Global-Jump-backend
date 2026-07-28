@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from app.models.advisor_profile import AdvisorServiceType
 from app.models.booking import BookingStatus, PaymentStatus
@@ -31,11 +31,17 @@ class BookingCreate(BaseModel):
 
 
 class AdvisorBookingCreate(BaseModel):
-    """Advisor books a consultation directly for one of their existing clients."""
+    """Advisor books a consultation directly for one of their existing clients.
+
+    Unlike the seeker-initiated flow, the advisor picks any service type they
+    *offer* (``offered_services``) rather than a priced ``AdvisorService``, and
+    supplies the slot length directly — advisor-created bookings carry no price.
+    """
 
     seeker_id: uuid.UUID
     service_type: AdvisorServiceType
     scheduled_start: datetime
+    duration_minutes: int = Field(ge=15, le=480)
     seeker_note: str | None = Field(default=None, max_length=1000)
 
 
@@ -112,8 +118,14 @@ class BookingRead(BaseModel):
     interpreter_name: str | None
     interpreter_contact: str | None
     interpreter_language: str | None
+    review_id: uuid.UUID | None = None
     created_at: datetime
     updated_at: datetime
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def has_review(self) -> bool:
+        return self.review_id is not None
 
 
 class BookingsListResponse(BaseModel):

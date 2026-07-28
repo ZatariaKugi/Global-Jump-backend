@@ -101,7 +101,7 @@ def list_flagged_stmt() -> Select[tuple[Review]]:
     return (
         select(Review)
         .where(Review.moderation_status == ModerationStatus.flagged)
-        .order_by(Review.updated_at.desc())
+        .order_by(Review.created_at.desc())
     )
 
 
@@ -237,6 +237,8 @@ def build_read(
         advisor_response=review.advisor_response,
         responded_at=review.responded_at,
         created_at=review.created_at,
+        moderation_status=review.moderation_status,
+        flag_reason=review.flag_reason,
     )
 
 
@@ -245,12 +247,16 @@ async def build_tab_summary(
 ) -> AdvisorReviewSummaryRead:
     """Overall + positive % + 1–5 star breakdown for the Reviews tab header card."""
     rows = (
-        await session.execute(
-            select(Review.rating_overall)
-            .where(Review.advisor_id == advisor_id)
-            .where(Review.moderation_status.in_(PUBLIC_STATUSES))
+        (
+            await session.execute(
+                select(Review.rating_overall)
+                .where(Review.advisor_id == advisor_id)
+                .where(Review.moderation_status.in_(PUBLIC_STATUSES))
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     if not rows:
         return AdvisorReviewSummaryRead(
             overall=None,
@@ -279,9 +285,7 @@ async def build_tab_summary(
     )
 
 
-async def build_enriched_reads(
-    session: AsyncSession, reviews: list[Review]
-) -> list[ReviewRead]:
+async def build_enriched_reads(session: AsyncSession, reviews: list[Review]) -> list[ReviewRead]:
     """Bulk-enrich rows with seeker name/photo and a display subtitle for filters."""
     if not reviews:
         return []
@@ -291,9 +295,9 @@ async def build_enriched_reads(
 
     seekers = {
         u.id: u
-        for u in (
-            await session.execute(select(User).where(User.id.in_(seeker_ids)))
-        ).scalars().all()
+        for u in (await session.execute(select(User).where(User.id.in_(seeker_ids))))
+        .scalars()
+        .all()
     }
     profiles = {
         p.user_id: p
@@ -301,13 +305,15 @@ async def build_enriched_reads(
             await session.execute(
                 select(SeekerProfile).where(SeekerProfile.user_id.in_(seeker_ids))
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     }
     service_by_booking = {
         b.id: b.service_type
-        for b in (
-            await session.execute(select(Booking).where(Booking.id.in_(booking_ids)))
-        ).scalars().all()
+        for b in (await session.execute(select(Booking).where(Booking.id.in_(booking_ids))))
+        .scalars()
+        .all()
     }
 
     return [

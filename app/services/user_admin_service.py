@@ -24,9 +24,7 @@ from app.services.email_service import send_password_reset_email
 # onboarding, not a soft-suspend. Mirror the login gate in user_service.
 _ADVISOR_ONBOARDING = and_(
     User.role == UserRole.advisor,
-    User.verification_status.in_(
-        (VerificationStatus.pending, VerificationStatus.under_review)
-    ),
+    User.verification_status.in_((VerificationStatus.pending, VerificationStatus.under_review)),
 )
 
 

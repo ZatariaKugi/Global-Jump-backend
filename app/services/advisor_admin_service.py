@@ -225,9 +225,7 @@ async def get_advisor_detail(
         successful_applications=profile.successful_applications,
         successful_application_rate=profile.successful_application_rate,
         country_expertise=expertise_codes,
-        country_expertise_names=[
-            country_name(code) or code for code in expertise_codes
-        ],
+        country_expertise_names=[country_name(code) or code for code in expertise_codes],
         languages=[
             LanguageEntry(
                 language=lang.language,
@@ -345,9 +343,7 @@ async def _build_earning_rows(
 
     booking_ids = [t.booking_id for t in transactions]
     bookings = (
-        (await session.execute(select(Booking).where(Booking.id.in_(booking_ids))))
-        .scalars()
-        .all()
+        (await session.execute(select(Booking).where(Booking.id.in_(booking_ids)))).scalars().all()
     )
     booking_by_id = {b.id: b for b in bookings}
 

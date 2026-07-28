@@ -78,9 +78,7 @@ async def _clear_prior(session: AsyncSession) -> int:
     booking_ids = (
         (
             await session.execute(
-                select(Booking.id).where(
-                    Booking.advisor_id.in_(ids) | Booking.seeker_id.in_(ids)
-                )
+                select(Booking.id).where(Booking.advisor_id.in_(ids) | Booking.seeker_id.in_(ids))
             )
         )
         .scalars()
@@ -156,9 +154,7 @@ async def _add_events(
     txn_id: uuid.UUID,
     steps: list[tuple[TransactionEventType, datetime]],
 ) -> int:
-    await session.execute(
-        delete(TransactionEvent).where(TransactionEvent.transaction_id == txn_id)
-    )
+    await session.execute(delete(TransactionEvent).where(TransactionEvent.transaction_id == txn_id))
     for event_type, when in steps:
         session.add(
             TransactionEvent(
@@ -273,9 +269,7 @@ async def _create_txn(
     return txn
 
 
-async def backfill_existing_txn(
-    session: AsyncSession, txn_id: uuid.UUID
-) -> tuple[bool, int, str]:
+async def backfill_existing_txn(session: AsyncSession, txn_id: uuid.UUID) -> tuple[bool, int, str]:
     txn = await session.get(Transaction, txn_id)
     if txn is None:
         return False, 0, "transaction_not_found"
@@ -311,9 +305,7 @@ async def backfill_existing_txn(
     return True, n, detail
 
 
-async def seed_payment_timeline(
-    *, backfill_txn_id: uuid.UUID | None = None
-) -> list[str]:
+async def seed_payment_timeline(*, backfill_txn_id: uuid.UUID | None = None) -> list[str]:
     lines: list[str] = []
     password_hash = hash_password(PASSWORD)
     now = datetime.now(UTC)
@@ -355,9 +347,7 @@ async def seed_payment_timeline(
             payment_status=PaymentStatus.paid,
             tag="ok",
         )
-        n_ok = await _add_events(
-            session, succeeded.id, _happy_path_steps(now - timedelta(days=2))
-        )
+        n_ok = await _add_events(session, succeeded.id, _happy_path_steps(now - timedelta(days=2)))
         lines.append(f"succeeded_txn={succeeded.id} events={n_ok}")
 
         refunded = await _create_txn(
@@ -371,9 +361,7 @@ async def seed_payment_timeline(
             tag="rf",
             refunded=True,
         )
-        n_rf = await _add_events(
-            session, refunded.id, _refund_path_steps(now - timedelta(days=5))
-        )
+        n_rf = await _add_events(session, refunded.id, _refund_path_steps(now - timedelta(days=5)))
         lines.append(f"refunded_txn={refunded.id} events={n_rf}")
 
         failed = await _create_txn(
@@ -386,9 +374,7 @@ async def seed_payment_timeline(
             payment_status=PaymentStatus.unpaid,
             tag="fl",
         )
-        n_fl = await _add_events(
-            session, failed.id, _failed_path_steps(now - timedelta(hours=6))
-        )
+        n_fl = await _add_events(session, failed.id, _failed_path_steps(now - timedelta(hours=6)))
         lines.append(f"failed_txn={failed.id} events={n_fl}")
 
         await session.commit()
@@ -403,9 +389,7 @@ async def seed_payment_timeline(
             f"invoice_url=/api/v1/admin/payments/{refunded.id}/invoice "
             f"(INV-{refunded.invoice_number:08d})"
         )
-        lines.append(
-            f"timeline_url=/api/v1/admin/payments/{succeeded.id}/timeline"
-        )
+        lines.append(f"timeline_url=/api/v1/admin/payments/{succeeded.id}/timeline")
         lines.append(f"logs_url=/api/v1/admin/payments/{succeeded.id}/logs")
     return lines
 

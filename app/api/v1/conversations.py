@@ -96,9 +96,7 @@ async def list_conversations(
     stmt = conversation_service.list_for_user_stmt(current_user.id, q)
     conversations, total = await paginate(session, stmt, params)
     data = [
-        await conversation_service.build_conversation_read(
-            session, c, current_user.id, settings
-        )
+        await conversation_service.build_conversation_read(session, c, current_user.id, settings)
         for c in conversations
     ]
     return ResponseEnvelope[list[ConversationRead]](
@@ -191,9 +189,7 @@ async def send_message(
             "preview": conversation_service.message_preview(message),
             "data": encoded,
             "last_message_at": (
-                conversation.last_message_at.isoformat()
-                if conversation.last_message_at
-                else None
+                conversation.last_message_at.isoformat() if conversation.last_message_at else None
             ),
         },
     )
@@ -467,9 +463,7 @@ async def conversation_websocket(
                     event_type="inbox_read",
                     base_payload={
                         "message_id": str(message.id),
-                        "read_at": (
-                            message.read_at.isoformat() if message.read_at else None
-                        ),
+                        "read_at": (message.read_at.isoformat() if message.read_at else None),
                     },
                 )
     except WebSocketDisconnect:

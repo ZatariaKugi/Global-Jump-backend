@@ -169,9 +169,7 @@ async def test_seeker_forbidden_from_advisor_document_endpoints(
 CUSTOMER_DOCS = "/api/v1/advisors/me/customer-documents"
 
 
-async def test_customer_documents_all_approved_is_completed(
-    client: AsyncClient, engine
-) -> None:
+async def test_customer_documents_all_approved_is_completed(client: AsyncClient, engine) -> None:
     _, advisor_headers, seeker_headers = await _booked_pair(client, engine)
     seeker_id = await _user_id(client, seeker_headers)
     document = await _upload_seeker_document(client, seeker_headers)
@@ -190,22 +188,16 @@ async def test_customer_documents_all_approved_is_completed(
     assert rows[0]["documents_status"] == "completed"
     assert rows[0]["documents_count"] == 1
 
-    resp = await client.get(
-        f"{CUSTOMER_DOCS}?documents_status=completed", headers=advisor_headers
-    )
+    resp = await client.get(f"{CUSTOMER_DOCS}?documents_status=completed", headers=advisor_headers)
     assert resp.status_code == 200, resp.text
     assert len(resp.json()["data"]) == 1
 
-    resp = await client.get(
-        f"{CUSTOMER_DOCS}?documents_status=rejected", headers=advisor_headers
-    )
+    resp = await client.get(f"{CUSTOMER_DOCS}?documents_status=rejected", headers=advisor_headers)
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"] == []
 
 
-async def test_customer_documents_all_rejected_is_rejected(
-    client: AsyncClient, engine
-) -> None:
+async def test_customer_documents_all_rejected_is_rejected(client: AsyncClient, engine) -> None:
     _, advisor_headers, seeker_headers = await _booked_pair(client, engine)
     seeker_id = await _user_id(client, seeker_headers)
     document = await _upload_seeker_document(client, seeker_headers)
@@ -224,21 +216,15 @@ async def test_customer_documents_all_rejected_is_rejected(
     assert rows[0]["documents_status"] == "rejected"
     assert rows[0]["documents_count"] == 1
 
-    resp = await client.get(
-        f"{CUSTOMER_DOCS}?documents_status=rejected", headers=advisor_headers
-    )
+    resp = await client.get(f"{CUSTOMER_DOCS}?documents_status=rejected", headers=advisor_headers)
     assert resp.status_code == 200, resp.text
     assert len(resp.json()["data"]) == 1
 
-    resp = await client.get(
-        f"{CUSTOMER_DOCS}?documents_status=completed", headers=advisor_headers
-    )
+    resp = await client.get(f"{CUSTOMER_DOCS}?documents_status=completed", headers=advisor_headers)
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"] == []
 
-    resp = await client.get(
-        f"{CUSTOMER_DOCS}?documents_status=pending", headers=advisor_headers
-    )
+    resp = await client.get(f"{CUSTOMER_DOCS}?documents_status=pending", headers=advisor_headers)
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"] == []
 

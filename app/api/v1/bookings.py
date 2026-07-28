@@ -64,6 +64,7 @@ def _read(
     *,
     advisor_profile_photo_key: str | None = None,
     seeker_profile_photo_key: str | None = None,
+    review_id: uuid.UUID | None = None,
 ) -> BookingRead:
     return booking_service.build_read(
         booking,
@@ -72,6 +73,7 @@ def _read(
         settings=settings,
         advisor_profile_photo_key=advisor_profile_photo_key,
         seeker_profile_photo_key=seeker_profile_photo_key,
+        review_id=review_id,
     )
 
 
@@ -84,6 +86,7 @@ async def _read_booking(
 ) -> BookingRead:
     advisor_photos = await booking_service.advisor_photo_keys(session, {booking.advisor_id})
     seeker_photos = await booking_service.seeker_photo_keys(session, {booking.seeker_id})
+    review_ids = await booking_service.review_ids_by_booking(session, {booking.id})
     return _read(
         booking,
         seeker,
@@ -91,6 +94,7 @@ async def _read_booking(
         settings,
         advisor_profile_photo_key=advisor_photos.get(booking.advisor_id),
         seeker_profile_photo_key=seeker_photos.get(booking.seeker_id),
+        review_id=review_ids.get(booking.id),
     )
 
 
@@ -204,9 +208,7 @@ async def list_my_bookings(
     )
     bookings, total = await paginate(session, stmt, params)
 
-    next_booking = await booking_service.get_next_upcoming(
-        session, current_user.id, role
-    )
+    next_booking = await booking_service.get_next_upcoming(session, current_user.id, role)
 
     user_ids = {b.seeker_id for b in bookings} | {b.advisor_id for b in bookings}
     if next_booking is not None:
@@ -226,6 +228,11 @@ async def list_my_bookings(
     photos = await booking_service.advisor_photo_keys(session, advisor_ids)
     seeker_photos = await booking_service.seeker_photo_keys(session, seeker_ids)
 
+    booking_ids = {b.id for b in bookings}
+    if next_booking is not None:
+        booking_ids.add(next_booking.id)
+    review_ids = await booking_service.review_ids_by_booking(session, booking_ids)
+
     def _row(b: Booking) -> BookingRead:
         return _read(
             b,
@@ -234,6 +241,7 @@ async def list_my_bookings(
             settings,
             advisor_profile_photo_key=photos.get(b.advisor_id),
             seeker_profile_photo_key=seeker_photos.get(b.seeker_id),
+            review_id=review_ids.get(b.id),
         )
 
     return BookingsListResponse(
@@ -251,13 +259,9 @@ async def get_next_upcoming_booking(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead | None]:
     """Next pending/confirmed meeting for banner — soonest ``scheduled_start`` >= now."""
-    booking = await booking_service.get_next_upcoming(
-        session, current_user.id, current_user.role
-    )
+    booking = await booking_service.get_next_upcoming(session, current_user.id, current_user.role)
     if booking is None:
-        return ResponseEnvelope[BookingRead | None](
-            data=None, meta=Meta(request_id=request_id)
-        )
+        return ResponseEnvelope[BookingRead | None](data=None, meta=Meta(request_id=request_id))
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead | None](
         data=await _read_booking(session, booking, seeker, advisor, settings),
@@ -413,7 +417,7 @@ async def update_booking_interpreter(
     summary="Cancel a booking",
     description=(
         "Allowed only when status is ``pending`` or ``confirmed``; otherwise "
-        "``400 invalid_state`` (\"Booking is no longer active\"). "
+        '``400 invalid_state`` ("Booking is no longer active"). '
         "Not cancellable: ``completed``, ``cancelled``, ``rejected``, ``no_show``. "
         "Seekers must act outside the advisor's ``cancellation_notice_hours`` "
         "(default 24) or receive ``400 late_cancellation``. Advisors may cancel anytime. "

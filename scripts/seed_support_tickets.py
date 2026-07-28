@@ -128,9 +128,7 @@ async def _get_user(session: AsyncSession, email: str) -> User | None:
     return await session.scalar(select(User).where(User.email == email))
 
 
-async def _upsert_ticket(
-    session: AsyncSession, admin: User, data: dict
-) -> tuple[str, str] | None:
+async def _upsert_ticket(session: AsyncSession, admin: User, data: dict) -> tuple[str, str] | None:
     user = await _get_user(session, data["user_email"])
     if user is None:
         return None
@@ -174,10 +172,10 @@ async def _upsert_ticket(
 
     # Reset messages
     existing_msgs = (
-        await session.execute(
-            select(TicketMessage).where(TicketMessage.ticket_id == ticket.id)
-        )
-    ).scalars().all()
+        (await session.execute(select(TicketMessage).where(TicketMessage.ticket_id == ticket.id)))
+        .scalars()
+        .all()
+    )
     for msg in existing_msgs:
         await session.delete(msg)
     await session.flush()

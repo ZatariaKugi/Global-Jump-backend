@@ -130,9 +130,7 @@ async def get_payment_summary(
 ) -> ResponseEnvelope[SeekerPaymentSummaryRead]:
     """Seeker Payments summary cards (Total Paid / Pending / Refund / Last)."""
     data = await payment_service.seeker_payment_summary(session, current_user.id)
-    return ResponseEnvelope[SeekerPaymentSummaryRead](
-        data=data, meta=Meta(request_id=request_id)
-    )
+    return ResponseEnvelope[SeekerPaymentSummaryRead](data=data, meta=Meta(request_id=request_id))
 
 
 @router.get("/history", response_model=ResponseEnvelope[list[SeekerPaymentRead]])
@@ -257,9 +255,7 @@ async def get_payment_invoice(
             perspective = "admin"
         else:
             perspective = "seeker"
-    invoice = await payment_service.build_invoice(
-        session, txn, settings, perspective=perspective
-    )
+    invoice = await payment_service.build_invoice(session, txn, settings, perspective=perspective)
     return ResponseEnvelope[InvoiceRead](
         data=invoice,
         meta=Meta(request_id=request_id),

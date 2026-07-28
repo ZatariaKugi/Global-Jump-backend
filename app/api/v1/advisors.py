@@ -722,9 +722,21 @@ async def list_my_leads(
     session: SessionDep,
     request_id: RequestIdDep,
     status: AdvisorLeadStatus | None = None,
+    q: Annotated[
+        str | None,
+        Query(max_length=100, description="Search seeker name / email or match reasons"),
+    ] = None,
+    visa_type: Annotated[
+        OptionalVisaType, Query(description="Filter by assessment visa type")
+    ] = None,
 ) -> ResponseEnvelope[list[AdvisorLeadRead]]:
     """AI-matched customer leads for this advisor, ranked by match score."""
-    stmt = advisor_lead_service.list_for_advisor_stmt(current_user.id, status)
+    stmt = advisor_lead_service.list_for_advisor_stmt(
+        current_user.id,
+        status,
+        q=q,
+        visa_type=visa_type.value if visa_type else None,
+    )
     leads, total = await paginate(session, stmt, params)
     data = [await _build_lead_read(session, lead) for lead in leads]
     return ResponseEnvelope[list[AdvisorLeadRead]](
@@ -844,13 +856,9 @@ async def list_my_clients(
     ``service_type`` / ``status`` filter on that latest booking.
     """
     types = [t.value for t in service_type] if service_type else None
-    stmt = booking_service.list_clients_stmt(
-        current_user.id, q, service_types=types, status=status
-    )
+    stmt = booking_service.list_clients_stmt(current_user.id, q, service_types=types, status=status)
     clients, total = await paginate(session, stmt, params)
-    data = await booking_service.build_client_reads(
-        session, current_user.id, clients, settings
-    )
+    data = await booking_service.build_client_reads(session, current_user.id, clients, settings)
     return ResponseEnvelope[list[ClientRead]](
         data=data,
         meta=page_meta(params, total, request_id),
@@ -928,9 +936,7 @@ async def list_client_documents(
     await _assert_advisor_client_relationship(session, current_user.id, seeker_id)
     stmt = seeker_document_service.list_by_seeker_stmt(seeker_id)
     documents, total = await paginate(session, stmt, params)
-    seeker = await seeker_document_service.build_client_seeker_brief(
-        session, seeker_id, settings
-    )
+    seeker = await seeker_document_service.build_client_seeker_brief(session, seeker_id, settings)
     return ResponseEnvelope[list[SeekerDocumentRead]](
         data=[seeker_document_service.build_read(d, settings) for d in documents],
         meta=page_meta(params, total, request_id, seeker=seeker),

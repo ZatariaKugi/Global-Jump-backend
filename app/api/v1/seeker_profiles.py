@@ -269,9 +269,7 @@ async def update_my_document(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[SeekerDocumentRead]:
     _require_seeker(current_user)
-    document = await seeker_document_service.get_for_seeker(
-        session, document_id, current_user.id
-    )
+    document = await seeker_document_service.get_for_seeker(session, document_id, current_user.id)
     document = await seeker_document_service.update_document(
         session, document, data, current_user.id
     )
@@ -289,9 +287,7 @@ async def delete_my_document(
 ) -> None:
     """Soft-archive the document (removed from list/summary; file retained)."""
     _require_seeker(current_user)
-    document = await seeker_document_service.get_for_seeker(
-        session, document_id, current_user.id
-    )
+    document = await seeker_document_service.get_for_seeker(session, document_id, current_user.id)
     await seeker_document_service.archive_document(session, document, current_user.id)
 
 

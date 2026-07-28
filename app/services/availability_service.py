@@ -69,9 +69,7 @@ async def list_overrides(
     return list(result.scalars().all())
 
 
-async def _default_override_timezone(
-    session: AsyncSession, advisor_id: uuid.UUID
-) -> str:
+async def _default_override_timezone(session: AsyncSession, advisor_id: uuid.UUID) -> str:
     """Prefer the advisor's first weekly-slot timezone; fall back to UTC."""
     weekly = await list_weekly_slots(session, advisor_id)
     if weekly:

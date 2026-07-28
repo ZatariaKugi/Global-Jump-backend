@@ -260,7 +260,6 @@ COUNTRY_NAMES: dict[str, str] = {
 }
 
 
-
 # ISO 3166-1 numeric country codes (zero-padded 3-digit strings for map libs).
 COUNTRY_NUMERIC: dict[str, str] = {
     "AD": "020",
@@ -514,12 +513,12 @@ COUNTRY_NUMERIC: dict[str, str] = {
     "ZW": "716",
 }
 
+
 def country_name(code: str | None) -> str | None:
     """Resolve a 2-letter ISO code to its full name; unknown/None → None."""
     if not code:
         return None
     return COUNTRY_NAMES.get(code.upper())
-
 
 
 def country_numeric(code: str | None) -> str | None:

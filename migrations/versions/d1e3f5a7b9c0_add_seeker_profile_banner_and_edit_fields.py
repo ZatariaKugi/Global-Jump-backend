@@ -19,20 +19,14 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "seeker_profiles", sa.Column("banner_url", sa.String(length=500), nullable=True)
-    )
+    op.add_column("seeker_profiles", sa.Column("banner_url", sa.String(length=500), nullable=True))
     op.add_column("seeker_profiles", sa.Column("phone", sa.String(length=40), nullable=True))
-    op.add_column(
-        "seeker_profiles", sa.Column("timezone", sa.String(length=50), nullable=True)
-    )
+    op.add_column("seeker_profiles", sa.Column("timezone", sa.String(length=50), nullable=True))
     op.add_column(
         "seeker_profiles",
         sa.Column("preferred_language", sa.String(length=100), nullable=True),
     )
-    op.add_column(
-        "seeker_profiles", sa.Column("about", sa.String(length=2000), nullable=True)
-    )
+    op.add_column("seeker_profiles", sa.Column("about", sa.String(length=2000), nullable=True))
 
 
 def downgrade() -> None:
