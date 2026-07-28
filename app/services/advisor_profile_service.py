@@ -35,7 +35,8 @@ from app.schemas.advisor_profile import (
     LanguageEntry,
     ServiceOffering,
 )
-from app.services import review_service
+from app.schemas.availability import WeeklySlotRead
+from app.services import availability_service, review_service
 
 _VALID_SERVICE_TYPES = {e.value for e in AdvisorServiceType}
 
@@ -156,6 +157,12 @@ async def update(
             for svc in (data.services or [])
         ]
 
+    if "weekly_slots" in fields:
+        fields.pop("weekly_slots")
+        await availability_service.set_weekly_slots(
+            session, profile.user_id, data.weekly_slots or []
+        )
+
     for field, value in fields.items():
         setattr(profile, field, value)
 
@@ -254,6 +261,7 @@ def build_read(
     review_count: int = 0,
     avg_response_time_hours: float | None = None,
     match_percentage: int | None = None,
+    weekly_slots: list[WeeklySlotRead] | None = None,
 ) -> AdvisorProfileRead:
     return AdvisorProfileRead(
         id=profile.id,
@@ -265,6 +273,7 @@ def build_read(
         avg_response_time_hours=avg_response_time_hours,
         verification_status=user.verification_status if user is not None else None,
         match_percentage=match_percentage,
+        weekly_slots=weekly_slots or [],
         **_build_common(profile, settings),
     )
 
@@ -280,6 +289,7 @@ async def build_enriched_read(
     """Profile read with rating, response-time, and verification badges."""
     average_rating, review_count = await review_service.rating_summary(session, profile.user_id)
     response_hours = await compute_avg_response_time_hours(session, profile.user_id)
+    slots = await availability_service.list_weekly_slots(session, profile.user_id)
     return build_read(
         profile,
         settings,
@@ -288,6 +298,7 @@ async def build_enriched_read(
         review_count=review_count,
         avg_response_time_hours=response_hours,
         match_percentage=match_percentage,
+        weekly_slots=[WeeklySlotRead.model_validate(s, from_attributes=True) for s in slots],
     )
 
 

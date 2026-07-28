@@ -13,6 +13,7 @@ from app.models.advisor_credential import DocumentType
 from app.models.advisor_profile import AdvisorServiceType
 from app.models.user import VerificationStatus
 from app.models.visa_type import VisaType
+from app.schemas.availability import WeeklySlotInput, WeeklySlotRead
 
 CountryCode = Annotated[str, Field(min_length=2, max_length=2)]
 
@@ -60,6 +61,10 @@ class AdvisorProfileUpdate(BaseModel):
     offered_services: list[AdvisorServiceType] | None = None
     languages: list[LanguageEntry] | None = None
     services: list[ServiceOffering] | None = None
+    weekly_slots: list[WeeklySlotInput] | None = Field(
+        default=None,
+        description="Weekly working hours; sending replaces saved hours, [] clears them.",
+    )
     public_profile_slug: str | None = Field(
         default=None,
         min_length=2,
@@ -85,6 +90,7 @@ class AdvisorProfileRead(BaseModel):
     country_expertise: list[str]
     languages: list[LanguageEntry]
     services: list[ServiceOffering]
+    weekly_slots: list[WeeklySlotRead] = []
     starting_price_usd: float | None = None
     is_featured: bool
     public_profile_slug: str | None
@@ -176,6 +182,10 @@ class AdvisorOnboardingSubmit(BaseModel):
 
     # Step 1
     service_types: list[AdvisorServiceType] = Field(default_factory=list, max_length=20)
+    # Step 1 (optional) — priced/bookable offerings; only rows with both price + duration.
+    services: list[ServiceOffering] | None = Field(default=None, max_length=20)
+    # Step 1 (optional) — weekly working hours; [] or omit means no hours set.
+    weekly_slots: list[WeeklySlotInput] | None = Field(default=None, max_length=100)
     # Step 2
     areas_of_expertise: list[RequiredVisaType] = Field(default_factory=list, max_length=20)
     # Step 3

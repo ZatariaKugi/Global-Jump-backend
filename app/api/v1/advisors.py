@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
 from sqlalchemy import select
 
 from app.api.deps import (
@@ -27,11 +29,17 @@ from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorProfile, AdvisorServiceType
 from app.models.assessment import Assessment
 from app.models.booking import Booking, BookingStatus
+from app.models.regulatory_update import RegulatoryUpdate
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.advisor_credential import (
     AdvisorCredentialCreate,
     AdvisorCredentialFromKey,
     AdvisorCredentialRead,
+)
+from app.schemas.advisor_dashboard import (
+    AdvisorDashboardRead,
+    DashboardWindow,
+    RegulatoryUpdateRead,
 )
 from app.schemas.advisor_lead import AdvisorLeadRead
 from app.schemas.advisor_profile import (
@@ -64,6 +72,7 @@ from app.schemas.seeker_document import (
 )
 from app.services import (
     advisor_credential_service,
+    advisor_dashboard_service,
     advisor_lead_service,
     advisor_matching_service,
     advisor_profile_service,
@@ -425,15 +434,22 @@ async def complete_advisor_onboarding(
             session, current_user.full_name
         )
 
-    update = AdvisorProfileUpdate(
-        bio=data.bio,
-        years_of_experience=data.years_of_experience,
-        country_of_residence=data.country_of_residence,
-        expertise_description=data.expertise_description,
-        offered_services=data.service_types or None,
-        visa_specializations=data.areas_of_expertise or None,
-        country_expertise=data.countries_you_serve or None,
-    )
+    update_fields: dict[str, object] = {
+        "bio": data.bio,
+        "years_of_experience": data.years_of_experience,
+        "country_of_residence": data.country_of_residence,
+        "expertise_description": data.expertise_description,
+        "offered_services": data.service_types or None,
+        "visa_specializations": data.areas_of_expertise or None,
+        "country_expertise": data.countries_you_serve or None,
+    }
+    # Priced offerings and weekly hours are optional on onboarding — only apply
+    # (and thus replace) when the FE actually sends them.
+    if data.services is not None:
+        update_fields["services"] = data.services
+    if data.weekly_slots is not None:
+        update_fields["weekly_slots"] = data.weekly_slots
+    update = AdvisorProfileUpdate(**update_fields)
     profile = await advisor_profile_service.update(session, profile, update)
 
     allowed_prefixes = (
@@ -630,6 +646,112 @@ async def get_my_reviews_summary(
     summary = await review_service.build_tab_summary(session, current_user.id)
     return ResponseEnvelope[AdvisorReviewSummaryRead](
         data=summary, meta=Meta(request_id=request_id)
+    )
+
+
+@router.get(
+    "/me/dashboard",
+    response_model=ResponseEnvelope[AdvisorDashboardRead],
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def get_my_dashboard(
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+    days: Annotated[
+        DashboardWindow,
+        Query(description="Stats window: 7, 30, or 90 days (drives every stats.* figure)"),
+    ] = 30,
+) -> ResponseEnvelope[AdvisorDashboardRead]:
+    """Single home-screen summary for ``/advisor/dashboard``.
+
+    ``days`` (7/30/90) scopes ``stats.new_leads_count`` and ``stats.total_earned_usd``.
+    ``stats.pending_reviews_count`` (reviews with no ``advisor_response``) and
+    ``stats.profile_completion_percent`` are point-in-time and unaffected by the window.
+    ``regulatory_updates`` and ``client_inquiries`` are capped previews — the card's
+    "See all" uses ``GET /advisors/me/regulatory-updates`` and ``GET /conversations``.
+
+    Toolbar **Sort** (recommended/popular/recent) is not wired here — it belongs to
+    the advisor discovery listing (``GET /advisors?sort=&recommended=``); the FE may
+    hide it on this screen. **Export** → ``GET /advisors/me/dashboard/export``.
+    """
+    profile = await advisor_profile_service.get_or_create(session, current_user.id)
+    data = await advisor_dashboard_service.get_dashboard(
+        session, current_user, profile, settings, days
+    )
+    return ResponseEnvelope[AdvisorDashboardRead](data=data, meta=Meta(request_id=request_id))
+
+
+@router.get(
+    "/me/dashboard/export",
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def export_my_dashboard(
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    days: Annotated[DashboardWindow, Query(description="Stats window: 7, 30, or 90 days")] = 30,
+) -> Response:
+    """Download the windowed dashboard stats + next appointment as CSV."""
+    profile = await advisor_profile_service.get_or_create(session, current_user.id)
+    csv_body = await advisor_dashboard_service.export_dashboard_csv(
+        session, current_user, profile, settings, days
+    )
+    stamp = datetime.now(UTC).strftime("%Y%m%d")
+    filename = f"dashboard-{days}d-{stamp}.csv"
+    return Response(
+        content=csv_body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get(
+    "/me/regulatory-updates",
+    response_model=ResponseEnvelope[list[RegulatoryUpdateRead]],
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def list_my_regulatory_updates(
+    params: PaginationDep,
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+    days: Annotated[
+        int | None,
+        Query(ge=1, le=365, description="Only updates published within the last N days"),
+    ] = None,
+) -> ResponseEnvelope[list[RegulatoryUpdateRead]]:
+    """Regulatory-updates "See all" list — newest first, optionally windowed by ``days``."""
+    stmt = advisor_dashboard_service.regulatory_list_stmt()
+    if days is not None:
+        since = datetime.now(UTC) - timedelta(days=days)
+        stmt = stmt.where(RegulatoryUpdate.published_at >= since)
+    updates, total = await paginate(session, stmt, params)
+    return ResponseEnvelope[list[RegulatoryUpdateRead]](
+        data=[RegulatoryUpdateRead.model_validate(u) for u in updates],
+        meta=page_meta(params, total, request_id),
+    )
+
+
+@router.get(
+    "/me/regulatory-updates/{update_id}",
+    response_model=ResponseEnvelope[RegulatoryUpdateRead],
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def get_my_regulatory_update(
+    update_id: uuid.UUID,
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[RegulatoryUpdateRead]:
+    """Regulatory-update detail sheet."""
+    update = await advisor_dashboard_service.get_regulatory_update(session, update_id)
+    if update is None:
+        raise NotFoundError("Regulatory update not found")
+    return ResponseEnvelope[RegulatoryUpdateRead](
+        data=RegulatoryUpdateRead.model_validate(update),
+        meta=Meta(request_id=request_id),
     )
 
 
@@ -1039,9 +1161,15 @@ async def list_my_payments(
     current_user: CurrentUser,
     session: SessionDep,
     request_id: RequestIdDep,
+    q: Annotated[
+        str | None,
+        Query(max_length=100, description="Search seeker name / email or appointment id"),
+    ] = None,
+    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
 ) -> ResponseEnvelope[list[TransactionAdvisorRead]]:
     """Earnings / customer-payments history — one row per transaction on this advisor's bookings."""
-    stmt = payment_service.list_for_advisor_stmt(current_user.id)
+    types = [t.value for t in service_type] if service_type else None
+    stmt = payment_service.list_for_advisor_stmt(current_user.id, q=q, service_types=types)
     txns, total = await paginate(session, stmt, params)
 
     data = []
