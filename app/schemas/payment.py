@@ -136,6 +136,7 @@ class PaymentSummaryRead(BaseModel):
 class AdvisorConnectStatus(BaseModel):
     stripe_account_id: str | None
     charges_enabled: bool
+    payouts_enabled: bool = False
     onboarding_complete: bool
     onboarding_url: str | None = None
 

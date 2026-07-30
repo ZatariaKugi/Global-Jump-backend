@@ -16,6 +16,7 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging, get_logger
 from app.core.observability import init_sentry, init_tracing, instrument_metrics
+from app.core.scheduler import create_scheduler
 from app.db.session import engine
 from app.middleware.request_context import RequestContextMiddleware
 
@@ -27,7 +28,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
     logger.info("startup", environment=settings.ENVIRONMENT.value)
     init_tracing(app, settings, engine=engine)
+    scheduler = create_scheduler(settings)
+    scheduler.start()
+    logger.info("scheduler_started", sweep_seconds=settings.TRANSFER_SWEEP_SECONDS)
     yield
+    scheduler.shutdown(wait=False)
     await engine.dispose()
     logger.info("shutdown")
 

@@ -22,6 +22,9 @@ class TransactionEventType(StrEnum):
     refunded = "refunded"
     failed = "failed"
     closed = "closed"
+    transfer_scheduled = "transfer_scheduled"  # delayed payout hold armed
+    transfer_completed = "transfer_completed"  # advisor payout transferred
+    transfer_failed = "transfer_failed"  # transfer attempt failed (retryable)
 
 
 class TransactionEvent(Base):

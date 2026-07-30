@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from enum import StrEnum
 
-from sqlalchemy import Float, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -151,3 +151,15 @@ class AdvisorProfile(BaseModel):
 
     # Stripe Connect — set when advisor completes payout onboarding
     stripe_account_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Cached Connect account readiness (refreshed from the account.updated webhook
+    # and get_connect_status) so checkout can gate on payout-readiness without a
+    # live Stripe API round-trip.
+    stripe_charges_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    stripe_payouts_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    stripe_details_submitted: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )

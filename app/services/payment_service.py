@@ -10,6 +10,7 @@ from datetime import UTC, date, datetime, timedelta
 import stripe
 import structlog
 from sqlalchemy import Select, String, cast, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -18,7 +19,7 @@ from app.core.exceptions import AppError, NotFoundError
 from app.core.file_storage import resolve_media_url
 from app.models.advisor_profile import AdvisorProfile
 from app.models.booking import Booking, BookingStatus, PaymentStatus
-from app.models.transaction import Transaction, TransactionStatus
+from app.models.transaction import Transaction, TransactionStatus, TransferStatus
 from app.models.transaction_event import TransactionEvent, TransactionEventType
 from app.models.user import User, UserRole
 from app.schemas.payment import (
@@ -98,6 +99,18 @@ async def _get_advisor_profile(session: AsyncSession, advisor_id: uuid.UUID) -> 
     return profile
 
 
+def _sync_connect_flags(profile: AdvisorProfile, account: object) -> None:
+    """Copy the connected account's readiness flags onto the cached profile columns.
+
+    Accepts a Stripe ``Account`` object or a webhook payload dict interchangeably
+    (via ``_stripe_get``) so both the live-status path and the account.updated
+    webhook can share it.
+    """
+    profile.stripe_charges_enabled = bool(_stripe_get(account, "charges_enabled", False))
+    profile.stripe_payouts_enabled = bool(_stripe_get(account, "payouts_enabled", False))
+    profile.stripe_details_submitted = bool(_stripe_get(account, "details_submitted", False))
+
+
 async def create_checkout_session(
     session: AsyncSession,
     booking_id: uuid.UUID,
@@ -115,6 +128,18 @@ async def create_checkout_session(
         raise AppError("Booking is not in a payable state", code="invalid_booking_state")
     if booking.payment_status != PaymentStatus.unpaid:
         raise AppError("Booking is already paid or refunded", code="already_paid")
+    # Advisor-created (free) bookings are not payable through checkout.
+    if booking.price_usd <= 0:
+        raise AppError("Booking has no payable amount", code="not_payable")
+
+    # Payout-readiness gate: the advisor must have a Connect account that can accept
+    # transfers before a seeker can pay them — otherwise funds would land on the
+    # platform with no destination for the delayed payout.
+    advisor_profile = await _get_advisor_profile(session, booking.advisor_id)
+    if not (advisor_profile.stripe_account_id and advisor_profile.stripe_charges_enabled):
+        raise AppError(
+            "Advisor is not set up to receive payments yet", code="advisor_not_payable"
+        )
 
     # Resume an existing open Checkout Session instead of hard-failing.
     existing = (
@@ -146,8 +171,6 @@ async def create_checkout_session(
         await session.delete(existing)
         await session.flush()
 
-    advisor_profile = await _get_advisor_profile(session, booking.advisor_id)
-
     commission_rate = settings.PLATFORM_COMMISSION_RATE
     commission_usd = round(booking.price_usd * commission_rate, 2)
     tax_rate = settings.TAX_WITHHOLDING_RATE
@@ -157,17 +180,10 @@ async def create_checkout_session(
     advisor = await session.get(User, booking.advisor_id)
     advisor_name = advisor.full_name if advisor else "Advisor"
 
-    # Use Stripe Connect when the advisor has a connected account; otherwise
-    # collect to the platform account and track the expected advisor payout.
-    # The platform retains commission + withheld tax; the connected account
-    # only receives advisor_payout_usd.
-    payment_intent_data: dict[str, object] = {}
-    if advisor_profile.stripe_account_id:
-        payment_intent_data = {
-            "application_fee_amount": int(round((commission_usd + tax_usd) * 100)),
-            "transfer_data": {"destination": advisor_profile.stripe_account_id},
-        }
-
+    # Separate charges & transfers: the full amount is charged to the platform
+    # account now. The advisor's share (advisor_payout_usd) is transferred to their
+    # connected account later, after the hold window — see run_due_transfers. The
+    # platform keeps commission + withheld tax on its own balance.
     checkout_session = await stripe.checkout.Session.create_async(
         payment_method_types=["card"],
         line_items=[
@@ -184,9 +200,6 @@ async def create_checkout_session(
             }
         ],
         mode="payment",
-        # Stripe's stubs expose ~40 individually-typed overloaded kwargs for this
-        # call; a dict splat can't type-check against that regardless of shape.
-        **({"payment_intent_data": payment_intent_data} if payment_intent_data else {}),  # type: ignore[arg-type]
         success_url=f"{settings.FRONTEND_URL}/bookings/{booking_id}?payment=success",
         cancel_url=f"{settings.FRONTEND_URL}/bookings/{booking_id}?payment=cancelled",
         metadata={"booking_id": str(booking_id)},
@@ -205,7 +218,25 @@ async def create_checkout_session(
         created_by=seeker_id,
     )
     session.add(txn)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        # Concurrent checkout won the unique booking_id insert. Roll back our attempt
+        # and return the winner's open session instead of surfacing a 500.
+        await session.rollback()
+        winner = (
+            await session.execute(select(Transaction).where(Transaction.booking_id == booking_id))
+        ).scalar_one_or_none()
+        if winner is not None and winner.status == TransactionStatus.pending:
+            resumed = await stripe.checkout.Session.retrieve_async(
+                winner.stripe_checkout_session_id
+            )
+            resumed_url = getattr(resumed, "url", None)
+            if resumed_url:
+                return CheckoutResponse(checkout_url=resumed_url, session_id=resumed.id)
+        raise AppError(
+            "A checkout session already exists for this booking", code="duplicate_checkout"
+        ) from exc
     await _log_event(session, txn.id, TransactionEventType.initiated)
 
     log.info(
@@ -250,6 +281,32 @@ async def handle_webhook(
         await _handle_checkout_expired(session, event["data"]["object"])
     elif event_type == "charge.refunded":
         await _handle_charge_refunded(session, event["data"]["object"])
+    elif event_type == "account.updated":
+        await _handle_account_updated(session, event["data"]["object"])
+
+
+async def _handle_account_updated(session: AsyncSession, account: object) -> None:
+    """Refresh an advisor's cached Connect readiness flags from an account.updated event."""
+    account_id = str(_stripe_get(account, "id") or "")
+    if not account_id:
+        return
+    profile = (
+        await session.execute(
+            select(AdvisorProfile).where(AdvisorProfile.stripe_account_id == account_id)
+        )
+    ).scalar_one_or_none()
+    if profile is None:
+        log.warning("webhook_account_updated_no_profile", account_id=account_id)
+        return
+    _sync_connect_flags(profile, account)
+    session.add(profile)
+    await session.flush()
+    log.info(
+        "connect_account_updated",
+        account_id=account_id,
+        charges_enabled=profile.stripe_charges_enabled,
+        payouts_enabled=profile.stripe_payouts_enabled,
+    )
 
 
 async def _next_invoice_number(session: AsyncSession) -> int:
@@ -285,6 +342,12 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
     if txn is None:
         log.warning("webhook_checkout_no_txn", session_id=session_id)
         return
+    # Idempotent against duplicate webhook delivery — Stripe may deliver the same
+    # event more than once. If we've already processed this checkout, do nothing
+    # (re-running would re-arm the hold and re-send the receipt).
+    if txn.status == TransactionStatus.succeeded:
+        log.info("webhook_checkout_already_processed", session_id=session_id)
+        return
 
     raw_pi = _stripe_get(cs, "payment_intent")
     pi_id: str | None = None
@@ -311,10 +374,15 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
     txn.stripe_payment_intent_id = pi_id
     txn.stripe_charge_id = charge_id
     txn.invoice_number = await _next_invoice_number(session)
+    # Arm the delayed payout: hold the advisor's share, then let the sweep transfer
+    # it after the window. Refunds are only possible while transfer_status is pending.
+    txn.transfer_after = datetime.now(UTC) + timedelta(minutes=settings.PAYOUT_HOLD_MINUTES)
+    txn.transfer_status = TransferStatus.pending
     session.add(txn)
     await _log_event(session, txn.id, TransactionEventType.authorized)
     await _log_event(session, txn.id, TransactionEventType.completed)
     await _log_event(session, txn.id, TransactionEventType.invoice_generated)
+    await _log_event(session, txn.id, TransactionEventType.transfer_scheduled)
 
     booking = await session.get(Booking, txn.booking_id)
     if booking is not None:
@@ -377,6 +445,10 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
     txn.status = TransactionStatus.refunded if is_full else TransactionStatus.partially_refunded
     txn.refunded_amount_usd = refunded_amount_usd
     txn.refunded_at = datetime.now(UTC)
+    # A refund that arrives while the payout is still held cancels it (e.g. a refund
+    # issued directly from the Stripe dashboard).
+    if txn.transfer_status == TransferStatus.pending:
+        txn.transfer_status = TransferStatus.cancelled
     session.add(txn)
     await _log_event(session, txn.id, TransactionEventType.refunded)
     if is_full:
@@ -399,14 +471,29 @@ async def refund_transaction(
     settings: Settings,
     amount_usd: float | None = None,
 ) -> Transaction:
-    """Issue a full or partial refund. ``amount_usd=None`` refunds the full amount."""
+    """Issue a full or partial refund. ``amount_usd=None`` refunds the full amount.
+
+    Refunds are only permitted during the payout hold window (``transfer_status ==
+    pending``). Once the sweep has transferred the advisor's share the payment is
+    locked. The row is locked FOR UPDATE so this serialises against the sweep — see
+    run_due_transfers.
+    """
     _init_stripe(settings)
 
-    txn = await session.get(Transaction, transaction_id)
+    txn = (
+        await session.execute(
+            select(Transaction).where(Transaction.id == transaction_id).with_for_update()
+        )
+    ).scalar_one_or_none()
     if txn is None:
         raise NotFoundError("Transaction not found")
     if txn.status != TransactionStatus.succeeded:
         raise AppError("Only succeeded transactions can be refunded", code="not_refundable")
+    # Refund window: closed once the advisor payout has been transferred.
+    if txn.transfer_status in (TransferStatus.completed, TransferStatus.failed):
+        raise AppError(
+            "The refund window has closed for this payment", code="refund_window_closed"
+        )
 
     refund_amount = amount_usd if amount_usd is not None else txn.amount_usd
     if refund_amount > txn.amount_usd:
@@ -434,6 +521,10 @@ async def refund_transaction(
     txn.refund_reason = reason
     txn.refunded_amount_usd = refund_amount
     txn.updated_by = admin_id
+    # Cancel the pending payout so the sweep never fires — nothing was transferred,
+    # so the refund comes entirely from the platform balance.
+    if txn.transfer_status == TransferStatus.pending:
+        txn.transfer_status = TransferStatus.cancelled
     session.add(txn)
     await _log_event(session, txn.id, TransactionEventType.refunded)
     if is_full:
@@ -450,6 +541,115 @@ async def refund_transaction(
         "payment_refunded_by_admin", transaction_id=str(transaction_id), admin_id=str(admin_id)
     )
     return txn
+
+
+# After this many failed transfer attempts the sweep gives up and marks the txn
+# transfer_status=failed so it needs manual intervention (funds stay on the platform).
+_MAX_TRANSFER_ATTEMPTS = 5
+
+
+async def run_due_transfers(session: AsyncSession, settings: Settings) -> int:
+    """Sweep: transfer the advisor's share for payments whose hold window has elapsed.
+
+    Selects succeeded transactions with ``transfer_status == pending`` and
+    ``transfer_after <= now``, locking each row ``FOR UPDATE SKIP LOCKED`` so
+    overlapping sweeps (or multiple app instances) never process the same row twice.
+    Each transfer uses ``idempotency_key = txn.id`` so a retry after a crash between
+    the Stripe call and the DB commit returns the same transfer instead of creating
+    a second one. Returns the number of transfers completed this pass.
+    """
+    _init_stripe(settings)
+
+    now = datetime.now(UTC)
+    due = (
+        (
+            await session.execute(
+                select(Transaction)
+                .where(
+                    Transaction.status == TransactionStatus.succeeded,
+                    Transaction.transfer_status == TransferStatus.pending,
+                    Transaction.transfer_after.is_not(None),
+                    Transaction.transfer_after <= now,
+                )
+                .with_for_update(skip_locked=True)
+                .limit(100)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    completed = 0
+    for txn in due:
+        booking = await session.get(Booking, txn.booking_id)
+        if booking is None:
+            continue
+        advisor_profile = (
+            await session.execute(
+                select(AdvisorProfile).where(AdvisorProfile.user_id == booking.advisor_id)
+            )
+        ).scalar_one_or_none()
+        if advisor_profile is None or not advisor_profile.stripe_account_id:
+            # Shouldn't happen (checkout gates on this), but never transfer without
+            # a destination — leave pending and record the reason.
+            txn.transfer_attempts += 1
+            txn.transfer_last_error = "advisor has no connected account"
+            session.add(txn)
+            continue
+
+        transfer_params: dict[str, object] = {
+            "amount": int(round(txn.advisor_payout_usd * 100)),
+            "currency": "usd",
+            "destination": advisor_profile.stripe_account_id,
+            "metadata": {"transaction_id": str(txn.id), "booking_id": str(txn.booking_id)},
+        }
+        # Tie the transfer to the original charge so it draws from those funds.
+        if txn.stripe_charge_id:
+            transfer_params["source_transaction"] = txn.stripe_charge_id
+        try:
+            # Same overloaded-kwargs stub mismatch as the checkout / refund calls; the
+            # idempotency_key makes a retry after a mid-call crash return the same
+            # transfer instead of creating a second one.
+            transfer = await stripe.Transfer.create_async(
+                **transfer_params,  # type: ignore[arg-type]
+                idempotency_key=f"transfer_{txn.id}",
+            )
+        except stripe.StripeError as exc:
+            txn.transfer_attempts += 1
+            txn.transfer_last_error = str(exc)[:500]
+            if txn.transfer_attempts >= _MAX_TRANSFER_ATTEMPTS:
+                txn.transfer_status = TransferStatus.failed
+                await _log_event(session, txn.id, TransactionEventType.transfer_failed)
+                log.error(
+                    "transfer_failed_terminal",
+                    transaction_id=str(txn.id),
+                    attempts=txn.transfer_attempts,
+                    error=str(exc),
+                )
+            else:
+                log.warning(
+                    "transfer_attempt_failed",
+                    transaction_id=str(txn.id),
+                    attempts=txn.transfer_attempts,
+                    error=str(exc),
+                )
+            session.add(txn)
+            continue
+
+        txn.stripe_transfer_id = transfer.id
+        txn.transfer_status = TransferStatus.completed
+        session.add(txn)
+        await _log_event(session, txn.id, TransactionEventType.transfer_completed)
+        completed += 1
+        log.info(
+            "transfer_completed",
+            transaction_id=str(txn.id),
+            transfer_id=transfer.id,
+            amount_usd=txn.advisor_payout_usd,
+        )
+
+    await session.flush()
+    return completed
 
 
 async def create_connect_account(
@@ -487,10 +687,13 @@ async def create_connect_account(
         return_url=f"{settings.FRONTEND_URL}/advisor/connect/return",
         type="account_onboarding",
     )
+    # Reflect any cached readiness for advisors resuming onboarding (the flags are
+    # authoritatively refreshed by get_connect_status / the account.updated webhook).
     return AdvisorConnectStatus(
         stripe_account_id=profile.stripe_account_id,
-        charges_enabled=False,
-        onboarding_complete=False,
+        charges_enabled=profile.stripe_charges_enabled,
+        payouts_enabled=profile.stripe_payouts_enabled,
+        onboarding_complete=profile.stripe_details_submitted and profile.stripe_charges_enabled,
         onboarding_url=account_link.url,
     )
 
@@ -512,15 +715,17 @@ async def get_connect_status(
         )
 
     account = await stripe.Account.retrieve_async(profile.stripe_account_id)
-    charges_enabled: bool = bool(account.get("charges_enabled", False))  # type: ignore[attr-defined]
-    details_submitted: bool = bool(
-        account.get("details_submitted", False)  # type: ignore[attr-defined]
-    )
+    # Refresh the cached readiness flags on every live status check so the checkout
+    # gate stays current even between account.updated webhook deliveries.
+    _sync_connect_flags(profile, account)
+    session.add(profile)
+    await session.flush()
 
     return AdvisorConnectStatus(
         stripe_account_id=profile.stripe_account_id,
-        charges_enabled=charges_enabled,
-        onboarding_complete=details_submitted and charges_enabled,
+        charges_enabled=profile.stripe_charges_enabled,
+        payouts_enabled=profile.stripe_payouts_enabled,
+        onboarding_complete=profile.stripe_details_submitted and profile.stripe_charges_enabled,
     )
 
 

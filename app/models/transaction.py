@@ -21,6 +21,20 @@ class TransactionStatus(StrEnum):
     failed = "failed"  # checkout session expired or payment failed
 
 
+class TransferStatus(StrEnum):
+    """Lifecycle of the delayed payout transfer to the advisor's connected account.
+
+    A payment charges the platform account immediately, but the advisor's share is
+    held for a fixed window (settings.PAYOUT_HOLD_MINUTES) before being transferred.
+    """
+
+    none = "none"  # no transfer applicable yet (payment not succeeded)
+    pending = "pending"  # hold armed; a transfer is scheduled for transfer_after
+    completed = "completed"  # transfer created on Stripe; payment now locked
+    cancelled = "cancelled"  # refunded during the hold window; no transfer will fire
+    failed = "failed"  # transfer attempts exhausted; needs manual intervention
+
+
 class Transaction(BaseModel):
     __tablename__ = "transactions"
 
@@ -37,6 +51,24 @@ class Transaction(BaseModel):
         String(255), nullable=True, index=True
     )
     stripe_charge_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Delayed payout (Stripe Connect separate charges & transfers). The charge lands
+    # on the platform; the advisor's share transfers after a hold window. transfer_after
+    # is indexed because the periodic sweep queries `pending` rows due before now.
+    transfer_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    transfer_status: Mapped[TransferStatus] = mapped_column(
+        SAEnum(TransferStatus, name="transfer_status"),
+        default=TransferStatus.none,
+        server_default=TransferStatus.none.value,
+        nullable=False,
+    )
+    stripe_transfer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    transfer_attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    transfer_last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     amount_usd: Mapped[float] = mapped_column(Float, nullable=False)
     commission_rate: Mapped[float] = mapped_column(Float, nullable=False)
