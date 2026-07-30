@@ -95,6 +95,10 @@ class Settings(BaseSettings):
     PLATFORM_COMMISSION_RATE: float = 0.15  # 15% platform commission, configurable
     TAX_WITHHOLDING_RATE: float = 0.08  # 8% tax withheld from advisor payouts, configurable
     PAYOUT_PROCESSING_FEE_RATE: float = 0.02  # 2% fee on manual payout requests, configurable
+    # Delayed payout: how long the platform holds the advisor's share before the
+    # automatic Connect transfer fires. Refunds are only possible during this window.
+    PAYOUT_HOLD_MINUTES: int = 2
+    TRANSFER_SWEEP_SECONDS: int = 60  # how often the background sweep runs due transfers
     INVOICE_FROM_ADDRESS: str | None = None  # optional platform address on invoices
     INVOICE_FROM_PHONE: str | None = None  # optional platform phone on invoices
 

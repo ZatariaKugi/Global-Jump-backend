@@ -30,6 +30,7 @@ dependencies = [
     "boto3>=1.43.36",
     "stripe>=7.0.0",
     "openai>=1.60.0",
+    "apscheduler>=3.11.3",
 ]
 
 [dependency-groups]
