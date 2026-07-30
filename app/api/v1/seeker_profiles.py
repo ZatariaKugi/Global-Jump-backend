@@ -18,6 +18,7 @@ from app.db.session import SessionDep
 from app.models.seeker_document import DocumentCategory, SeekerDocumentStatus
 from app.models.user import User, UserRole
 from app.schemas.response import Meta, ResponseEnvelope
+from app.schemas.seeker_dashboard import SeekerDashboardRead
 from app.schemas.seeker_document import (
     DocumentCommentCreate,
     DocumentCommentRead,
@@ -35,6 +36,7 @@ from app.schemas.seeker_profile import (
 from app.schemas.visa_journey import VisaJourneyRead
 from app.services import (
     ai_insight_service,
+    seeker_dashboard_service,
     seeker_document_service,
     seeker_profile_service,
     visa_journey_service,
@@ -112,6 +114,60 @@ async def update_my_profile(
     profile = await seeker_profile_service.update(session, profile, data, settings)
     return ResponseEnvelope[SeekerProfileRead](
         data=seeker_profile_service.build_read(profile, settings),
+        meta=Meta(request_id=request_id),
+    )
+
+
+# ── Seeker home dashboard ────────────────────────────────────────────────────
+
+
+@router.get(
+    "/dashboard",
+    response_model=ResponseEnvelope[SeekerDashboardRead],
+    summary="Seeker home dashboard",
+    description=(
+        "Single source of truth for the seeker home screen — next-appointment "
+        "banner, stat cards, per-stage visa journey chart, eligibility donut, "
+        "and AI-matched advisors. ``next_upcoming`` matches the GET /bookings "
+        "field of the same name. "
+        "``visa_type`` / ``country`` default from the seeker profile when omitted. "
+        "``eligibility_*`` figures and ``matched_advisors`` come from the latest "
+        "completed assessment for that scope and are null/empty until one exists. "
+        "All figures are current-state — there is no ``days`` window."
+    ),
+)
+async def get_my_dashboard(
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+    visa_type: Annotated[OptionalVisaType, Query()] = None,
+    country: Annotated[
+        str | None,
+        Query(min_length=2, max_length=2, description="ISO 3166-1 alpha-2 destination"),
+    ] = None,
+) -> ResponseEnvelope[SeekerDashboardRead]:
+    _require_seeker(current_user)
+    if country is not None and country_code(country) is None:
+        raise AppError("Unknown country code", code="invalid_country")
+
+    profile = await seeker_profile_service.get_or_create(session, current_user.id)
+    resolved_visa = visa_type
+    if resolved_visa is None and profile.intended_visa_type:
+        resolved_visa = parse_visa_type(profile.intended_visa_type)
+    resolved_country = country.upper() if country else None
+    if resolved_country is None and profile.intended_destination:
+        resolved_country = profile.intended_destination.upper()
+
+    dashboard = await seeker_dashboard_service.get_dashboard(
+        session,
+        current_user.id,
+        settings,
+        visa_type=resolved_visa,
+        country=resolved_country,
+    )
+    return ResponseEnvelope[SeekerDashboardRead](
+        data=dashboard,
         meta=Meta(request_id=request_id),
     )
 

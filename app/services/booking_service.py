@@ -382,6 +382,27 @@ async def get_next_upcoming(
     return result.scalars().first()
 
 
+async def read_booking(
+    session: AsyncSession, booking: Booking, *, settings: Settings
+) -> BookingRead:
+    """Fully-resolved ``BookingRead`` (party names, photos, review id) for
+    callers outside the bookings router — e.g. the seeker dashboard banner."""
+    seeker = await session.get(User, booking.seeker_id)
+    advisor = await session.get(User, booking.advisor_id)
+    advisor_photos = await advisor_photo_keys(session, {booking.advisor_id})
+    seeker_photos = await seeker_photo_keys(session, {booking.seeker_id})
+    review_ids = await review_ids_by_booking(session, {booking.id})
+    return build_read(
+        booking,
+        seeker,
+        advisor,
+        settings=settings,
+        advisor_profile_photo_key=advisor_photos.get(booking.advisor_id),
+        seeker_profile_photo_key=seeker_photos.get(booking.seeker_id),
+        review_id=review_ids.get(booking.id),
+    )
+
+
 async def get_for_party(
     session: AsyncSession, booking_id: uuid.UUID, user_id: uuid.UUID
 ) -> Booking:

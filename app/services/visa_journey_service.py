@@ -7,6 +7,7 @@ for the requested (or profile-default) visa type + destination country.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -66,6 +67,26 @@ _ACTIVE_BOOKING = (
     BookingStatus.confirmed,
     BookingStatus.completed,
 )
+
+STEP_KEYS: tuple[JourneyStepKey, ...] = tuple(key for key, _, _ in _STEP_COPY)
+
+# application_preparation is computed but hidden from the visa-journey stepper;
+# progress/completed counts are defined over the visible steps only.
+VISIBLE_STEP_KEYS: tuple[JourneyStepKey, ...] = tuple(
+    key for key in STEP_KEYS if key != JourneyStepKey.application_preparation
+)
+
+
+@dataclass
+class JourneyState:
+    """Computed journey inputs shared by the visa-journey endpoint and the
+    seeker dashboard aggregate — statuses cover all ``STEP_KEYS`` including
+    the hidden ``application_preparation``."""
+
+    assessment: Assessment | None
+    booking: Booking | None
+    summary: DocumentPortfolioSummary
+    statuses: dict[JourneyStepKey, JourneyStepStatus]
 
 
 async def _latest_assessment(
@@ -197,16 +218,20 @@ def _submission_status(unlocked: bool, *, done: bool) -> JourneyStepStatus:
     return JourneyStepStatus.in_progress
 
 
-def _overall_progress(steps: list[VisaJourneyStep], doc_progress: int) -> int:
-    total = len(steps)
+def overall_progress(
+    statuses: dict[JourneyStepKey, JourneyStepStatus], doc_progress: int
+) -> int:
+    """Weighted 0–100 progress over the visible steps only."""
+    total = len(VISIBLE_STEP_KEYS)
     if total == 0:
         return 0
     score = 0.0
-    for step in steps:
-        if step.status == JourneyStepStatus.completed:
+    for key in VISIBLE_STEP_KEYS:
+        status = statuses[key]
+        if status == JourneyStepStatus.completed:
             score += 1.0
-        elif step.status == JourneyStepStatus.in_progress:
-            if step.key == JourneyStepKey.documentation:
+        elif status == JourneyStepStatus.in_progress:
+            if key == JourneyStepKey.documentation:
                 score += max(0.0, min(doc_progress, 100)) / 100.0
             else:
                 score += 0.5
@@ -277,15 +302,14 @@ async def _build_suggestion(
     return None
 
 
-async def get_journey(
+async def compute_state(
     session: AsyncSession,
     seeker_id: uuid.UUID,
-    settings: Settings,
     *,
     visa_type: VisaType | None,
     country: str | None,
-) -> VisaJourneyRead:
-    """Build the Visa Journey Tracking payload for the seeker."""
+) -> JourneyState:
+    """Compute step statuses (all ``STEP_KEYS``) from portfolio data."""
     assessment = await _latest_assessment(session, seeker_id, visa_type, country)
     booking = await _latest_booking(session, seeker_id)
     summary = await seeker_document_service.portfolio_summary(
@@ -324,10 +348,28 @@ async def get_journey(
         JourneyStepKey.application_preparation: prep_st,
         JourneyStepKey.submission: submission_st,
     }
-
-    visible_step_copy = tuple(
-        item for item in _STEP_COPY if item[0] != JourneyStepKey.application_preparation
+    return JourneyState(
+        assessment=assessment,
+        booking=booking,
+        summary=summary,
+        statuses=statuses,
     )
+
+
+async def get_journey(
+    session: AsyncSession,
+    seeker_id: uuid.UUID,
+    settings: Settings,
+    *,
+    visa_type: VisaType | None,
+    country: str | None,
+) -> VisaJourneyRead:
+    """Build the Visa Journey Tracking payload for the seeker."""
+    state = await compute_state(session, seeker_id, visa_type=visa_type, country=country)
+    assessment, booking, summary = state.assessment, state.booking, state.summary
+    statuses = state.statuses
+
+    visible_step_copy = tuple(item for item in _STEP_COPY if item[0] in VISIBLE_STEP_KEYS)
 
     steps: list[VisaJourneyStep] = []
     for order, (key, title, description) in enumerate(visible_step_copy, start=1):
@@ -379,7 +421,7 @@ async def get_journey(
         current_status_label=status_label,
         completed_steps=completed_steps,
         total_steps=len(steps),
-        progress_percent=_overall_progress(steps, summary.progress_percent),
+        progress_percent=overall_progress(statuses, summary.progress_percent),
         steps=steps,
         advisor_suggestion=suggestion,
         assessment_id=assessment.id if assessment else None,
