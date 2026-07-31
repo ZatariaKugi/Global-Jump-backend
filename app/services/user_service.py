@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -13,7 +15,13 @@ from app.core.file_storage import resolve_media_url
 from app.core.security import hash_password, verify_password
 from app.models.advisor_profile import AdvisorProfile
 from app.models.seeker_profile import SeekerProfile
-from app.models.user import SignupSource, User, UserRole, VerificationStatus
+from app.models.user import (
+    AuthProvider,
+    SignupSource,
+    User,
+    UserRole,
+    VerificationStatus,
+)
 from app.schemas.advisor import AdvisorCreate
 from app.schemas.user import UserCreate, UserRead, UserUpdate
 
@@ -92,6 +100,89 @@ async def create_advisor(session: AsyncSession, data: AdvisorCreate) -> User:
     return user
 
 
+def _guard_google_login(user: User, requested_role: UserRole) -> None:
+    """Enforce role match and advisor-rejection for a Google sign-in.
+
+    One account per email: a seeker cannot sign in through the advisor button and
+    vice versa, and admin accounts never sign in via the Google seeker/advisor
+    buttons (requested role is only ever seeker/advisor).
+    """
+    if user.role != requested_role:
+        raise ConflictError(
+            f"This email is already registered as a {user.role.value}. "
+            f"Please sign in as a {user.role.value}."
+        )
+    if user.role == UserRole.advisor and user.verification_status == VerificationStatus.rejected:
+        raise AuthenticationError(
+            "Your account was rejected by an admin. Please contact support."
+        )
+
+
+async def get_or_create_google_user(
+    session: AsyncSession,
+    email: str,
+    full_name: str | None,
+    role: UserRole,
+) -> User:
+    """Resolve a Google identity to a local User (auto-link or create).
+
+    ``role`` is the role requested on the frontend, carried through the signed
+    OAuth state. Only ``seeker``/``advisor`` are valid.
+    """
+    if role not in (UserRole.seeker, UserRole.advisor):
+        raise AuthenticationError("Unsupported role for Google sign-in")
+
+    now = datetime.now(UTC)
+
+    existing = await get_by_email(session, email)
+    if existing is not None:
+        _guard_google_login(existing, role)
+        # Auto-link: Google verifies the email, so stamp it if not already set.
+        if existing.email_verified_at is None:
+            existing.email_verified_at = now
+            session.add(existing)
+            await session.flush()
+        return existing
+
+    # New account. Guard the check-then-insert TOCTOU: a concurrent first
+    # sign-in for the same email would otherwise violate the unique email
+    # constraint. Insert inside a SAVEPOINT and, on conflict, fall back to the
+    # auto-link path with the now-existing row.
+    user = User(
+        email=email,
+        full_name=full_name,
+        hashed_password=None,
+        role=role,
+        auth_provider=AuthProvider.google,
+        email_verified_at=now,
+        signup_source=SignupSource.organic,
+    )
+    if role == UserRole.advisor:
+        # Mirror create_advisor: inactive until an admin approves.
+        user.is_active = False
+        user.verification_status = VerificationStatus.pending
+
+    try:
+        async with session.begin_nested():
+            session.add(user)
+            await session.flush()
+    except IntegrityError:
+        # Lost the race — another request created this email first. Re-read and
+        # treat it as an auto-link.
+        winner = await get_by_email(session, email)
+        if winner is None:  # pragma: no cover - only if the conflict was unrelated
+            raise
+        _guard_google_login(winner, role)
+        if winner.email_verified_at is None:
+            winner.email_verified_at = now
+            session.add(winner)
+            await session.flush()
+        return winner
+
+    await session.refresh(user)
+    return user
+
+
 async def update_user(session: AsyncSession, user: User, data: UserUpdate) -> User:
     if data.full_name is not None:
         user.full_name = data.full_name
@@ -112,9 +203,16 @@ async def authenticate(session: AsyncSession, email: str, password: str) -> User
     Raises :class:`AuthenticationError` on any failure.
     """
     user = await get_by_email(session, email)
-    # Always run the Argon2 check — use the real hash when the user exists,
-    # a pre-computed sentinel otherwise — so response time is constant.
-    candidate_hash = user.hashed_password if user is not None else _TIMING_SENTINEL_HASH
+    # Always run the Argon2 check — use the real hash when the user exists and
+    # has one, a pre-computed sentinel otherwise — so response time is constant.
+    # A Google-only account has ``hashed_password is None``; falling back to the
+    # sentinel keeps ``verify_password`` from crashing on ``None`` and makes such
+    # an account indistinguishable from a wrong password (clean 401, no leak).
+    candidate_hash = (
+        user.hashed_password
+        if user is not None and user.hashed_password is not None
+        else _TIMING_SENTINEL_HASH
+    )
     password_ok = verify_password(password, candidate_hash)
     if user is None or not password_ok:
         raise AuthenticationError("Incorrect email or password")

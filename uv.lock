@@ -564,6 +564,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "fastapi-mail" },
+    { name = "httpx" },
     { name = "jinja2" },
     { name = "openai" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
@@ -588,7 +589,6 @@ dependencies = [
 dev = [
     { name = "aiosqlite" },
     { name = "asgi-lifespan" },
-    { name = "httpx" },
     { name = "mypy" },
     { name = "pre-commit" },
     { name = "pytest" },
@@ -606,6 +606,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=43.0.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "fastapi-mail", specifier = ">=1.6.4" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "openai", specifier = ">=1.60.0" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.28.0" },
@@ -630,7 +631,6 @@ requires-dist = [
 dev = [
     { name = "aiosqlite", specifier = ">=0.20.0" },
     { name = "asgi-lifespan", specifier = ">=2.1.0" },
-    { name = "httpx", specifier = ">=0.27.0" },
     { name = "mypy", specifier = ">=1.13.0" },
     { name = "pre-commit", specifier = ">=4.0.0" },
     { name = "pytest", specifier = ">=8.3.0" },

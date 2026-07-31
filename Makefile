@@ -2,7 +2,7 @@ UV ?= uv
 UV_RUN ?= $(UV) run
 APP ?= app.main:app
 HOST ?= 0.0.0.0
-PORT ?= 8020
+PORT ?= 8000
 MSG ?= new_migration
 
 .DEFAULT_GOAL := help

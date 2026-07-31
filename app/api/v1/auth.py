@@ -11,13 +11,17 @@ and ``token_type``.
 from __future__ import annotations
 
 from typing import Annotated
+from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
+from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 
 from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
+from app.core.exceptions import AppError, NotFoundError
 from app.core.rate_limit import enforce_cooldown
 from app.db.session import SessionDep
+from app.models.user import UserRole
 from app.schemas.advisor import AdvisorCreate, AdvisorRead
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.token import (
@@ -29,7 +33,12 @@ from app.schemas.token import (
     TokenPair,
 )
 from app.schemas.user import UserCreate, UserRead
-from app.services import activity_log_service, auth_service, user_service
+from app.services import (
+    activity_log_service,
+    auth_service,
+    google_oauth_service,
+    user_service,
+)
 from app.services.email_service import send_password_reset_email, send_verification_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -129,6 +138,85 @@ async def logout(
 ) -> None:
     """Revoke the provided refresh token (requires a valid access token)."""
     await auth_service.revoke_refresh_token(session, body.refresh_token)
+
+
+# ---------------------------------------------------------------------------
+# Google OAuth (authorization-code flow)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/google/login")
+async def google_login(
+    settings: SettingsDep,
+    role: Annotated[UserRole, Query()] = UserRole.seeker,
+) -> RedirectResponse:
+    """Redirect the browser to Google's consent screen.
+
+    ``role`` (seeker/advisor) is chosen by which signup button was clicked and is
+    carried through Google via the signed ``state``.
+    """
+    if not settings.google_oauth_enabled:
+        raise NotFoundError("Google sign-in is not configured")
+    if role not in (UserRole.seeker, UserRole.advisor):
+        raise NotFoundError("Google sign-in supports seeker and advisor roles only")
+
+    state = google_oauth_service.sign_state(role, settings)
+    url = google_oauth_service.build_authorization_url(settings, state)
+    return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
+
+
+@router.get("/google/callback")
+async def google_callback(
+    session: SessionDep,
+    settings: SettingsDep,
+    code: Annotated[str | None, Query()] = None,
+    state: Annotated[str | None, Query()] = None,
+    error: Annotated[str | None, Query()] = None,
+) -> RedirectResponse:
+    """Handle Google's redirect: verify state, exchange code, issue our tokens.
+
+    Always redirects back to ``{FRONTEND_URL}/auth/callback``. On success the
+    fragment carries the token pair; on any failure it carries ``error=<code>``
+    so the frontend can show a message on its own login screen.
+    """
+    base = f"{settings.FRONTEND_URL}/auth/callback"
+
+    def redirect(**fragment: str) -> RedirectResponse:
+        return RedirectResponse(
+            f"{base}#{urlencode(fragment)}", status_code=status.HTTP_302_FOUND
+        )
+
+    if not settings.google_oauth_enabled:
+        raise NotFoundError("Google sign-in is not configured")
+
+    # User denied consent (or Google returned an error) — bounce back cleanly.
+    if error:
+        return redirect(error=error)
+    if not code or not state:
+        return redirect(error="invalid_request")
+
+    try:
+        # Validate state (signature + CSRF nonce) and decode the role BEFORE any
+        # network call, so a forged/expired state is rejected cheaply.
+        requested_role = google_oauth_service.verify_state(state, settings)
+        google_user = await google_oauth_service.exchange_code(code, settings)
+        if not google_user.email_verified:
+            return redirect(error="email_unverified")
+
+        user = await user_service.get_or_create_google_user(
+            session,
+            email=google_user.email,
+            full_name=google_user.full_name,
+            role=requested_role,
+        )
+        await activity_log_service.record_login(session, user.id)
+        access_token, raw_refresh = await auth_service.create_token_pair(session, user, settings)
+    except AppError as exc:
+        # ConflictError (role mismatch) / AuthenticationError (bad code, rejected
+        # advisor, unverified) — surface as a fragment error, never a JSON page.
+        return redirect(error=exc.code)
+
+    return redirect(access_token=access_token, refresh_token=raw_refresh)
 
 
 # ---------------------------------------------------------------------------

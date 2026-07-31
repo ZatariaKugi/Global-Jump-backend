@@ -35,12 +35,18 @@ class SignupSource(StrEnum):
     other = "other"
 
 
+class AuthProvider(StrEnum):
+    local = "local"  # password account issued by this service
+    google = "google"  # created/linked via Google OAuth
+
+
 class User(BaseModel):
     __tablename__ = "users"
 
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
     full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Nullable: Google-only accounts have no password (auth_provider=google).
+    hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True, server_default="true", nullable=False)
     # Explicit admin soft-suspend — distinct from advisor onboarding (is_active=False + pending).
     is_suspended: Mapped[bool] = mapped_column(
@@ -78,6 +84,13 @@ class User(BaseModel):
         server_default=SignupSource.organic.value,
         nullable=False,
         sort_order=106,
+    )
+    auth_provider: Mapped[AuthProvider] = mapped_column(
+        SAEnum(AuthProvider, name="auth_provider"),
+        default=AuthProvider.local,
+        server_default=AuthProvider.local.value,
+        nullable=False,
+        sort_order=107,
     )
 
     @property

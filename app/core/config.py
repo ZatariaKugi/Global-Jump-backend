@@ -65,6 +65,14 @@ class Settings(BaseSettings):
     IDENTITY_ISSUER: str = "identity-service"
     IDENTITY_AUDIENCE: str = "globlejump"
 
+    # Auth — Google OAuth (authorization-code flow) -------------------------
+    # GOOGLE_REDIRECT_URI must match the value registered in the Google Cloud
+    # console byte-for-byte, including the API + auth prefix, e.g.
+    # http://localhost:8000/api/v1/auth/google/callback
+    GOOGLE_CLIENT_ID: str | None = None
+    GOOGLE_CLIENT_SECRET: str | None = None
+    GOOGLE_REDIRECT_URI: str | None = None
+
     # Email ---------------------------------------------------------------
     SMTP_HOST: str | None = None
     SMTP_PORT: int = 587
@@ -129,6 +137,9 @@ class Settings(BaseSettings):
         "STRIPE_WEBHOOK_SECRET",
         "STRIPE_PUBLISHABLE_KEY",
         "OPENAI_API_KEY",
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "GOOGLE_REDIRECT_URI",
         mode="before",
     )
     @classmethod
@@ -162,6 +173,12 @@ class Settings(BaseSettings):
     @property
     def external_auth_enabled(self) -> bool:
         return bool(self.IDENTITY_JWT_SECRET or self.IDENTITY_JWKS_URL)
+
+    @property
+    def google_oauth_enabled(self) -> bool:
+        return bool(
+            self.GOOGLE_CLIENT_ID and self.GOOGLE_CLIENT_SECRET and self.GOOGLE_REDIRECT_URI
+        )
 
 
 @lru_cache
