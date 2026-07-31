@@ -100,14 +100,17 @@ async def create_advisor(session: AsyncSession, data: AdvisorCreate) -> User:
     return user
 
 
-def _guard_google_login(user: User, requested_role: UserRole) -> None:
+def _guard_google_login(user: User, requested_role: UserRole | None) -> None:
     """Enforce role match and advisor-rejection for a Google sign-in.
 
     One account per email: a seeker cannot sign in through the advisor button and
-    vice versa, and admin accounts never sign in via the Google seeker/advisor
-    buttons (requested role is only ever seeker/advisor).
+    vice versa, and admin accounts never sign in via Google. A ``None``
+    ``requested_role`` (role-less start) skips the match — the account signs in
+    as whatever role it already has — but stays limited to seeker/advisor.
     """
-    if user.role != requested_role:
+    if user.role not in (UserRole.seeker, UserRole.advisor):
+        raise AuthenticationError("This account cannot sign in with Google")
+    if requested_role is not None and user.role != requested_role:
         raise ConflictError(
             f"This email is already registered as a {user.role.value}. "
             f"Please sign in as a {user.role.value}."
@@ -122,14 +125,16 @@ async def get_or_create_google_user(
     session: AsyncSession,
     email: str,
     full_name: str | None,
-    role: UserRole,
+    role: UserRole | None,
 ) -> User:
     """Resolve a Google identity to a local User (auto-link or create).
 
-    ``role`` is the role requested on the frontend, carried through the signed
-    OAuth state. Only ``seeker``/``advisor`` are valid.
+    ``role`` is the role requested on the frontend (signed OAuth state or the
+    ``/auth/google/complete`` body). ``None`` means "sign in as whatever role the
+    account already has" — valid only for existing accounts; creating a new one
+    requires a concrete seeker/advisor role.
     """
-    if role not in (UserRole.seeker, UserRole.advisor):
+    if role is not None and role not in (UserRole.seeker, UserRole.advisor):
         raise AuthenticationError("Unsupported role for Google sign-in")
 
     now = datetime.now(UTC)
@@ -144,10 +149,11 @@ async def get_or_create_google_user(
             await session.flush()
         return existing
 
-    # New account. Guard the check-then-insert TOCTOU: a concurrent first
-    # sign-in for the same email would otherwise violate the unique email
-    # constraint. Insert inside a SAVEPOINT and, on conflict, fall back to the
-    # auto-link path with the now-existing row.
+
+    if role is None:
+        raise AuthenticationError("A role is required to create a Google account")
+
+
     user = User(
         email=email,
         full_name=full_name,

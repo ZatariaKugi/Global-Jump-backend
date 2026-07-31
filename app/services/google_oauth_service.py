@@ -6,9 +6,16 @@ The backend owns the redirect: it builds the Google authorize URL, receives the
 read the verified identity claims and then issue our own local token pair.
 
 The OAuth ``state`` carries a signed CSRF nonce **and** the requested role
-(``seeker``/``advisor``) so the role selected on the frontend survives the round
-trip through Google. It is a short-lived JWT signed with ``JWT_SECRET`` — a
-forged or tampered ``state`` fails signature verification.
+(``seeker``/``advisor``, or ``None`` when the frontend didn't ask for one) so the
+role selected on the frontend survives the round trip through Google. It is a
+short-lived JWT signed with ``JWT_SECRET`` — a forged or tampered ``state`` fails
+signature verification.
+
+When a *new* user arrives with no role in the state, the callback defers account
+creation: it hands the frontend a signed **pending-signup token** carrying the
+verified Google identity, the frontend shows a "continue as seeker/advisor"
+chooser, and ``POST /auth/google/complete`` turns token + chosen role into the
+actual account.
 """
 
 from __future__ import annotations
@@ -37,6 +44,12 @@ GOOGLE_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
 _STATE_EXPIRE_MINUTES = 10
 _STATE_ISSUER = "globlejump-oauth-state"
 
+# The pending-signup token only needs to survive the frontend's role-chooser
+# screen. Replay is harmless: completing twice hits the existing-email
+# auto-link path in ``get_or_create_google_user``.
+_SIGNUP_EXPIRE_MINUTES = 15
+_SIGNUP_ISSUER = "globlejump-oauth-signup"
+
 
 @dataclass(slots=True)
 class GoogleUserInfo:
@@ -49,24 +62,29 @@ class GoogleUserInfo:
 
 
 # --- OAuth state (signed CSRF nonce + requested role) ----------------------
-def sign_state(role: UserRole, settings: Settings) -> str:
-    """Sign a short-lived state token carrying a CSRF nonce and the role."""
+def sign_state(role: UserRole | None, settings: Settings) -> str:
+    """Sign a short-lived state token carrying a CSRF nonce and the role.
+
+    ``role`` is ``None`` when the frontend started the flow without picking one —
+    the callback then defers the choice to the post-Google role chooser.
+    """
     now = datetime.now(UTC)
     payload = {
         "iss": _STATE_ISSUER,
         "iat": now,
         "exp": now + timedelta(minutes=_STATE_EXPIRE_MINUTES),
         "nonce": secrets.token_urlsafe(16),
-        "role": role.value,
+        "role": role.value if role is not None else None,
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
 
 
-def verify_state(state: str, settings: Settings) -> UserRole:
+def verify_state(state: str, settings: Settings) -> UserRole | None:
     """Validate the state signature/expiry and return the requested role.
 
-    Raises :class:`AuthenticationError` on any tampering, expiry, or an
-    unexpected role value.
+    Returns ``None`` when the flow was started without a role. Raises
+    :class:`AuthenticationError` on any tampering, expiry, or an unexpected
+    role value.
     """
     try:
         payload = jwt.decode(
@@ -80,6 +98,8 @@ def verify_state(state: str, settings: Settings) -> UserRole:
         raise AuthenticationError("Invalid or expired OAuth state") from exc
 
     role_value = payload.get("role")
+    if role_value is None:
+        return None
     if not isinstance(role_value, str):
         raise AuthenticationError("Invalid OAuth state role")
     try:
@@ -89,6 +109,48 @@ def verify_state(state: str, settings: Settings) -> UserRole:
     if role not in (UserRole.seeker, UserRole.advisor):
         raise AuthenticationError("Unsupported role for Google sign-in")
     return role
+
+
+# --- Pending-signup token (verified identity awaiting a role choice) --------
+def sign_signup_token(google_user: GoogleUserInfo, settings: Settings) -> str:
+    """Sign a short-lived token carrying a verified-but-roleless Google identity.
+
+    Issued by the callback instead of creating a user when a new email arrives
+    with no requested role; redeemed by ``POST /auth/google/complete``.
+    """
+    now = datetime.now(UTC)
+    payload = {
+        "iss": _SIGNUP_ISSUER,
+        "iat": now,
+        "exp": now + timedelta(minutes=_SIGNUP_EXPIRE_MINUTES),
+        "nonce": secrets.token_urlsafe(16),
+        "email": google_user.email,
+        "full_name": google_user.full_name,
+    }
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
+
+
+def verify_signup_token(token: str, settings: Settings) -> tuple[str, str | None]:
+    """Validate a pending-signup token and return ``(email, full_name)``.
+
+    Raises :class:`AuthenticationError` on tampering or expiry.
+    """
+    try:
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET,
+            algorithms=["HS256"],
+            issuer=_SIGNUP_ISSUER,
+            options={"require": ["exp", "iss", "nonce"]},
+        )
+    except jwt.PyJWTError as exc:
+        raise AuthenticationError("Invalid or expired signup token") from exc
+
+    email = payload.get("email")
+    if not isinstance(email, str) or not email:
+        raise AuthenticationError("Invalid signup token")
+    full_name = payload.get("full_name")
+    return email, full_name if isinstance(full_name, str) else None
 
 
 # --- Authorize URL ---------------------------------------------------------

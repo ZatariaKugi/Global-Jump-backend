@@ -44,6 +44,13 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class GoogleCompleteRequest(BaseModel):
+    """Redeem a pending-signup token with the role chosen on the frontend."""
+
+    signup_token: str
+    role: UserRole
+
+
 class EmailVerifyRequest(BaseModel):
     token: str
 

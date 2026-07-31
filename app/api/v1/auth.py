@@ -27,6 +27,7 @@ from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.token import (
     EmailVerifyRequest,
     ForgotPasswordRequest,
+    GoogleCompleteRequest,
     RefreshRequest,
     ResendVerificationRequest,
     ResetPasswordRequest,
@@ -148,16 +149,18 @@ async def logout(
 @router.get("/google/login")
 async def google_login(
     settings: SettingsDep,
-    role: Annotated[UserRole, Query()] = UserRole.seeker,
+    role: Annotated[UserRole | None, Query()] = None,
 ) -> RedirectResponse:
     """Redirect the browser to Google's consent screen.
 
     ``role`` (seeker/advisor) is chosen by which signup button was clicked and is
-    carried through Google via the signed ``state``.
+    carried through Google via the signed ``state``. When omitted, an existing
+    account signs in with its stored role and a *new* user is asked to choose a
+    role on the frontend after Google authenticates them.
     """
     if not settings.google_oauth_enabled:
         raise NotFoundError("Google sign-in is not configured")
-    if role not in (UserRole.seeker, UserRole.advisor):
+    if role is not None and role not in (UserRole.seeker, UserRole.advisor):
         raise NotFoundError("Google sign-in supports seeker and advisor roles only")
 
     state = google_oauth_service.sign_state(role, settings)
@@ -176,8 +179,11 @@ async def google_callback(
     """Handle Google's redirect: verify state, exchange code, issue our tokens.
 
     Always redirects back to ``{FRONTEND_URL}/auth/callback``. On success the
-    fragment carries the token pair; on any failure it carries ``error=<code>``
-    so the frontend can show a message on its own login screen.
+    fragment carries the token pair plus ``role``/``verification_status``; when a
+    *new* user arrived without a role it carries ``status=role_required`` and a
+    signed ``signup_token`` for the frontend's seeker/advisor chooser; on any
+    failure it carries ``error=<code>`` so the frontend can show a message on
+    its own login screen.
     """
     base = f"{settings.FRONTEND_URL}/auth/callback"
 
@@ -196,12 +202,20 @@ async def google_callback(
         return redirect(error="invalid_request")
 
     try:
-        # Validate state (signature + CSRF nonce) and decode the role BEFORE any
-        # network call, so a forged/expired state is rejected cheaply.
         requested_role = google_oauth_service.verify_state(state, settings)
         google_user = await google_oauth_service.exchange_code(code, settings)
         if not google_user.email_verified:
             return redirect(error="email_unverified")
+
+        existing = await user_service.get_by_email(session, google_user.email)
+        if existing is None and requested_role is None:
+            signup_token = google_oauth_service.sign_signup_token(google_user, settings)
+            return redirect(
+                status="role_required",
+                signup_token=signup_token,
+                email=google_user.email,
+                full_name=google_user.full_name or "",
+            )
 
         user = await user_service.get_or_create_google_user(
             session,
@@ -216,7 +230,45 @@ async def google_callback(
         # advisor, unverified) — surface as a fragment error, never a JSON page.
         return redirect(error=exc.code)
 
-    return redirect(access_token=access_token, refresh_token=raw_refresh)
+    fragment = {
+        "access_token": access_token,
+        "refresh_token": raw_refresh,
+        "role": user.role.value,
+    }
+    if user.verification_status is not None:
+        fragment["verification_status"] = user.verification_status.value
+    return redirect(**fragment)
+
+
+@router.post("/google/complete", response_model=TokenPair)
+async def google_complete(
+    body: GoogleCompleteRequest,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> TokenPair:
+    """Finish a role-less Google sign-in with the role chosen on the frontend.
+
+    Redeems the ``signup_token`` issued by the callback's ``role_required``
+    redirect: creates the account with the chosen role (advisor ⇒ pending until
+    admin approval) and returns the same ``TokenPair`` shape as ``/auth/login``.
+    If the account was created meanwhile, this auto-links like a normal Google
+    sign-in (role mismatch still raises a conflict).
+    """
+    if not settings.google_oauth_enabled:
+        raise NotFoundError("Google sign-in is not configured")
+
+    email, full_name = google_oauth_service.verify_signup_token(body.signup_token, settings)
+    user = await user_service.get_or_create_google_user(
+        session, email=email, full_name=full_name, role=body.role
+    )
+    await activity_log_service.record_login(session, user.id)
+    access_token, raw_refresh = await auth_service.create_token_pair(session, user, settings)
+    return TokenPair(
+        access_token=access_token,
+        refresh_token=raw_refresh,
+        role=user.role,
+        verification_status=user.verification_status,
+    )
 
 
 # ---------------------------------------------------------------------------
