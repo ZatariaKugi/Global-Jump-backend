@@ -36,8 +36,15 @@ from app.models.booking import Booking
 from app.models.booking_document_request import BookingDocumentRequest
 from app.models.booking_note import BookingNote, BookingNoteAttachment
 from app.models.conversation import Conversation
+from app.models.device_token import DevicePlatform, DeviceToken
 from app.models.eligibility_rule import EligibilityRule
 from app.models.message import Message, MessageAttachment
+from app.models.notification import (
+    Notification,
+    NotificationEntityType,
+    NotificationType,
+    PushStatus,
+)
 from app.models.payout_request import PayoutRequest
 from app.models.regulatory_update import RegulatoryUpdate
 from app.models.review import Review
@@ -97,6 +104,12 @@ __all__ = [
     "Conversation",
     "Message",
     "MessageAttachment",
+    "DeviceToken",
+    "DevicePlatform",
+    "Notification",
+    "NotificationType",
+    "NotificationEntityType",
+    "PushStatus",
     "Transaction",
     "TransactionEvent",
     "PayoutRequest",

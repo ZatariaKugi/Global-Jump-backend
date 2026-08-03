@@ -13,7 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.db.session import async_session_factory
-from app.services import payment_service
+from app.services import payment_service, push_service
 
 logger = get_logger(__name__)
 
@@ -33,6 +33,19 @@ async def _sweep_due_transfers(settings: Settings) -> None:
             logger.exception("transfer_sweep_failed")
 
 
+async def _sweep_due_pushes(settings: Settings) -> None:
+    """One push-outbox pass. Opens its own session and commits/rolls back explicitly."""
+    async with async_session_factory() as session:
+        try:
+            count = await push_service.run_due_pushes(session, settings)
+            await session.commit()
+            if count:
+                logger.info("push_sweep_completed", pushes=count)
+        except Exception:  # noqa: BLE001 — a sweep failure must not kill the scheduler
+            await session.rollback()
+            logger.exception("push_sweep_failed")
+
+
 def create_scheduler(settings: Settings) -> AsyncIOScheduler:
     """Build the scheduler with the transfer-sweep job registered."""
     scheduler = AsyncIOScheduler()
@@ -47,5 +60,15 @@ def create_scheduler(settings: Settings) -> AsyncIOScheduler:
         coalesce=True,
         max_instances=1,
         misfire_grace_time=settings.TRANSFER_SWEEP_SECONDS,
+    )
+    scheduler.add_job(
+        _sweep_due_pushes,
+        trigger="interval",
+        seconds=settings.NOTIFICATION_PUSH_SWEEP_SECONDS,
+        args=[settings],
+        id="notification_push_sweep",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=settings.NOTIFICATION_PUSH_SWEEP_SECONDS,
     )
     return scheduler

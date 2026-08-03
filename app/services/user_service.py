@@ -14,6 +14,7 @@ from app.core.exceptions import AuthenticationError, ConflictError
 from app.core.file_storage import resolve_media_url
 from app.core.security import hash_password, verify_password
 from app.models.advisor_profile import AdvisorProfile
+from app.models.notification import NotificationEntityType, NotificationType
 from app.models.seeker_profile import SeekerProfile
 from app.models.user import (
     AuthProvider,
@@ -24,6 +25,7 @@ from app.models.user import (
 )
 from app.schemas.advisor import AdvisorCreate
 from app.schemas.user import UserCreate, UserRead, UserUpdate
+from app.services import notification_service
 
 # Pre-computed Argon2id hash used as a timing sentinel when a login email is
 # not found.  Always verifying against a real hash prevents response-time
@@ -65,6 +67,18 @@ async def build_user_read(session: AsyncSession, user: User, settings: Settings)
     )
 
 
+async def _notify_admins_user_registered(session: AsyncSession, user: User) -> None:
+    await notification_service.notify_admins(
+        session,
+        type=NotificationType.user_registered,
+        title="New user registered",
+        body=f"{user.full_name or user.email} signed up as {user.role.value}",
+        entity_type=NotificationEntityType.user,
+        entity_id=user.id,
+        actor_id=user.id,
+    )
+
+
 async def create_user(session: AsyncSession, data: UserCreate) -> User:
     if await get_by_email(session, data.email):
         raise ConflictError("A user with this email already exists")
@@ -78,6 +92,7 @@ async def create_user(session: AsyncSession, data: UserCreate) -> User:
     session.add(user)
     await session.flush()
     await session.refresh(user)
+    await _notify_admins_user_registered(session, user)
     return user
 
 
@@ -97,6 +112,7 @@ async def create_advisor(session: AsyncSession, data: AdvisorCreate) -> User:
     session.add(user)
     await session.flush()
     await session.refresh(user)
+    await _notify_admins_user_registered(session, user)
     return user
 
 
@@ -186,6 +202,8 @@ async def get_or_create_google_user(
         return winner
 
     await session.refresh(user)
+    # Create branch only — an existing-account Google sign-in must not notify.
+    await _notify_admins_user_registered(session, user)
     return user
 
 

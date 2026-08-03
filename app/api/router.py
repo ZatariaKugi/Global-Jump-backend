@@ -14,6 +14,8 @@ from app.api.v1 import (
     bookmarks,
     conversations,
     countries,
+    devices,
+    notifications,
     payments,
     reviews,
     seeker_profiles,
@@ -34,6 +36,8 @@ api_router.include_router(bookmarks.router)
 api_router.include_router(payments.router)
 api_router.include_router(reviews.router)
 api_router.include_router(conversations.router)
+api_router.include_router(devices.router)
+api_router.include_router(notifications.router)
 api_router.include_router(assessments.router)
 api_router.include_router(uploads.router)
 api_router.include_router(tickets.router)

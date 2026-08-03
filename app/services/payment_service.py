@@ -19,6 +19,7 @@ from app.core.exceptions import AppError, NotFoundError
 from app.core.file_storage import resolve_media_url
 from app.models.advisor_profile import AdvisorProfile
 from app.models.booking import Booking, BookingStatus, PaymentStatus
+from app.models.notification import NotificationEntityType, NotificationType
 from app.models.transaction import Transaction, TransactionStatus, TransferStatus
 from app.models.transaction_event import TransactionEvent, TransactionEventType
 from app.models.user import User, UserRole
@@ -35,9 +36,31 @@ from app.schemas.payment import (
     TransactionAdvisorRead,
     TransactionFinanceRead,
 )
-from app.services import email_service
+from app.services import email_service, notification_service
 
 log = structlog.get_logger()
+
+
+async def _notify_payment(
+    session: AsyncSession,
+    txn: Transaction,
+    *,
+    recipient_id: uuid.UUID,
+    type: NotificationType,
+    title: str,
+    body: str,
+    actor_id: uuid.UUID | None = None,
+) -> None:
+    await notification_service.notify(
+        session,
+        user_id=recipient_id,
+        type=type,
+        title=title,
+        body=body,
+        entity_type=NotificationEntityType.transaction,
+        entity_id=txn.id,
+        actor_id=actor_id,
+    )
 
 _INVOICE_TERMS = (
     "Payment is due upon receipt. This invoice reflects charges for consultation "
@@ -298,9 +321,20 @@ async def _handle_account_updated(session: AsyncSession, account: object) -> Non
     if profile is None:
         log.warning("webhook_account_updated_no_profile", account_id=account_id)
         return
+    was_payouts_enabled = profile.stripe_payouts_enabled
     _sync_connect_flags(profile, account)
     session.add(profile)
     await session.flush()
+    if not was_payouts_enabled and profile.stripe_payouts_enabled:
+        await notification_service.notify(
+            session,
+            user_id=profile.user_id,
+            type=NotificationType.connect_payouts_enabled,
+            title="Stripe payouts enabled",
+            body="Your Stripe account is verified — you can now receive payments",
+            entity_type=NotificationEntityType.user,
+            entity_id=profile.user_id,
+        )
     log.info(
         "connect_account_updated",
         account_id=account_id,
@@ -405,6 +439,24 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
                 invoice_number=f"{txn.invoice_number:08d}",
                 settings=settings,
             )
+        await _notify_payment(
+            session,
+            txn,
+            recipient_id=booking.seeker_id,
+            type=NotificationType.payment_succeeded,
+            title="Payment received",
+            body=f"${txn.amount_usd:.2f} paid for {booking.service_type}",
+            actor_id=booking.seeker_id,
+        )
+        await _notify_payment(
+            session,
+            txn,
+            recipient_id=booking.advisor_id,
+            type=NotificationType.payment_succeeded,
+            title="Consultation paid",
+            body=f"Your client paid ${txn.amount_usd:.2f} for {booking.service_type}",
+            actor_id=booking.seeker_id,
+        )
     await _log_event(session, txn.id, TransactionEventType.receipt_sent)
     await _log_event(session, txn.id, TransactionEventType.closed)
 
@@ -421,6 +473,16 @@ async def _handle_checkout_expired(session: AsyncSession, cs: object) -> None:
     session.add(txn)
     await _log_event(session, txn.id, TransactionEventType.failed)
     await _log_event(session, txn.id, TransactionEventType.closed)
+    booking = await session.get(Booking, txn.booking_id)
+    if booking is not None:
+        await _notify_payment(
+            session,
+            txn,
+            recipient_id=booking.seeker_id,
+            type=NotificationType.payment_failed,
+            title="Checkout expired",
+            body=f"Your payment for {booking.service_type} was not completed",
+        )
     await session.flush()
     log.info("checkout_expired", session_id=session_id)
 
@@ -458,6 +520,14 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
     if booking is not None:
         booking.payment_status = PaymentStatus.refunded
         session.add(booking)
+        await _notify_payment(
+            session,
+            txn,
+            recipient_id=booking.seeker_id,
+            type=NotificationType.payment_refunded,
+            title="Payment refunded",
+            body=f"${refunded_amount_usd:.2f} refunded for {booking.service_type}",
+        )
 
     await session.flush()
     log.info("payment_refunded_via_webhook", booking_id=str(txn.booking_id))
@@ -534,6 +604,15 @@ async def refund_transaction(
     if booking is not None:
         booking.payment_status = PaymentStatus.refunded
         session.add(booking)
+        await _notify_payment(
+            session,
+            txn,
+            recipient_id=booking.seeker_id,
+            type=NotificationType.payment_refunded,
+            title="Payment refunded",
+            body=f"${refund_amount:.2f} refunded for {booking.service_type}",
+            actor_id=admin_id,
+        )
 
     await session.flush()
     await session.refresh(txn)
@@ -620,6 +699,28 @@ async def run_due_transfers(session: AsyncSession, settings: Settings) -> int:
             if txn.transfer_attempts >= _MAX_TRANSFER_ATTEMPTS:
                 txn.transfer_status = TransferStatus.failed
                 await _log_event(session, txn.id, TransactionEventType.transfer_failed)
+                await _notify_payment(
+                    session,
+                    txn,
+                    recipient_id=booking.advisor_id,
+                    type=NotificationType.transfer_failed,
+                    title="Payout transfer failed",
+                    body=(
+                        f"Your ${txn.advisor_payout_usd:.2f} payout could not be transferred — "
+                        "support has been notified"
+                    ),
+                )
+                await notification_service.notify_admins(
+                    session,
+                    type=NotificationType.transfer_failed,
+                    title="Advisor transfer failed",
+                    body=(
+                        f"Transfer of ${txn.advisor_payout_usd:.2f} failed terminally "
+                        f"after {txn.transfer_attempts} attempts"
+                    ),
+                    entity_type=NotificationEntityType.transaction,
+                    entity_id=txn.id,
+                )
                 log.error(
                     "transfer_failed_terminal",
                     transaction_id=str(txn.id),
@@ -640,6 +741,14 @@ async def run_due_transfers(session: AsyncSession, settings: Settings) -> int:
         txn.transfer_status = TransferStatus.completed
         session.add(txn)
         await _log_event(session, txn.id, TransactionEventType.transfer_completed)
+        await _notify_payment(
+            session,
+            txn,
+            recipient_id=booking.advisor_id,
+            type=NotificationType.transfer_completed,
+            title="Earnings released",
+            body=f"${txn.advisor_payout_usd:.2f} has been transferred to your Stripe account",
+        )
         completed += 1
         log.info(
             "transfer_completed",

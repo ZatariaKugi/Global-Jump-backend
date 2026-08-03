@@ -16,6 +16,7 @@ from app.core.file_storage import resolve_media_url
 from app.models.advisor_profile import AdvisorProfile
 from app.models.conversation import Conversation
 from app.models.message import Message, MessageAttachment
+from app.models.notification import NotificationEntityType, NotificationType
 from app.models.review import ModerationStatus
 from app.models.seeker_profile import SeekerProfile
 from app.models.user import User, UserRole
@@ -26,6 +27,7 @@ from app.schemas.conversation import (
     MessageRead,
     OtherPartyRole,
 )
+from app.services import notification_service
 from app.services.ws_manager import manager
 
 PUBLIC_STATUSES = (ModerationStatus.visible, ModerationStatus.flagged)
@@ -207,6 +209,26 @@ async def send_message(
 
     await session.flush()
     await session.refresh(message)
+
+    # Push only when the recipient isn't connected to this conversation's WebSocket —
+    # an online recipient already sees the message via the broadcast.
+    recipient_id = (
+        conversation.advisor_id
+        if sender.id == conversation.seeker_id
+        else conversation.seeker_id
+    )
+    if not manager.is_online(conversation.id, recipient_id):
+        preview = body[:140] if body else "Sent an attachment"
+        await notification_service.notify(
+            session,
+            user_id=recipient_id,
+            type=NotificationType.message_received,
+            title=f"New message from {sender.full_name or 'your contact'}",
+            body=preview,
+            entity_type=NotificationEntityType.conversation,
+            entity_id=conversation.id,
+            actor_id=sender.id,
+        )
     return message
 
 

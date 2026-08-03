@@ -13,7 +13,9 @@ from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import resolve_url
 from app.models.booking import Booking
 from app.models.booking_document_request import BookingDocumentRequest, DocumentRequestStatus
+from app.models.notification import NotificationEntityType, NotificationType
 from app.schemas.booking_document_request import DocumentRequestRead
+from app.services import notification_service
 
 
 async def create_request(
@@ -30,6 +32,16 @@ async def create_request(
     session.add(request)
     await session.flush()
     await session.refresh(request)
+    await notification_service.notify(
+        session,
+        user_id=booking.seeker_id,
+        type=NotificationType.document_requested,
+        title="Document requested",
+        body=f"Your advisor requested: {description[:200]}",
+        entity_type=NotificationEntityType.booking,
+        entity_id=booking.id,
+        actor_id=actor_id,
+    )
     return request
 
 
@@ -76,6 +88,16 @@ async def fulfill(
     session.add(request)
     await session.flush()
     await session.refresh(request)
+    await notification_service.notify(
+        session,
+        user_id=booking.advisor_id,
+        type=NotificationType.document_fulfilled,
+        title="Document uploaded",
+        body=f"Your client uploaded: {request.description[:200]}",
+        entity_type=NotificationEntityType.booking,
+        entity_id=booking.id,
+        actor_id=actor_id,
+    )
     return request
 
 

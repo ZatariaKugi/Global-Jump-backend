@@ -12,8 +12,10 @@ from app.core.exceptions import AppError, PermissionDeniedError
 from app.core.file_storage import resolve_url
 from app.models.booking import Booking
 from app.models.booking_note import BookingNote, BookingNoteAttachment
+from app.models.notification import NotificationEntityType, NotificationType
 from app.models.user import User
 from app.schemas.booking_note import BookingNoteAttachmentRead, BookingNoteRead
+from app.services import notification_service
 
 
 async def create_note(
@@ -41,6 +43,16 @@ async def create_note(
     session.add(note)
     await session.flush()
     await session.refresh(note)
+    await notification_service.notify(
+        session,
+        user_id=booking.seeker_id,
+        type=NotificationType.booking_note_added,
+        title="New note on your booking",
+        body=f"Your advisor added a note to appointment #{booking.appointment_number}",
+        entity_type=NotificationEntityType.booking,
+        entity_id=booking.id,
+        actor_id=author.id,
+    )
     return note
 
 

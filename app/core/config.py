@@ -110,6 +110,17 @@ class Settings(BaseSettings):
     INVOICE_FROM_ADDRESS: str | None = None  # optional platform address on invoices
     INVOICE_FROM_PHONE: str | None = None  # optional platform phone on invoices
 
+    # Push notifications — Firebase Cloud Messaging ---------------------------
+    # Path to a Firebase service-account JSON file. Unset ⇒ push disabled: the
+    # notification outbox still fills (in-app feed works) and the sweep marks
+    # rows ``skipped`` instead of sending.
+    FIREBASE_CREDENTIALS_FILE: str | None = None
+    NOTIFICATION_PUSH_SWEEP_SECONDS: int = 5
+    NOTIFICATION_PUSH_MAX_ATTEMPTS: int = 5
+    # Pending rows older than this are expired to ``skipped`` so enabling FCM
+    # later never blasts a historical backlog to devices.
+    NOTIFICATION_PUSH_STALE_HOURS: int = 24
+
     # OpenAI (AI assessment insights) -----------------------------------------
     OPENAI_API_KEY: str | None = None
     OPENAI_MODEL: str = "gpt-5.4-mini"
@@ -140,6 +151,7 @@ class Settings(BaseSettings):
         "GOOGLE_CLIENT_ID",
         "GOOGLE_CLIENT_SECRET",
         "GOOGLE_REDIRECT_URI",
+        "FIREBASE_CREDENTIALS_FILE",
         mode="before",
     )
     @classmethod
@@ -179,6 +191,10 @@ class Settings(BaseSettings):
         return bool(
             self.GOOGLE_CLIENT_ID and self.GOOGLE_CLIENT_SECRET and self.GOOGLE_REDIRECT_URI
         )
+
+    @property
+    def push_enabled(self) -> bool:
+        return bool(self.FIREBASE_CREDENTIALS_FILE)
 
 
 @lru_cache

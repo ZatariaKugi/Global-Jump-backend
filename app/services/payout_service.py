@@ -11,10 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError
 from app.models.booking import Booking
+from app.models.notification import NotificationEntityType, NotificationType
 from app.models.payout_request import PayoutRequest, PayoutStatus
 from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User
 from app.schemas.payout import PayoutPreviewRead, PayoutRequestCreate
+from app.services import notification_service
 
 
 async def get_available_balance(session: AsyncSession, advisor_id: uuid.UUID) -> float:
@@ -87,6 +89,15 @@ async def create_request(
     session.add(payout)
     await session.flush()
     await session.refresh(payout)
+    await notification_service.notify_admins(
+        session,
+        type=NotificationType.payout_requested,
+        title="New payout request",
+        body=f"{advisor.full_name or advisor.email} requested ${payout.amount_usd:.2f}",
+        entity_type=NotificationEntityType.payout_request,
+        entity_id=payout.id,
+        actor_id=advisor.id,
+    )
     return payout
 
 
@@ -142,6 +153,16 @@ async def complete(
     session.add(payout)
     await session.flush()
     await session.refresh(payout)
+    await notification_service.notify(
+        session,
+        user_id=payout.advisor_id,
+        type=NotificationType.payout_completed,
+        title="Payout completed",
+        body=f"Your ${payout.amount_usd:.2f} payout has been processed",
+        entity_type=NotificationEntityType.payout_request,
+        entity_id=payout.id,
+        actor_id=admin_id,
+    )
     return payout
 
 
@@ -157,4 +178,17 @@ async def reject(
     session.add(payout)
     await session.flush()
     await session.refresh(payout)
+    await notification_service.notify(
+        session,
+        user_id=payout.advisor_id,
+        type=NotificationType.payout_rejected,
+        title="Payout rejected",
+        body=(
+            f"Your ${payout.amount_usd:.2f} payout request was rejected"
+            + (f": {reason}" if reason else "")
+        ),
+        entity_type=NotificationEntityType.payout_request,
+        entity_id=payout.id,
+        actor_id=admin_id,
+    )
     return payout

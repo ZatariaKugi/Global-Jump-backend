@@ -30,3 +30,7 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# Firebase service account credentials
+global-jump-fcm-firebase-adminsdk-fbsvc-58f7f30449.json
+*firebase-adminsdk*.json

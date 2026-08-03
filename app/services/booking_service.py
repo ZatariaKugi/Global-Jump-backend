@@ -17,6 +17,7 @@ from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorOfferedService, AdvisorProfile, AdvisorService
 from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus, PaymentStatus
 from app.models.booking_document_request import DocumentRequestStatus
+from app.models.notification import NotificationEntityType, NotificationType
 from app.models.review import Review
 from app.models.seeker_profile import SeekerProfile
 from app.models.transaction import Transaction
@@ -33,11 +34,48 @@ from app.schemas.booking import (
     BookingSort,
     ClientRead,
 )
-from app.services import availability_service, booking_document_service, booking_note_service
+from app.services import (
+    availability_service,
+    booking_document_service,
+    booking_note_service,
+    notification_service,
+)
 from app.services.availability_service import as_utc
 
 DEFAULT_NOTICE_HOURS = 24
 _ACTIVE_UPCOMING = (BookingStatus.pending, BookingStatus.confirmed)
+
+
+def _booking_summary(booking: Booking) -> str:
+    when = as_utc(booking.scheduled_start).strftime("%b %d, %Y %H:%M UTC")
+    service = humanize_slug(booking.service_type)
+    return f"{service} on {when} — appointment #{booking.appointment_number}"
+
+
+def _counterparty(booking: Booking, actor_id: uuid.UUID) -> uuid.UUID:
+    return booking.advisor_id if actor_id == booking.seeker_id else booking.seeker_id
+
+
+async def _notify_booking(
+    session: AsyncSession,
+    booking: Booking,
+    *,
+    recipient_id: uuid.UUID,
+    actor_id: uuid.UUID,
+    type: NotificationType,
+    title: str,
+    body: str | None = None,
+) -> None:
+    await notification_service.notify(
+        session,
+        user_id=recipient_id,
+        type=type,
+        title=title,
+        body=body or _booking_summary(booking),
+        entity_type=NotificationEntityType.booking,
+        entity_id=booking.id,
+        actor_id=actor_id,
+    )
 
 
 async def _next_appointment_number(session: AsyncSession) -> int:
@@ -265,6 +303,14 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    await _notify_booking(
+        session,
+        booking,
+        recipient_id=booking.advisor_id,
+        actor_id=seeker.id,
+        type=NotificationType.booking_requested,
+        title="New consultation request",
+    )
     return booking
 
 
@@ -309,6 +355,14 @@ async def create_by_advisor(
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    await _notify_booking(
+        session,
+        booking,
+        recipient_id=booking.seeker_id,
+        actor_id=advisor.id,
+        type=NotificationType.booking_confirmed,
+        title="Booking confirmed",
+    )
     return booking
 
 
@@ -444,6 +498,14 @@ async def cancel(
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    await _notify_booking(
+        session,
+        booking,
+        recipient_id=_counterparty(booking, actor_id),
+        actor_id=actor_id,
+        type=NotificationType.booking_cancelled,
+        title="Booking cancelled",
+    )
     return booking
 
 
@@ -470,6 +532,14 @@ async def reschedule(
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    await _notify_booking(
+        session,
+        booking,
+        recipient_id=_counterparty(booking, actor_id),
+        actor_id=actor_id,
+        type=NotificationType.booking_rescheduled,
+        title="Booking rescheduled",
+    )
     return booking
 
 
@@ -485,6 +555,14 @@ async def accept(session: AsyncSession, booking: Booking, actor_id: uuid.UUID) -
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    await _notify_booking(
+        session,
+        booking,
+        recipient_id=booking.seeker_id,
+        actor_id=actor_id,
+        type=NotificationType.booking_confirmed,
+        title="Booking confirmed",
+    )
     return booking
 
 
@@ -503,6 +581,14 @@ async def reject(
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    await _notify_booking(
+        session,
+        booking,
+        recipient_id=booking.seeker_id,
+        actor_id=actor_id,
+        type=NotificationType.booking_rejected,
+        title="Booking declined",
+    )
     return booking
 
 
@@ -569,6 +655,14 @@ async def complete(session: AsyncSession, booking: Booking, actor_id: uuid.UUID)
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    await _notify_booking(
+        session,
+        booking,
+        recipient_id=booking.seeker_id,
+        actor_id=actor_id,
+        type=NotificationType.booking_completed,
+        title="Consultation completed — leave a review",
+    )
     return booking
 
 
@@ -579,6 +673,14 @@ async def mark_no_show(session: AsyncSession, booking: Booking, actor_id: uuid.U
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    await _notify_booking(
+        session,
+        booking,
+        recipient_id=booking.seeker_id,
+        actor_id=actor_id,
+        type=NotificationType.booking_no_show,
+        title="Appointment marked as no-show",
+    )
     return booking
 
 
