@@ -1,19 +1,24 @@
 """Seeker home dashboard — composes visa journey state, document summary,
 the latest completed assessment, and AI advisor matching into one payload.
 Distinct from dashboard_service.py (admin home) and advisor_dashboard_service.py.
+
+An optional ``days`` window scopes the completed-assessment lookup and the
+documents-uploaded tile — everything else is current-state.
 """
 
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.countries import country_name
 from app.core.visa_types import parse_visa_type, visa_type_name
 from app.models.assessment import Assessment, AssessmentStatus
+from app.models.seeker_document import SeekerDocument
 from app.models.user import UserRole
 from app.models.visa_type import VisaType
 from app.schemas.assessment import AdvisorMatchRead
@@ -52,6 +57,7 @@ async def _latest_completed_assessment(
     user_id: uuid.UUID,
     visa_type: VisaType | None,
     country: str | None,
+    since: datetime | None = None,
 ) -> Assessment | None:
     stmt = select(Assessment).where(
         Assessment.user_id == user_id,
@@ -61,10 +67,34 @@ async def _latest_completed_assessment(
         stmt = stmt.where(Assessment.visa_type == visa_type.value)
     if country is not None:
         stmt = stmt.where(Assessment.destination_country == country.upper())
+    if since is not None:
+        stmt = stmt.where(Assessment.completed_at >= since)
     stmt = stmt.order_by(
         Assessment.completed_at.desc().nulls_last(), Assessment.created_at.desc()
     ).limit(1)
     return (await session.execute(stmt)).scalars().first()
+
+
+async def _documents_uploaded_since(
+    session: AsyncSession,
+    seeker_id: uuid.UUID,
+    visa_type: VisaType | None,
+    since: datetime,
+) -> int:
+    stmt = select(func.count(SeekerDocument.id)).where(
+        SeekerDocument.seeker_id == seeker_id,
+        SeekerDocument.is_archived.is_(False),
+        SeekerDocument.created_at >= since,
+    )
+    if visa_type is not None:
+        # Untagged docs apply to every visa filter — parity with list_by_seeker_stmt.
+        stmt = stmt.where(
+            or_(
+                SeekerDocument.visa_type == visa_type.value,
+                SeekerDocument.visa_type.is_(None),
+            )
+        )
+    return int((await session.execute(stmt)).scalar_one())
 
 
 def _build_stages(
@@ -100,8 +130,10 @@ async def get_dashboard(
     *,
     visa_type: VisaType | None,
     country: str | None,
+    days: int | None = None,
 ) -> SeekerDashboardRead:
     """Build the seeker home dashboard for the resolved visa/country scope."""
+    since = datetime.now(UTC) - timedelta(days=days) if days is not None else None
     next_booking = await booking_service.get_next_upcoming(session, seeker_id, UserRole.seeker)
     next_upcoming: BookingRead | None = None
     if next_booking is not None:
@@ -121,7 +153,9 @@ async def get_dashboard(
     )
     application_status = int(round(100 * completed_steps / total_steps)) if total_steps else 0
 
-    assessment = await _latest_completed_assessment(session, seeker_id, visa_type, country)
+    assessment = await _latest_completed_assessment(
+        session, seeker_id, visa_type, country, since=since
+    )
 
     matched: list[AdvisorMatchRead] = []
     if assessment is not None:
@@ -147,12 +181,16 @@ async def get_dashboard(
             ],
         )
 
-    
     source = assessment or state.assessment
     resolved_visa = visa_type or (parse_visa_type(source.visa_type) if source else None)
     resolved_country = country or (source.destination_country if source else None)
 
+    documents_uploaded = state.summary.total
+    if since is not None:
+        documents_uploaded = await _documents_uploaded_since(session, seeker_id, visa_type, since)
+
     return SeekerDashboardRead(
+        window_days=days,
         next_upcoming=next_upcoming,
         stats=SeekerDashboardStats(
             eligibility_score=score,
@@ -162,7 +200,7 @@ async def get_dashboard(
             country=resolved_country,
             country_name=country_name(resolved_country),
             journey_progress_percent=journey_progress,
-            documents_uploaded=state.summary.total,
+            documents_uploaded=documents_uploaded,
             documents_progress_percent=state.summary.progress_percent,
             application_status_percent=application_status,
         ),

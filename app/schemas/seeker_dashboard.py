@@ -1,9 +1,12 @@
 """Seeker home dashboard aggregate schemas (FE ``/seeker/dashboard``).
 
 A single home-screen summary for a seeker — stat cards, the per-stage visa
-journey chart, the eligibility donut, and AI-matched advisors. Every figure is
-current-state (no ``days`` window): eligibility, journey progress, and document
-tallies don't change meaning over a 7/30/90-day range.
+journey chart, the eligibility donut, and AI-matched advisors. An optional
+``days`` window (7/30/90) scopes the eligibility figures and matched advisors
+to the latest completed assessment *within the window*, and makes
+``documents_uploaded`` count only in-window uploads; journey stages, progress
+percents, and ``next_upcoming`` remain current-state. ``window_days`` echoes
+the applied window (null = all-time).
 """
 
 from __future__ import annotations
@@ -22,7 +25,9 @@ from app.schemas.visa_journey import JourneyStepKey
 
 class SeekerDashboardStats(BaseModel):
     """Stat-card figures. ``eligibility_*`` come from the latest completed
-    assessment for the resolved visa/country scope — null until one exists."""
+    assessment for the resolved visa/country scope (within the ``days`` window
+    when one is given) — null until one exists. ``documents_uploaded`` counts
+    only in-window uploads when ``days`` is set; all-time otherwise."""
 
     eligibility_score: float | None
     eligibility_tier: EligibilityTier | None
@@ -61,6 +66,7 @@ class EligibilityBreakdownRead(BaseModel):
 
 
 class SeekerDashboardRead(BaseModel):
+    window_days: int | None = None
     next_upcoming: BookingRead | None
     stats: SeekerDashboardStats
     journey_stages: list[JourneyStageRead]

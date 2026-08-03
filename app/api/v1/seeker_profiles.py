@@ -17,6 +17,7 @@ from app.core.visa_types import OptionalVisaType, parse_visa_type
 from app.db.session import SessionDep
 from app.models.seeker_document import DocumentCategory, SeekerDocumentStatus
 from app.models.user import User, UserRole
+from app.schemas.advisor_dashboard import DashboardWindow
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.seeker_dashboard import SeekerDashboardRead
 from app.schemas.seeker_document import (
@@ -133,7 +134,12 @@ async def update_my_profile(
         "``visa_type`` / ``country`` default from the seeker profile when omitted. "
         "``eligibility_*`` figures and ``matched_advisors`` come from the latest "
         "completed assessment for that scope and are null/empty until one exists. "
-        "All figures are current-state — there is no ``days`` window."
+        "``days`` (7/30/90, optional) windows the latest-completed-assessment "
+        "lookup — ``eligibility_*``, ``eligibility_breakdown``, ``matched_advisors`` "
+        "and ``assessment_id`` reflect assessments completed in-window — and "
+        "``stats.documents_uploaded`` counts uploads in-window. ``journey_stages``, "
+        "progress percents, and ``next_upcoming`` are always current-state. "
+        "``window_days`` echoes the applied window (null = all-time)."
     ),
 )
 async def get_my_dashboard(
@@ -145,6 +151,10 @@ async def get_my_dashboard(
     country: Annotated[
         str | None,
         Query(min_length=2, max_length=2, description="ISO 3166-1 alpha-2 destination"),
+    ] = None,
+    days: Annotated[
+        DashboardWindow | None,
+        Query(description="Window: 7, 30, or 90 days; omitted = all-time"),
     ] = None,
 ) -> ResponseEnvelope[SeekerDashboardRead]:
     _require_seeker(current_user)
@@ -165,6 +175,7 @@ async def get_my_dashboard(
         settings,
         visa_type=resolved_visa,
         country=resolved_country,
+        days=days,
     )
     return ResponseEnvelope[SeekerDashboardRead](
         data=dashboard,
