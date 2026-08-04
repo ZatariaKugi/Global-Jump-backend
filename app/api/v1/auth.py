@@ -230,7 +230,11 @@ async def google_callback(
         if not google_user.email_verified:
             return redirect(error="email_unverified")
 
-        existing = await user_service.get_by_email(session, google_user.email)
+        # Match by sub first so a user who changed their Google email is still
+        # recognised as an existing account (not pushed into role selection).
+        existing = await user_service.get_by_google_sub(session, google_user.sub)
+        if existing is None:
+            existing = await user_service.get_by_email(session, google_user.email)
         if existing is None and requested_role is None:
             signup_token = google_oauth_service.sign_signup_token(google_user, settings)
             return redirect(

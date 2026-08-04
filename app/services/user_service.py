@@ -42,6 +42,11 @@ async def get_by_email(session: AsyncSession, email: str) -> User | None:
     return result.scalar_one_or_none()
 
 
+async def get_by_google_sub(session: AsyncSession, google_sub: str) -> User | None:
+    result = await session.execute(select(User).where(User.google_sub == google_sub))
+    return result.scalar_one_or_none()
+
+
 async def profile_photo_key(session: AsyncSession, user: User) -> str | None:
     """Raw stored photo key for seeker/advisor profiles; admins have none."""
     if user.role == UserRole.seeker:
@@ -157,13 +162,22 @@ def _guard_google_login(user: User, requested_role: UserRole | None) -> None:
 
 
 async def _link_google_identity(
-    session: AsyncSession, user: User, google_sub: str | None, now: datetime
+    session: AsyncSession,
+    user: User,
+    google_sub: str | None,
+    now: datetime,
+    email: str | None = None,
 ) -> User:
     """Stamp Google provider metadata onto an existing account (auto-link).
 
     Google verified the email, so mark it verified if not already; record the
     provider so the account's origin is auditable rather than silently welded on;
     and persist Google's stable ``sub`` so identity is tied to the Google account.
+    When ``email`` is supplied and differs from the stored one (the account was
+    resolved by ``google_sub`` after the user changed their Google email), sync it
+    so the local record stays reachable and matches Google — unless another local
+    account already owns that address, in which case we leave the stored email
+    untouched rather than crash on the unique constraint.
     Only touches fields that need it, so repeat sign-ins are no-ops.
     """
     changed = False
@@ -176,6 +190,11 @@ async def _link_google_identity(
     if google_sub is not None and user.google_sub != google_sub:
         user.google_sub = google_sub
         changed = True
+    if email is not None and email != user.email:
+        collision = await get_by_email(session, email)
+        if collision is None:
+            user.email = email
+            changed = True
     if changed:
         session.add(user)
         await session.flush()
@@ -201,6 +220,18 @@ async def get_or_create_google_user(
         raise AuthenticationError("Unsupported role for Google sign-in")
 
     now = datetime.now(UTC)
+
+    # Resolve by Google's stable ``sub`` first: this survives the user changing
+    # their Google email, and matches the same account even when the incoming
+    # email now points elsewhere. Fall back to email for the first-ever link of a
+    # pre-existing account and for rows provisioned before ``google_sub`` existed.
+    if google_sub is not None:
+        by_sub = await get_by_google_sub(session, google_sub)
+        if by_sub is not None:
+            _guard_google_login(by_sub, role)
+            return await _link_google_identity(
+                session, by_sub, google_sub, now, email=email
+            )
 
     existing = await get_by_email(session, email)
     if existing is not None:
