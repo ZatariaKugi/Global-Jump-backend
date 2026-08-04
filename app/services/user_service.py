@@ -117,12 +117,15 @@ async def create_advisor(session: AsyncSession, data: AdvisorCreate) -> User:
 
 
 def _guard_google_login(user: User, requested_role: UserRole | None) -> None:
-    """Enforce role match and advisor-rejection for a Google sign-in.
+    """Enforce role match, account status, and advisor gating for a Google sign-in.
 
     One account per email: a seeker cannot sign in through the advisor button and
     vice versa, and admin accounts never sign in via Google. A ``None``
     ``requested_role`` (role-less start) skips the match — the account signs in
     as whatever role it already has — but stays limited to seeker/advisor.
+
+    Mirrors the account-status rules enforced by :func:`authenticate` so the
+    Google path can't bypass the suspend/inactive gates the password path applies.
     """
     if user.role not in (UserRole.seeker, UserRole.advisor):
         raise AuthenticationError("This account cannot sign in with Google")
@@ -131,10 +134,52 @@ def _guard_google_login(user: User, requested_role: UserRole | None) -> None:
             f"This email is already registered as a {user.role.value}. "
             f"Please sign in as a {user.role.value}."
         )
+    if getattr(user, "is_suspended", False) or (
+        user.verification_status == VerificationStatus.suspended
+    ):
+        raise AuthenticationError("Account is suspended")
     if user.role == UserRole.advisor and user.verification_status == VerificationStatus.rejected:
         raise AuthenticationError(
             "Your account was rejected by an admin. Please contact support."
         )
+    if not user.is_active:
+        # Pending / under-review advisors may sign in to finish onboarding or view
+        # the Approval Pending screen (marketplace actions stay gated by
+        # require_verified_advisor) — mirrors authenticate(). Everyone else is out.
+        if user.role == UserRole.advisor and user.verification_status in (
+            VerificationStatus.pending,
+            VerificationStatus.under_review,
+        ):
+            return
+        if user.role == UserRole.advisor:
+            raise AuthenticationError("Advisor account pending verification")
+        raise AuthenticationError("Account is inactive")
+
+
+async def _link_google_identity(
+    session: AsyncSession, user: User, google_sub: str | None, now: datetime
+) -> User:
+    """Stamp Google provider metadata onto an existing account (auto-link).
+
+    Google verified the email, so mark it verified if not already; record the
+    provider so the account's origin is auditable rather than silently welded on;
+    and persist Google's stable ``sub`` so identity is tied to the Google account.
+    Only touches fields that need it, so repeat sign-ins are no-ops.
+    """
+    changed = False
+    if user.email_verified_at is None:
+        user.email_verified_at = now
+        changed = True
+    if user.auth_provider != AuthProvider.google:
+        user.auth_provider = AuthProvider.google
+        changed = True
+    if google_sub is not None and user.google_sub != google_sub:
+        user.google_sub = google_sub
+        changed = True
+    if changed:
+        session.add(user)
+        await session.flush()
+    return user
 
 
 async def get_or_create_google_user(
@@ -142,13 +187,15 @@ async def get_or_create_google_user(
     email: str,
     full_name: str | None,
     role: UserRole | None,
+    google_sub: str | None = None,
 ) -> User:
     """Resolve a Google identity to a local User (auto-link or create).
 
     ``role`` is the role requested on the frontend (signed OAuth state or the
     ``/auth/google/complete`` body). ``None`` means "sign in as whatever role the
     account already has" — valid only for existing accounts; creating a new one
-    requires a concrete seeker/advisor role.
+    requires a concrete seeker/advisor role. ``google_sub`` is Google's stable
+    account identifier, persisted so identity survives an email change.
     """
     if role is not None and role not in (UserRole.seeker, UserRole.advisor):
         raise AuthenticationError("Unsupported role for Google sign-in")
@@ -158,12 +205,7 @@ async def get_or_create_google_user(
     existing = await get_by_email(session, email)
     if existing is not None:
         _guard_google_login(existing, role)
-        # Auto-link: Google verifies the email, so stamp it if not already set.
-        if existing.email_verified_at is None:
-            existing.email_verified_at = now
-            session.add(existing)
-            await session.flush()
-        return existing
+        return await _link_google_identity(session, existing, google_sub, now)
 
 
     if role is None:
@@ -176,6 +218,7 @@ async def get_or_create_google_user(
         hashed_password=None,
         role=role,
         auth_provider=AuthProvider.google,
+        google_sub=google_sub,
         email_verified_at=now,
         signup_source=SignupSource.organic,
     )
@@ -195,11 +238,7 @@ async def get_or_create_google_user(
         if winner is None:  # pragma: no cover - only if the conflict was unrelated
             raise
         _guard_google_login(winner, role)
-        if winner.email_verified_at is None:
-            winner.email_verified_at = now
-            session.add(winner)
-            await session.flush()
-        return winner
+        return await _link_google_identity(session, winner, google_sub, now)
 
     await session.refresh(user)
     # Create branch only — an existing-account Google sign-in must not notify.

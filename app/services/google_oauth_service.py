@@ -62,29 +62,39 @@ class GoogleUserInfo:
 
 
 # --- OAuth state (signed CSRF nonce + requested role) ----------------------
-def sign_state(role: UserRole | None, settings: Settings) -> str:
+def sign_state(role: UserRole | None, settings: Settings) -> tuple[str, str]:
     """Sign a short-lived state token carrying a CSRF nonce and the role.
 
     ``role`` is ``None`` when the frontend started the flow without picking one —
     the callback then defers the choice to the post-Google role chooser.
+
+    Returns ``(state, nonce)``. The caller stores the ``nonce`` in an HttpOnly
+    cookie on the initiating browser; the callback requires the state's nonce to
+    match it, which binds the round trip to that browser (CSRF defence) and — by
+    clearing the cookie — makes the state single-use.
     """
     now = datetime.now(UTC)
+    nonce = secrets.token_urlsafe(16)
     payload = {
         "iss": _STATE_ISSUER,
         "iat": now,
         "exp": now + timedelta(minutes=_STATE_EXPIRE_MINUTES),
-        "nonce": secrets.token_urlsafe(16),
+        "nonce": nonce,
         "role": role.value if role is not None else None,
     }
-    return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256"), nonce
 
 
-def verify_state(state: str, settings: Settings) -> UserRole | None:
-    """Validate the state signature/expiry and return the requested role.
+def verify_state(
+    state: str, expected_nonce: str | None, settings: Settings
+) -> UserRole | None:
+    """Validate the state signature/expiry/nonce and return the requested role.
 
-    Returns ``None`` when the flow was started without a role. Raises
-    :class:`AuthenticationError` on any tampering, expiry, or an unexpected
-    role value.
+    ``expected_nonce`` is the value read from the browser's state cookie. The
+    state's ``nonce`` must match it, which proves the callback landed in the same
+    browser that started the flow. Returns ``None`` when the flow was started
+    without a role. Raises :class:`AuthenticationError` on any tampering, expiry,
+    nonce mismatch, or an unexpected role value.
     """
     try:
         payload = jwt.decode(
@@ -96,6 +106,14 @@ def verify_state(state: str, settings: Settings) -> UserRole | None:
         )
     except jwt.PyJWTError as exc:
         raise AuthenticationError("Invalid or expired OAuth state") from exc
+
+    nonce = payload.get("nonce")
+    if (
+        not expected_nonce
+        or not isinstance(nonce, str)
+        or not secrets.compare_digest(nonce, expected_nonce)
+    ):
+        raise AuthenticationError("OAuth state did not match this browser")
 
     role_value = payload.get("role")
     if role_value is None:
@@ -126,12 +144,15 @@ def sign_signup_token(google_user: GoogleUserInfo, settings: Settings) -> str:
         "nonce": secrets.token_urlsafe(16),
         "email": google_user.email,
         "full_name": google_user.full_name,
+        # Carry Google's verified ``sub`` so the account created by
+        # ``/google/complete`` is tied to the Google identity, not just the email.
+        "sub": google_user.sub,
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
 
 
-def verify_signup_token(token: str, settings: Settings) -> tuple[str, str | None]:
-    """Validate a pending-signup token and return ``(email, full_name)``.
+def verify_signup_token(token: str, settings: Settings) -> tuple[str, str | None, str | None]:
+    """Validate a pending-signup token and return ``(email, full_name, sub)``.
 
     Raises :class:`AuthenticationError` on tampering or expiry.
     """
@@ -150,7 +171,12 @@ def verify_signup_token(token: str, settings: Settings) -> tuple[str, str | None
     if not isinstance(email, str) or not email:
         raise AuthenticationError("Invalid signup token")
     full_name = payload.get("full_name")
-    return email, full_name if isinstance(full_name, str) else None
+    sub = payload.get("sub")
+    return (
+        email,
+        full_name if isinstance(full_name, str) else None,
+        sub if isinstance(sub, str) else None,
+    )
 
 
 # --- Authorize URL ---------------------------------------------------------

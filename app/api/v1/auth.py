@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Annotated
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Cookie, Depends, Query, status
 from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 
@@ -43,6 +43,11 @@ from app.services import (
 from app.services.email_service import send_password_reset_email, send_verification_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+# HttpOnly cookie binding the OAuth ``state`` to the browser that started the
+# flow. Lives only for the length of the Google consent round trip.
+_OAUTH_STATE_COOKIE = "gj_oauth_state"
+_OAUTH_STATE_COOKIE_MAX_AGE = 600  # 10 minutes — matches the signed state's expiry
 
 
 # ---------------------------------------------------------------------------
@@ -157,15 +162,29 @@ async def google_login(
     carried through Google via the signed ``state``. When omitted, an existing
     account signs in with its stored role and a *new* user is asked to choose a
     role on the frontend after Google authenticates them.
+
+    An HttpOnly cookie carrying the state's nonce is set so the callback can
+    confirm it landed in the same browser (CSRF defence) and treat the state as
+    single-use.
     """
     if not settings.google_oauth_enabled:
         raise NotFoundError("Google sign-in is not configured")
     if role is not None and role not in (UserRole.seeker, UserRole.advisor):
         raise NotFoundError("Google sign-in supports seeker and advisor roles only")
 
-    state = google_oauth_service.sign_state(role, settings)
+    state, nonce = google_oauth_service.sign_state(role, settings)
     url = google_oauth_service.build_authorization_url(settings, state)
-    return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
+    response = RedirectResponse(url, status_code=status.HTTP_302_FOUND)
+    response.set_cookie(
+        key=_OAUTH_STATE_COOKIE,
+        value=nonce,
+        max_age=_OAUTH_STATE_COOKIE_MAX_AGE,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+    return response
 
 
 @router.get("/google/callback")
@@ -175,6 +194,7 @@ async def google_callback(
     code: Annotated[str | None, Query()] = None,
     state: Annotated[str | None, Query()] = None,
     error: Annotated[str | None, Query()] = None,
+    oauth_state: Annotated[str | None, Cookie(alias=_OAUTH_STATE_COOKIE)] = None,
 ) -> RedirectResponse:
     """Handle Google's redirect: verify state, exchange code, issue our tokens.
 
@@ -188,9 +208,12 @@ async def google_callback(
     base = f"{settings.FRONTEND_URL}/auth/callback"
 
     def redirect(**fragment: str) -> RedirectResponse:
-        return RedirectResponse(
+        response = RedirectResponse(
             f"{base}#{urlencode(fragment)}", status_code=status.HTTP_302_FOUND
         )
+        # The state cookie is single-use — always clear it as we leave the flow.
+        response.delete_cookie(_OAUTH_STATE_COOKIE, path="/")
+        return response
 
     if not settings.google_oauth_enabled:
         raise NotFoundError("Google sign-in is not configured")
@@ -202,7 +225,7 @@ async def google_callback(
         return redirect(error="invalid_request")
 
     try:
-        requested_role = google_oauth_service.verify_state(state, settings)
+        requested_role = google_oauth_service.verify_state(state, oauth_state, settings)
         google_user = await google_oauth_service.exchange_code(code, settings)
         if not google_user.email_verified:
             return redirect(error="email_unverified")
@@ -222,6 +245,7 @@ async def google_callback(
             email=google_user.email,
             full_name=google_user.full_name,
             role=requested_role,
+            google_sub=google_user.sub,
         )
         await activity_log_service.record_login(session, user.id)
         access_token, raw_refresh = await auth_service.create_token_pair(session, user, settings)
@@ -257,9 +281,11 @@ async def google_complete(
     if not settings.google_oauth_enabled:
         raise NotFoundError("Google sign-in is not configured")
 
-    email, full_name = google_oauth_service.verify_signup_token(body.signup_token, settings)
+    email, full_name, google_sub = google_oauth_service.verify_signup_token(
+        body.signup_token, settings
+    )
     user = await user_service.get_or_create_google_user(
-        session, email=email, full_name=full_name, role=body.role
+        session, email=email, full_name=full_name, role=body.role, google_sub=google_sub
     )
     await activity_log_service.record_login(session, user.id)
     access_token, raw_refresh = await auth_service.create_token_pair(session, user, settings)

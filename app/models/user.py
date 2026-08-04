@@ -92,6 +92,11 @@ class User(BaseModel):
         nullable=False,
         sort_order=107,
     )
+    # Google's stable account identifier (``sub`` claim). Persisted so identity is
+    # tied to the Google account, not just a re-assignable email address.
+    google_sub: Mapped[str | None] = mapped_column(
+        String(255), unique=True, index=True, nullable=True, sort_order=108
+    )
 
     @property
     def is_email_verified(self) -> bool:
