@@ -104,6 +104,35 @@ curl localhost:8000/metrics
 Use the `CurrentUser` dependency for endpoints that need a local account, or
 `CurrentPrincipal` / `require_role(...)` for endpoints that accept either issuer.
 
+## Push notifications (FCM)
+
+Notifications use a **transactional outbox**: `notification_service.notify()` writes a
+row to the `notifications` table inside the same transaction as the domain change that
+triggered it, so the in-app feed and the push obligation are atomic with the event.
+A background sweep (`push_service.run_due_pushes`, every
+`NOTIFICATION_PUSH_SWEEP_SECONDS`) claims committed `pending` rows with
+`FOR UPDATE SKIP LOCKED` — safe to run from multiple app instances — and delivers them
+via Firebase Cloud Messaging. Delivery is at-least-once (retry with exponential backoff
+up to `NOTIFICATION_PUSH_MAX_ATTEMPTS`); clients must **dedupe on
+`data.notification_id`**.
+
+Push is **optional**. Leave `FIREBASE_CREDENTIALS_FILE` unset and the feed still works —
+the sweep drains pending rows to `skipped`. If credentials are set but Firebase fails to
+initialise, rows are left `pending` (not skipped) so a later successful init still
+delivers them.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `FIREBASE_CREDENTIALS_FILE` | _(unset)_ | Path to the Firebase service-account JSON. Unset ⇒ push disabled. Never commit it (`*firebase-adminsdk*.json` is gitignored). |
+| `NOTIFICATION_PUSH_SWEEP_SECONDS` | `5` | Outbox sweep interval. |
+| `NOTIFICATION_PUSH_MAX_ATTEMPTS` | `5` | Retries before a push is marked `failed`. |
+| `NOTIFICATION_PUSH_STALE_HOURS` | `24` | Pending rows older than this are skipped (so enabling FCM later never blasts a backlog). |
+| `NOTIFICATION_MAX_DEVICES_PER_USER` | `10` | Oldest device tokens are evicted beyond this cap. |
+
+Register a device with `POST /api/v1/devices` (`{token, platform}`); it's removed on
+logout via `DELETE /api/v1/devices`. Dead tokens (app uninstalled / wrong project) are
+pruned automatically when FCM reports them unregistered.
+
 ## API response structure
 
 Every JSON response uses a consistent envelope (defined in `app/schemas/response.py`).

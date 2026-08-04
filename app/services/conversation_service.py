@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import Select, case, func, or_, select
@@ -31,6 +31,10 @@ from app.services import notification_service
 from app.services.ws_manager import manager
 
 PUBLIC_STATUSES = (ModerationStatus.visible, ModerationStatus.flagged)
+
+# When the recipient is connected to this instance, delay the chat push this long so
+# their client's read receipt can cancel it before it fires (see send_message).
+CHAT_PUSH_ONLINE_GRACE_SECONDS = 15
 
 
 async def profile_photo_keys(
@@ -210,25 +214,38 @@ async def send_message(
     await session.flush()
     await session.refresh(message)
 
-    # Push only when the recipient isn't connected to this conversation's WebSocket —
-    # an online recipient already sees the message via the broadcast.
+    # Always queue the in-app notification. The old process-local `is_online` gate
+    # was wrong under multiple app instances — the recipient may be connected to a
+    # *different* instance, so this one would wrongly see them offline (or online)
+    # and mis-decide the push. Instead we always write the row; whether an actual
+    # FCM push fires is decided later against committed DB state: if the recipient
+    # reads the message in-app (read receipt → mark_read → push_status=skipped)
+    # before the sweep runs, no push goes out.
     recipient_id = (
         conversation.advisor_id
         if sender.id == conversation.seeker_id
         else conversation.seeker_id
     )
-    if not manager.is_online(conversation.id, recipient_id):
-        preview = body[:140] if body else "Sent an attachment"
-        await notification_service.notify(
-            session,
-            user_id=recipient_id,
-            type=NotificationType.message_received,
-            title=f"New message from {sender.full_name or 'your contact'}",
-            body=preview,
-            entity_type=NotificationEntityType.conversation,
-            entity_id=conversation.id,
-            actor_id=sender.id,
+    preview = body[:140] if body else "Sent an attachment"
+    notification = await notification_service.notify(
+        session,
+        user_id=recipient_id,
+        type=NotificationType.message_received,
+        title=f"New message from {sender.full_name or 'your contact'}",
+        body=preview,
+        entity_type=NotificationEntityType.conversation,
+        entity_id=conversation.id,
+        actor_id=sender.id,
+    )
+    # Grace window: if the recipient is connected to *this* instance right now, they
+    # almost certainly see the broadcast immediately, so defer the push briefly to
+    # give the client's read receipt a chance to cancel it. On a miss (they're on
+    # another instance, or offline) this only delays the push by the grace window.
+    if manager.is_online(conversation.id, recipient_id):
+        notification.push_next_attempt_at = now + timedelta(
+            seconds=CHAT_PUSH_ONLINE_GRACE_SECONDS
         )
+        await session.flush()
     return message
 
 

@@ -144,9 +144,19 @@ async def mark_all_read(session: AsyncSession, user_id: uuid.UUID) -> int:
 
 
 async def register_device(
-    session: AsyncSession, user_id: uuid.UUID, token: str, platform: DevicePlatform
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    token: str,
+    platform: DevicePlatform,
+    *,
+    max_devices: int | None = None,
 ) -> DeviceToken:
-    """Upsert by unique token — a token seen under a new account changes owner."""
+    """Upsert by unique token — a token seen under a new account changes owner.
+
+    When ``max_devices`` is set, registering a *new* token beyond the cap evicts the
+    user's least-recently-seen tokens first, so a single account can't grow the
+    device table without bound.
+    """
     existing = await session.scalar(select(DeviceToken).where(DeviceToken.token == token))
     now = datetime.now(UTC)
     if existing is not None:
@@ -155,10 +165,30 @@ async def register_device(
         existing.last_seen_at = now
         await session.flush()
         return existing
+
+    if max_devices is not None and max_devices > 0:
+        await _evict_stale_devices(session, user_id, keep=max_devices - 1)
+
     device = DeviceToken(user_id=user_id, token=token, platform=platform, last_seen_at=now)
     session.add(device)
     await session.flush()
     return device
+
+
+async def _evict_stale_devices(
+    session: AsyncSession, user_id: uuid.UUID, *, keep: int
+) -> None:
+    """Delete all but the ``keep`` most-recently-seen tokens for ``user_id``."""
+    result = await session.execute(
+        select(DeviceToken)
+        .where(DeviceToken.user_id == user_id)
+        .order_by(DeviceToken.last_seen_at.desc())
+    )
+    devices = list(result.scalars().all())
+    for device in devices[keep:]:
+        await session.delete(device)
+    if len(devices) > keep:
+        await session.flush()
 
 
 async def unregister_device(session: AsyncSession, user_id: uuid.UUID, token: str) -> None:

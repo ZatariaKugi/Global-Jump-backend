@@ -66,12 +66,22 @@ async def run_due_pushes(session: AsyncSession, settings: Settings) -> int:
     """One sweep pass over the notification outbox. Flushes; the caller commits."""
     now = datetime.now(UTC)
 
-    if not settings.push_enabled or not firebase_admin._apps:
+    if not settings.push_enabled:
+        # Push is intentionally off (no credentials configured): drain pending rows
+        # to ``skipped`` so the in-app feed keeps working and the outbox never grows.
         await session.execute(
             update(Notification)
             .where(Notification.push_status == PushStatus.pending)
             .values(push_status=PushStatus.skipped)
         )
+        return 0
+
+    # Push is enabled but Firebase isn't initialised yet — e.g. init failed on the
+    # last startup, or transient credential trouble. Retry init; if it still fails,
+    # leave pending rows untouched so a later successful init delivers them (do NOT
+    # mass-skip, which would silently drop every queued push).
+    if not firebase_admin._apps and not init_firebase(settings):
+        logger.warning("push_sweep_skipped [firebase not initialised — leaving rows pending]")
         return 0
 
     # Expire stale backlog so a freshly-enabled FCM never blasts old rows.
@@ -125,7 +135,11 @@ async def _dispatch_one(
 ) -> int:
     devices = tokens_by_user.get(notification.user_id, [])
     if not devices:
-        notification.push_status = PushStatus.skipped
+        # No device registered *yet*. The user may register one shortly after the
+        # event (e.g. first login on a new phone), so defer rather than skip — the
+        # row stays pending until either a token appears or the stale cutoff drains
+        # it. Backoff is bounded by NOTIFICATION_PUSH_MAX_ATTEMPTS / stale expiry.
+        _record_failure(notification, "no registered device tokens", settings)
         return 0
 
     message = _build_message(notification, [d.token for d in devices])

@@ -469,6 +469,12 @@ async def _handle_checkout_expired(session: AsyncSession, cs: object) -> None:
     txn = txn_result.scalar_one_or_none()
     if txn is None:
         return
+    # Idempotent against duplicate webhook delivery: only a still-pending checkout
+    # can expire. If it already succeeded (a completed event won the race) or was
+    # already marked failed, do nothing — re-running would re-notify the seeker.
+    if txn.status != TransactionStatus.pending:
+        log.info("webhook_checkout_expired_already_processed", session_id=session_id)
+        return
     txn.status = TransactionStatus.failed
     session.add(txn)
     await _log_event(session, txn.id, TransactionEventType.failed)
@@ -504,6 +510,20 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
         else txn.amount_usd
     )
     is_full = refunded_amount_usd >= txn.amount_usd
+
+    # Idempotent against duplicate webhook delivery and against an admin-initiated
+    # refund that already moved the row (refund_transaction sets these same fields):
+    # Stripe may redeliver charge.refunded, and an admin refund also triggers one.
+    # Only proceed when this event reflects *more* refunded than we've recorded
+    # (e.g. a genuine partial→larger escalation from the dashboard); otherwise the
+    # refund is already accounted for — don't re-notify the seeker or re-log events.
+    already_refunded = txn.refunded_amount_usd or 0.0
+    if txn.status in (
+        TransactionStatus.refunded,
+        TransactionStatus.partially_refunded,
+    ) and refunded_amount_usd <= already_refunded:
+        log.info("webhook_refund_already_processed", charge_id=charge_id)
+        return
     txn.status = TransactionStatus.refunded if is_full else TransactionStatus.partially_refunded
     txn.refunded_amount_usd = refunded_amount_usd
     txn.refunded_at = datetime.now(UTC)

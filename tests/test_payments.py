@@ -266,3 +266,73 @@ async def test_payment_receipt_email_sent_on_successful_payment(
     mock_send.assert_awaited_once()
     assert mock_send.call_args.args[0] == "cust@test.com"
     assert mock_send.call_args.kwargs["service_type"] == "immigration_specialist"
+
+
+# ── Webhook idempotency (PR #82 review follow-ups) ───────────────────────────
+
+
+async def _count_notifications(engine, notif_type: str) -> int:
+    from app.models.notification import Notification
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        rows = await session.execute(
+            Notification.__table__.select().where(Notification.type == notif_type)
+        )
+        return len(rows.mappings().all())
+
+
+async def test_charge_refunded_webhook_is_idempotent(client: AsyncClient, engine) -> None:
+    """A redelivered charge.refunded (or one after an admin refund) must not re-notify.
+
+    Calls the handler directly (twice) — the webhook HTTP route enforces a Stripe
+    signature the suite can't produce; idempotency lives in the handler either way.
+    """
+    from app.services.payment_service import _handle_charge_refunded
+
+    booking_id, _, _, _, _ = await _confirmed_booking(client, engine)
+    await _succeeded_transaction(engine, booking_id, amount_usd=100.0, stripe_charge_id="ch_dup")
+
+    charge = {"id": "ch_dup", "amount_refunded": 10000}
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    for _ in range(2):  # first delivery + redelivery
+        async with session_factory() as session:
+            await _handle_charge_refunded(session, charge)
+            await session.commit()
+
+    # Only one refund notification despite two deliveries.
+    assert await _count_notifications(engine, "payment_refunded") == 1
+
+
+async def test_checkout_expired_webhook_is_idempotent(client: AsyncClient, engine) -> None:
+    """A redelivered checkout.session.expired must not re-notify the seeker."""
+    from app.services.payment_service import _handle_checkout_expired
+
+    booking_id, _, _, _, _ = await _confirmed_booking(client, engine)
+
+    # Insert a *pending* transaction directly (the checkout endpoint gates on advisor
+    # payout-readiness, which is orthogonal to what this test covers).
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        txn = Transaction(
+            booking_id=uuid.UUID(booking_id),
+            stripe_checkout_session_id="cs_expire_dup",
+            amount_usd=100.0,
+            commission_rate=0.15,
+            commission_usd=15.0,
+            tax_rate=0.08,
+            tax_usd=8.0,
+            advisor_payout_usd=77.0,
+            status=TransactionStatus.pending,
+            created_at=datetime.now(UTC),
+        )
+        session.add(txn)
+        await session.commit()
+
+    cs = {"id": "cs_expire_dup"}
+    for _ in range(2):  # first delivery + redelivery
+        async with session_factory() as session:
+            await _handle_checkout_expired(session, cs)
+            await session.commit()
+
+    assert await _count_notifications(engine, "payment_failed") == 1

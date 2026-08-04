@@ -120,6 +120,10 @@ class Settings(BaseSettings):
     # Pending rows older than this are expired to ``skipped`` so enabling FCM
     # later never blasts a historical backlog to devices.
     NOTIFICATION_PUSH_STALE_HOURS: int = 24
+    # Cap on device tokens kept per user. Registering beyond this evicts the
+    # least-recently-seen token, bounding a stolen/abused JWT's ability to bloat the
+    # table with junk tokens.
+    NOTIFICATION_MAX_DEVICES_PER_USER: int = 10
 
     # OpenAI (AI assessment insights) -----------------------------------------
     OPENAI_API_KEY: str | None = None

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.deps import CurrentUser, RequestIdDep
+from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.db.session import SessionDep
 from app.schemas.device import DeviceRead, DeviceRegister, DeviceUnregister
 from app.schemas.response import Meta, ResponseEnvelope
@@ -18,15 +18,21 @@ async def register_device(
     data: DeviceRegister,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[DeviceRead]:
     """Register (or refresh) an FCM device token for the current user.
 
     Upsert by token: re-registering is safe, and a token previously owned by
-    another account is reassigned to the caller.
+    another account is reassigned to the caller. Beyond
+    ``NOTIFICATION_MAX_DEVICES_PER_USER`` tokens the oldest are evicted.
     """
     device = await notification_service.register_device(
-        session, current_user.id, data.token, data.platform
+        session,
+        current_user.id,
+        data.token,
+        data.platform,
+        max_devices=settings.NOTIFICATION_MAX_DEVICES_PER_USER,
     )
     return ResponseEnvelope[DeviceRead](
         data=DeviceRead.model_validate(device), meta=Meta(request_id=request_id)
