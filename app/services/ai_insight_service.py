@@ -66,6 +66,10 @@ Rules:
   format. Use an empty list if nothing is missing.
 - "summary": one paragraph of practical improvement suggestions, under 900
   characters, second person ("you"), no bullet points.
+- If a "Reference policy (admin-verified)" section is present, use it only as
+  context for what this destination and visa type typically require — it may
+  inform weaknesses and missing_requirements. Never use it to change, justify,
+  or second-guess the provided score, tier, or category scores.
 - Respond only with JSON matching the required schema.
 """
 
@@ -126,6 +130,21 @@ class InsightPayload(BaseModel):
     summary: str
 
 
+class PolicyReference(BaseModel):
+    """Admin-verified country policy injected into the prompt for grounding.
+
+    Built by assessment_service from a published CountryRule. Passing this as a
+    plain contract avoids importing the ORM model here (and any import cycle).
+    """
+
+    country_name: str
+    visa_type_label: str
+    summary: str | None = None
+    requirements: list[str] = []
+    pitfalls: list[str] = []
+    process_notes: list[str] = []
+
+
 def _category_key(raw: str) -> str:
     # Tolerate models echoing decoration: "[nationality]", "nationality (category
     # score 100/100)", "Visa Refusals", etc.
@@ -159,6 +178,7 @@ def _filter_strengths(items: list[_StrengthItem], assessment: Assessment) -> lis
 def _build_user_prompt(
     assessment: Assessment,
     answered: list[tuple[AssessmentQuestion, AssessmentQuestionOption]],
+    policy: PolicyReference | None = None,
 ) -> str:
     lines = [
         f"Destination country: {assessment.destination_country}",
@@ -182,6 +202,24 @@ def _build_user_prompt(
         )
         lines.append(f"- [{category}]{score_note} {question.text}")
         lines.append(f"  Answer: {option.text}")
+
+    # Admin-verified reference policy (§21). Additive: only present when a
+    # published CountryRule exists for this country/visa — no policy, no change.
+    if policy is not None:
+        lines.append("")
+        lines.append("Reference policy (admin-verified):")
+        lines.append(f"Country: {policy.country_name} · Visa type: {policy.visa_type_label}")
+        if policy.summary:
+            lines.append(f"Summary: {policy.summary}")
+        if policy.requirements:
+            lines.append("Typical requirements:")
+            lines.extend(f"- {r}" for r in policy.requirements)
+        if policy.pitfalls:
+            lines.append("Common pitfalls:")
+            lines.extend(f"- {p}" for p in policy.pitfalls)
+        if policy.process_notes:
+            lines.append("Process notes:")
+            lines.extend(f"- {n}" for n in policy.process_notes)
     return "\n".join(lines)
 
 
@@ -196,11 +234,16 @@ async def generate_insights(
     assessment: Assessment,
     answered: list[tuple[AssessmentQuestion, AssessmentQuestionOption]],
     settings: Settings,
+    policy: PolicyReference | None = None,
 ) -> InsightPayload | None:
     """Generate narrative insights for a just-scored assessment.
 
     Precondition: the caller has already set ``score``, ``tier``, and
     ``category_scores`` on the assessment — the prompt is grounded on them.
+
+    ``policy`` is an optional admin-verified reference policy; when present it is
+    added to the prompt for grounding but never overrides the deterministic
+    score (§22). When absent the prompt is unchanged (§23, additive).
 
     Returns None when OpenAI is unconfigured or the call fails for any
     reason; never raises.
@@ -219,7 +262,7 @@ async def generate_insights(
             model=settings.OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": _build_user_prompt(assessment, answered)},
+                {"role": "user", "content": _build_user_prompt(assessment, answered, policy)},
             ],
             response_format=_RESPONSE_FORMAT,
             max_completion_tokens=2000,

@@ -175,9 +175,7 @@ async def register_device(
     return device
 
 
-async def _evict_stale_devices(
-    session: AsyncSession, user_id: uuid.UUID, *, keep: int
-) -> None:
+async def _evict_stale_devices(session: AsyncSession, user_id: uuid.UUID, *, keep: int) -> None:
     """Delete all but the ``keep`` most-recently-seen tokens for ``user_id``."""
     result = await session.execute(
         select(DeviceToken)

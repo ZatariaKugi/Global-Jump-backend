@@ -15,7 +15,9 @@ from sqlalchemy import Select, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
+from app.core.countries import country_name
 from app.core.exceptions import AppError, NotFoundError
+from app.core.visa_types import visa_type_name
 from app.models.assessment import (
     Assessment,
     AssessmentAnswer,
@@ -41,7 +43,7 @@ from app.schemas.assessment import (
     QuestionUpdate,
 )
 from app.schemas.assessment_threshold import AssessmentThresholdUpsert
-from app.services import ab_variant_service, ai_insight_service
+from app.services import ab_variant_service, ai_insight_service, country_rule_service
 
 # Tips are surfaced for answers scoring below this threshold.
 TIP_SCORE_THRESHOLD = 60.0
@@ -278,9 +280,28 @@ async def submit_answers(
     ]
     assessment.tips = [AssessmentTip(assessment_id=assessment.id, tip=t) for t in tips]
 
+    # Admin-verified reference policy (§21) — additive grounding for the AI
+    # narrative. Absent policy = prompt unchanged; the deterministic score above
+    # is never affected by it.
+    policy_ref: ai_insight_service.PolicyReference | None = None
+    published = await country_rule_service.get_published(
+        session, assessment.destination_country, assessment.visa_type
+    )
+    if published is not None:
+        policy_ref = ai_insight_service.PolicyReference(
+            country_name=country_name(published.country_code) or published.country_code,
+            visa_type_label=visa_type_name(published.visa_type) or published.visa_type,
+            summary=published.summary,
+            requirements=[r.text for r in published.requirements],
+            pitfalls=[p.text for p in published.pitfalls],
+            process_notes=[n.text for n in published.process_notes],
+        )
+
     # Best-effort AI narrative — None (unconfigured/failed) leaves insights
     # empty and ai_summary NULL; the frontend falls back to improvement_tips.
-    payload = await ai_insight_service.generate_insights(assessment, answered_pairs, settings)
+    payload = await ai_insight_service.generate_insights(
+        assessment, answered_pairs, settings, policy_ref
+    )
     if payload is not None:
         assessment.ai_summary = payload.summary
         insight_rows: list[AssessmentInsight] = []

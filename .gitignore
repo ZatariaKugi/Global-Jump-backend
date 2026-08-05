@@ -32,5 +32,5 @@ htmlcov/
 .DS_Store
 
 # Firebase service account credentials
-global-jump-fcm-firebase-adminsdk-fbsvc-58f7f30449.json
+global-jump-llc-firebase-adminsdk-fbsvc-584dc0c263.json
 *firebase-adminsdk*.json

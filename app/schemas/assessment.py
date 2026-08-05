@@ -4,11 +4,31 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AfterValidator, BaseModel, Field, model_validator
 
+from app.core.countries import SUPPORTED_COUNTRY_CODES, is_supported_country
 from app.core.visa_types import OptionalVisaType, RequiredVisaType
 from app.models.assessment import AssessmentStatus, EligibilityTier, QuestionCategory
+
+
+def _require_supported_country(value: str) -> str:
+    code = value.upper()
+    if not is_supported_country(code):
+        raise ValueError(
+            f"Unsupported country {value!r}; must be one of {', '.join(SUPPORTED_COUNTRY_CODES)}"
+        )
+    return code
+
+
+def _optional_supported_country(value: str | None) -> str | None:
+    return _require_supported_country(value) if value is not None else None
+
+
+# Country-code fields constrained to the 10 supported countries (new writes only).
+SupportedCountryCode = Annotated[str, AfterValidator(_require_supported_country)]
+OptionalSupportedCountryCode = Annotated[str | None, AfterValidator(_optional_supported_country)]
 
 # ── Questionnaire ────────────────────────────────────────────────────────────
 
@@ -61,7 +81,7 @@ class QuestionCreate(BaseModel):
     # Optional — questions are scoped by country/visa_type; category is for
     # result breakdown only when provided.
     category: QuestionCategory | None = None
-    country_code: str | None = Field(default=None, min_length=2, max_length=2)
+    country_code: OptionalSupportedCountryCode = None
     visa_type: OptionalVisaType = None
     weight: float = Field(default=1.0, gt=0, le=10)
     # UI "Weightage %" (0–100) — preferred; converts to ``weight`` = pct / 10.
@@ -82,7 +102,7 @@ class QuestionUpdate(BaseModel):
     text: str | None = Field(default=None, min_length=1, max_length=500)
     description: str | None = Field(default=None, max_length=1000)
     category: QuestionCategory | None = None
-    country_code: str | None = Field(default=None, min_length=2, max_length=2)
+    country_code: OptionalSupportedCountryCode = None
     visa_type: OptionalVisaType = None
     weight: float | None = Field(default=None, gt=0, le=10)
     weightage_pct: float | None = Field(default=None, ge=0, le=100)
@@ -126,7 +146,7 @@ class QuestionAdminRead(BaseModel):
 
 
 class AssessmentCreate(BaseModel):
-    destination_country: str = Field(min_length=2, max_length=2)
+    destination_country: SupportedCountryCode
     visa_type: RequiredVisaType
 
 

@@ -70,6 +70,6 @@ class SeekerDashboardRead(BaseModel):
     next_upcoming: BookingRead | None
     stats: SeekerDashboardStats
     journey_stages: list[JourneyStageRead]
-    eligibility_breakdown: EligibilityBreakdownRead | None  
-    matched_advisors: list[AdvisorMatchRead]  
-    assessment_id: uuid.UUID | None  
+    eligibility_breakdown: EligibilityBreakdownRead | None
+    matched_advisors: list[AdvisorMatchRead]
+    assessment_id: uuid.UUID | None

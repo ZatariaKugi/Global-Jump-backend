@@ -155,9 +155,7 @@ async def _clear_prior(session: AsyncSession, advisor_id: uuid.UUID) -> int:
                 .all()
             )
             if txn_ids:
-                await session.execute(
-                    delete(Transaction).where(Transaction.id.in_(txn_ids))
-                )
+                await session.execute(delete(Transaction).where(Transaction.id.in_(txn_ids)))
             await session.execute(delete(Review).where(Review.booking_id.in_(booking_ids)))
             await session.execute(delete(Booking).where(Booking.id.in_(booking_ids)))
         await session.execute(
@@ -274,9 +272,7 @@ async def _make_succeeded_txn(
     return txn
 
 
-async def _make_review(
-    session: AsyncSession, booking: Booking, advisor_id: uuid.UUID
-) -> Review:
+async def _make_review(session: AsyncSession, booking: Booking, advisor_id: uuid.UUID) -> Review:
     review = Review(
         booking_id=booking.id,
         seeker_id=booking.seeker_id,

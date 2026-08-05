@@ -68,7 +68,7 @@ SEEKERS = [
         "nationality": "CN",
         "country_of_residence": "CN",
         "intended_visa_type": "student",
-        "intended_destination": "US",
+        "intended_destination": "GB",
         "passport_number": "CN9876543",
         "passport_expiry": date(2028, 2, 15),
         "countries_visited": ["JP", "KR"],

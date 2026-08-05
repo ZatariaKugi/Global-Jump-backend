@@ -179,10 +179,10 @@ async def main() -> None:
                 "/advisors/me/profile",
                 json={
                     "title": "Visa Specialist",
-                    "bio": "Expert in UK and US visa applications.",
+                    "bio": "Expert in UK and Irish visa applications.",
                     "years_of_experience": 5,
                     "visa_specializations": ["tourist", "work"],
-                    "country_expertise": ["GB", "US"],
+                    "country_expertise": ["GB", "IE"],
                     "languages": [{"language": "English", "proficiency": "native"}],
                     "services": [
                         {

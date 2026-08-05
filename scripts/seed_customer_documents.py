@@ -65,7 +65,7 @@ SEEKER_SPECS: list[SeekerSpec] = [
         "docs.seeker2@globlejump.test",
         "Maya Chen",
         "work",
-        "US",
+        "AU",
         BookingStatus.pending,
         [
             (DocumentCategory.passport, "US Passport.pdf", SeekerDocumentStatus.approved),

@@ -62,6 +62,7 @@ async def _notify_payment(
         actor_id=actor_id,
     )
 
+
 _INVOICE_TERMS = (
     "Payment is due upon receipt. This invoice reflects charges for consultation "
     "services arranged through the platform. Refunds are subject to the platform "
@@ -160,9 +161,7 @@ async def create_checkout_session(
     # platform with no destination for the delayed payout.
     advisor_profile = await _get_advisor_profile(session, booking.advisor_id)
     if not (advisor_profile.stripe_account_id and advisor_profile.stripe_charges_enabled):
-        raise AppError(
-            "Advisor is not set up to receive payments yet", code="advisor_not_payable"
-        )
+        raise AppError("Advisor is not set up to receive payments yet", code="advisor_not_payable")
 
     # Resume an existing open Checkout Session instead of hard-failing.
     existing = (
@@ -518,10 +517,14 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
     # (e.g. a genuine partial→larger escalation from the dashboard); otherwise the
     # refund is already accounted for — don't re-notify the seeker or re-log events.
     already_refunded = txn.refunded_amount_usd or 0.0
-    if txn.status in (
-        TransactionStatus.refunded,
-        TransactionStatus.partially_refunded,
-    ) and refunded_amount_usd <= already_refunded:
+    if (
+        txn.status
+        in (
+            TransactionStatus.refunded,
+            TransactionStatus.partially_refunded,
+        )
+        and refunded_amount_usd <= already_refunded
+    ):
         log.info("webhook_refund_already_processed", charge_id=charge_id)
         return
     txn.status = TransactionStatus.refunded if is_full else TransactionStatus.partially_refunded
@@ -581,9 +584,7 @@ async def refund_transaction(
         raise AppError("Only succeeded transactions can be refunded", code="not_refundable")
     # Refund window: closed once the advisor payout has been transferred.
     if txn.transfer_status in (TransferStatus.completed, TransferStatus.failed):
-        raise AppError(
-            "The refund window has closed for this payment", code="refund_window_closed"
-        )
+        raise AppError("The refund window has closed for this payment", code="refund_window_closed")
 
     refund_amount = amount_usd if amount_usd is not None else txn.amount_usd
     if refund_amount > txn.amount_usd:

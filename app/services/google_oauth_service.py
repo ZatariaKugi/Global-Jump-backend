@@ -85,9 +85,7 @@ def sign_state(role: UserRole | None, settings: Settings) -> tuple[str, str]:
     return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256"), nonce
 
 
-def verify_state(
-    state: str, expected_nonce: str | None, settings: Settings
-) -> UserRole | None:
+def verify_state(state: str, expected_nonce: str | None, settings: Settings) -> UserRole | None:
     """Validate the state signature/expiry/nonce and return the requested role.
 
     ``expected_nonce`` is the value read from the browser's state cookie. The

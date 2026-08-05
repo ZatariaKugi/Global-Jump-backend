@@ -6,13 +6,28 @@ import uuid
 from datetime import date, datetime
 from typing import Annotated
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator
 
-from app.core.countries import country_code
+from app.core.countries import SUPPORTED_COUNTRY_CODES, country_code, is_supported_country
 from app.core.visa_types import OptionalVisaType, RequiredVisaType
 from app.models.seeker_profile import EducationLevel, EmploymentStatus
 
 CountryCode = Annotated[str, Field(min_length=2, max_length=2)]
+
+
+def _require_supported_destination(value: str) -> str:
+    code = value.upper()
+    if not is_supported_country(code):
+        raise ValueError(
+            f"Unsupported destination {value!r}; must be one of "
+            f"{', '.join(SUPPORTED_COUNTRY_CODES)}"
+        )
+    return code
+
+
+SupportedDestinationCode = Annotated[
+    str, Field(min_length=2, max_length=2), AfterValidator(_require_supported_destination)
+]
 
 
 class PriorVisa(BaseModel):
@@ -32,7 +47,7 @@ class SeekerProfileUpdate(BaseModel):
     preferred_language: str | None = Field(default=None, max_length=100)
     about: str | None = Field(default=None, max_length=2000)
     intended_visa_type: OptionalVisaType = None
-    intended_destination: CountryCode | None = None
+    intended_destination: SupportedDestinationCode | None = None
     passport_number: str | None = Field(default=None, min_length=5, max_length=20)
     passport_expiry: date | None = None
     countries_visited: list[CountryCode] | None = None
@@ -94,6 +109,11 @@ class OnboardingSubmit(BaseModel):
         code = country_code(value)
         if code is None:
             raise ValueError(f"Unrecognized country: {value!r}")
+        if not is_supported_country(code):
+            raise ValueError(
+                f"Unsupported destination {value!r}; must be one of "
+                f"{', '.join(SUPPORTED_COUNTRY_CODES)}"
+            )
         return code
 
     @field_validator("nationality")

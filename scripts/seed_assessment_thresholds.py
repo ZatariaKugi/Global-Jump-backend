@@ -29,8 +29,8 @@ SEED_THRESHOLDS: list[tuple[str | None, str | None, float, float, float]] = [
     (None, None, 80.0, 60.0, 40.0),  # global
     ("CA", "student", 85.0, 65.0, 45.0),
     ("CA", "work", 82.0, 62.0, 42.0),
-    ("US", "tourist", 75.0, 55.0, 35.0),
-    ("US", "work", 88.0, 70.0, 50.0),
+    ("NZ", "tourist", 75.0, 55.0, 35.0),
+    ("NZ", "work", 88.0, 70.0, 50.0),
     ("GB", "work", 80.0, 60.0, 40.0),
     ("GB", "student", 78.0, 58.0, 38.0),
     ("AU", "pr", 90.0, 75.0, 55.0),

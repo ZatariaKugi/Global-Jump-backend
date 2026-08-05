@@ -222,9 +222,7 @@ async def send_message(
     # reads the message in-app (read receipt → mark_read → push_status=skipped)
     # before the sweep runs, no push goes out.
     recipient_id = (
-        conversation.advisor_id
-        if sender.id == conversation.seeker_id
-        else conversation.seeker_id
+        conversation.advisor_id if sender.id == conversation.seeker_id else conversation.seeker_id
     )
     preview = body[:140] if body else "Sent an attachment"
     notification = await notification_service.notify(
@@ -242,9 +240,7 @@ async def send_message(
     # give the client's read receipt a chance to cancel it. On a miss (they're on
     # another instance, or offline) this only delays the push by the grace window.
     if manager.is_online(conversation.id, recipient_id):
-        notification.push_next_attempt_at = now + timedelta(
-            seconds=CHAT_PUSH_ONLINE_GRACE_SECONDS
-        )
+        notification.push_next_attempt_at = now + timedelta(seconds=CHAT_PUSH_ONLINE_GRACE_SECONDS)
         await session.flush()
     return message
 

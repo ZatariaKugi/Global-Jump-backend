@@ -9,7 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from app.api.deps import RequestIdDep
-from app.core.countries import COUNTRY_NAMES
+from app.core.countries import supported_countries
 from app.schemas.country import CountryRead
 from app.schemas.response import Meta, ResponseEnvelope
 
@@ -18,8 +18,5 @@ router = APIRouter(prefix="/countries", tags=["countries"])
 
 @router.get("", response_model=ResponseEnvelope[list[CountryRead]])
 async def list_countries(request_id: RequestIdDep) -> ResponseEnvelope[list[CountryRead]]:
-    countries = [
-        CountryRead(code=code, name=name)
-        for code, name in sorted(COUNTRY_NAMES.items(), key=lambda item: item[1])
-    ]
+    countries = [CountryRead(code=code, name=name) for code, name in supported_countries()]
     return ResponseEnvelope[list[CountryRead]](data=countries, meta=Meta(request_id=request_id))

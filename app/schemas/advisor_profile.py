@@ -6,8 +6,9 @@ import uuid
 from datetime import date, datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator
 
+from app.core.countries import SUPPORTED_COUNTRY_CODES, is_supported_country
 from app.core.visa_types import RequiredVisaType
 from app.models.advisor_credential import DocumentType
 from app.models.advisor_profile import AdvisorServiceType
@@ -16,6 +17,21 @@ from app.models.visa_type import VisaType
 from app.schemas.availability import WeeklySlotInput, WeeklySlotRead
 
 CountryCode = Annotated[str, Field(min_length=2, max_length=2)]
+
+
+def _require_supported_destination(value: str) -> str:
+    code = value.upper()
+    if not is_supported_country(code):
+        raise ValueError(
+            f"Unsupported country {value!r}; must be one of {', '.join(SUPPORTED_COUNTRY_CODES)}"
+        )
+    return code
+
+
+
+SupportedCountryCode = Annotated[
+    str, Field(min_length=2, max_length=2), AfterValidator(_require_supported_destination)
+]
 
 # Document types shown on the onboarding "Verification Documents" screen.
 ONBOARDING_DOCUMENT_TYPES = frozenset(
@@ -57,7 +73,7 @@ class AdvisorProfileUpdate(BaseModel):
     years_of_experience: int | None = Field(default=None, ge=0, le=60)
     successful_application_rate: float | None = Field(default=None, ge=0, le=100)
     visa_specializations: list[RequiredVisaType] | None = None
-    country_expertise: list[CountryCode] | None = None
+    country_expertise: list[SupportedCountryCode] | None = None
     offered_services: list[AdvisorServiceType] | None = None
     languages: list[LanguageEntry] | None = None
     services: list[ServiceOffering] | None = None
@@ -192,7 +208,7 @@ class AdvisorOnboardingSubmit(BaseModel):
     expertise_description: str | None = Field(default=None, max_length=2000)
     # Step 4
     country_of_residence: CountryCode | None = None
-    countries_you_serve: list[CountryCode] = Field(default_factory=list, max_length=50)
+    countries_you_serve: list[SupportedCountryCode] = Field(default_factory=list, max_length=50)
     # Step 5
     bio: str | None = Field(default=None, max_length=800)
     years_of_experience: int | None = Field(default=None, ge=0, le=60)

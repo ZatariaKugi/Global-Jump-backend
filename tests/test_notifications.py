@@ -55,8 +55,7 @@ async def _pending(session: AsyncSession, user_id: uuid.UUID, **kw) -> Notificat
 def _fake_batch(successes: list[bool], exceptions: list | None = None):
     exceptions = exceptions or [None] * len(successes)
     responses = [
-        SimpleNamespace(success=s, exception=e)
-        for s, e in zip(successes, exceptions, strict=True)
+        SimpleNamespace(success=s, exception=e) for s, e in zip(successes, exceptions, strict=True)
     ]
     return SimpleNamespace(responses=responses)
 
@@ -133,9 +132,7 @@ async def test_no_device_tokens_defers_not_skips(session, settings, monkeypatch)
 
 async def test_successful_dispatch_marks_sent(session, settings, monkeypatch):
     user = await _user(session)
-    await notification_service.register_device(
-        session, user.id, "tok-good", DevicePlatform.android
-    )
+    await notification_service.register_device(session, user.id, "tok-good", DevicePlatform.android)
     n = await _pending(session, user.id)
     await session.commit()
 
@@ -160,9 +157,7 @@ async def test_unregistered_token_is_pruned(session, settings, monkeypatch):
     from firebase_admin import messaging as fb_messaging
 
     user = await _user(session)
-    await notification_service.register_device(
-        session, user.id, "tok-dead", DevicePlatform.ios
-    )
+    await notification_service.register_device(session, user.id, "tok-dead", DevicePlatform.ios)
     await _pending(session, user.id)
     await session.commit()
 
@@ -224,9 +219,7 @@ async def test_device_cap_evicts_least_recently_seen(session):
 
     tokens = {
         d.token
-        for d in (await notification_service.tokens_for_users(session, [user.id])).get(
-            user.id, []
-        )
+        for d in (await notification_service.tokens_for_users(session, [user.id])).get(user.id, [])
     }
     assert tokens == {"tok-2", "tok-new"}  # oldest (tok-0, tok-1) evicted
     assert len(tokens) == 2

@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from app.api.deps import CurrentPrincipal, RequestIdDep, SettingsDep, require_role
 from app.api.pagination import PaginationDep, page_meta, paginate
@@ -16,6 +16,7 @@ from app.models.advisor_credential import CredentialStatus
 from app.models.assessment import AssessmentQuestion
 from app.models.assessment_threshold import AssessmentThreshold
 from app.models.booking import BookingStatus
+from app.models.country_rule import RulePublishStatus
 from app.models.eligibility_rule import EligibilityRule
 from app.models.payout_request import PayoutStatus
 from app.models.review import Review
@@ -53,6 +54,11 @@ from app.schemas.assessment import (
 from app.schemas.assessment_threshold import AssessmentThresholdRead, AssessmentThresholdUpsert
 from app.schemas.booking import BookingDetailsRead
 from app.schemas.conversation import FlaggedMessageRead
+from app.schemas.country_rule import (
+    CountryRuleGenerateRequest,
+    CountryRuleRead,
+    CountryRuleUpdate,
+)
 from app.schemas.dashboard import ActivityFeedItemRead, DashboardSummaryRead
 from app.schemas.eligibility_rule import (
     EligibilityRuleCreate,
@@ -90,6 +96,7 @@ from app.services import (
     assessment_service,
     booking_service,
     conversation_service,
+    country_rule_service,
     dashboard_service,
     eligibility_rule_service,
     impersonation_service,
@@ -1639,4 +1646,144 @@ async def list_activities(
     items, total = await dashboard_service.list_recent_activities_page(session, days, params)
     return ResponseEnvelope[list[ActivityFeedItemRead]](
         data=items, meta=page_meta(params, total, request_id)
+    )
+
+
+# ── Country Rules & Policies ─────────────────────────────────────────────────
+
+
+@router.post(
+    "/country-rules/generate",
+    response_model=ResponseEnvelope[CountryRuleRead],
+    status_code=201,
+)
+async def generate_country_rule(
+    body: CountryRuleGenerateRequest,
+    principal: CurrentPrincipal,
+    settings: SettingsDep,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[CountryRuleRead]:
+    """Generate a new AI policy draft for a country/visa pair.
+
+    The service owns its own transactions (it does not use this request session)
+    so the slow web-search call holds no lock; a duplicate in-flight generation
+    returns 409.
+    """
+    rule_id = await country_rule_service.generate(
+        body.country_code, body.visa_type.value, principal.id, settings
+    )
+    rule = await country_rule_service.get_rule(session, rule_id)
+    return ResponseEnvelope[CountryRuleRead](
+        data=CountryRuleRead.from_model(rule), meta=Meta(request_id=request_id)
+    )
+
+
+@router.get("/country-rules", response_model=ResponseEnvelope[list[CountryRuleRead]])
+async def list_country_rules(
+    session: SessionDep,
+    request_id: RequestIdDep,
+    params: PaginationDep,
+    country_code: str | None = Query(default=None, min_length=2, max_length=2),
+    visa_type: OptionalVisaType = None,
+    status: RulePublishStatus | None = None,
+) -> ResponseEnvelope[list[CountryRuleRead]]:
+    stmt = country_rule_service.list_rules_stmt(
+        country_code=country_code,
+        visa_type=visa_type.value if visa_type else None,
+        status=status,
+    )
+    rules, total = await paginate(session, stmt, params)
+    return ResponseEnvelope[list[CountryRuleRead]](
+        data=[CountryRuleRead.from_model(r) for r in rules],
+        meta=page_meta(params, total, request_id),
+    )
+
+
+@router.get("/country-rules/{rule_id}", response_model=ResponseEnvelope[CountryRuleRead])
+async def get_country_rule(
+    rule_id: uuid.UUID, session: SessionDep, request_id: RequestIdDep
+) -> ResponseEnvelope[CountryRuleRead]:
+    rule = await country_rule_service.get_rule(session, rule_id)
+    return ResponseEnvelope[CountryRuleRead](
+        data=CountryRuleRead.from_model(rule), meta=Meta(request_id=request_id)
+    )
+
+
+@router.patch("/country-rules/{rule_id}", response_model=ResponseEnvelope[CountryRuleRead])
+async def update_country_rule(
+    rule_id: uuid.UUID,
+    body: CountryRuleUpdate,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[CountryRuleRead]:
+    rule = await country_rule_service.get_rule(session, rule_id)
+    rule = await country_rule_service.update_draft(
+        session,
+        rule,
+        summary=body.summary,
+        requirements=body.requirements,
+        pitfalls=body.pitfalls,
+        process_notes=body.process_notes,
+        source_url=body.source_url,
+        admin_id=principal.id,
+    )
+    return ResponseEnvelope[CountryRuleRead](
+        data=CountryRuleRead.from_model(rule), meta=Meta(request_id=request_id)
+    )
+
+
+@router.patch("/country-rules/{rule_id}/publish", response_model=ResponseEnvelope[CountryRuleRead])
+async def publish_country_rule(
+    rule_id: uuid.UUID,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[CountryRuleRead]:
+    rule = await country_rule_service.get_rule(session, rule_id)
+    rule = await country_rule_service.publish(session, rule, principal.id)
+    return ResponseEnvelope[CountryRuleRead](
+        data=CountryRuleRead.from_model(rule), meta=Meta(request_id=request_id)
+    )
+
+
+@router.patch("/country-rules/{rule_id}/archive", response_model=ResponseEnvelope[CountryRuleRead])
+async def archive_country_rule(
+    rule_id: uuid.UUID,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[CountryRuleRead]:
+    """Archive a draft or published policy so it is not used by AI assessment."""
+    rule = await country_rule_service.get_rule(session, rule_id)
+    rule = await country_rule_service.archive(session, rule, principal.id)
+    return ResponseEnvelope[CountryRuleRead](
+        data=CountryRuleRead.from_model(rule), meta=Meta(request_id=request_id)
+    )
+
+
+@router.patch("/country-rules/{rule_id}/restore", response_model=ResponseEnvelope[CountryRuleRead])
+async def restore_country_rule(
+    rule_id: uuid.UUID,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[CountryRuleRead]:
+    """Restore an archived policy back to draft so it can be edited and re-published."""
+    rule = await country_rule_service.get_rule(session, rule_id)
+    rule = await country_rule_service.restore(session, rule, principal.id)
+    return ResponseEnvelope[CountryRuleRead](
+        data=CountryRuleRead.from_model(rule), meta=Meta(request_id=request_id)
+    )
+
+
+@router.delete("/country-rules/{rule_id}", response_model=ResponseEnvelope[dict[str, bool]])
+async def delete_country_rule(
+    rule_id: uuid.UUID, session: SessionDep, request_id: RequestIdDep
+) -> ResponseEnvelope[dict[str, bool]]:
+    rule = await country_rule_service.get_rule(session, rule_id)
+    await country_rule_service.delete_rule(session, rule)
+    return ResponseEnvelope[dict[str, bool]](
+        data={"deleted": True}, meta=Meta(request_id=request_id)
     )

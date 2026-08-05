@@ -144,9 +144,7 @@ def _guard_google_login(user: User, requested_role: UserRole | None) -> None:
     ):
         raise AuthenticationError("Account is suspended")
     if user.role == UserRole.advisor and user.verification_status == VerificationStatus.rejected:
-        raise AuthenticationError(
-            "Your account was rejected by an admin. Please contact support."
-        )
+        raise AuthenticationError("Your account was rejected by an admin. Please contact support.")
     if not user.is_active:
         # Pending / under-review advisors may sign in to finish onboarding or view
         # the Approval Pending screen (marketplace actions stay gated by
@@ -229,19 +227,15 @@ async def get_or_create_google_user(
         by_sub = await get_by_google_sub(session, google_sub)
         if by_sub is not None:
             _guard_google_login(by_sub, role)
-            return await _link_google_identity(
-                session, by_sub, google_sub, now, email=email
-            )
+            return await _link_google_identity(session, by_sub, google_sub, now, email=email)
 
     existing = await get_by_email(session, email)
     if existing is not None:
         _guard_google_login(existing, role)
         return await _link_google_identity(session, existing, google_sub, now)
 
-
     if role is None:
         raise AuthenticationError("A role is required to create a Google account")
-
 
     user = User(
         email=email,
@@ -314,6 +308,9 @@ async def authenticate(session: AsyncSession, email: str, password: str) -> User
         user.verification_status == VerificationStatus.suspended
     ):
         raise AuthenticationError("Account is suspended")
+
+    if user.role in (UserRole.seeker, UserRole.advisor) and user.email_verified_at is None:
+        raise AuthenticationError("Please verify your email address before signing in")
     if user.role == UserRole.advisor and user.verification_status == VerificationStatus.rejected:
         raise AuthenticationError("Your account was rejected by an admin. Please contact support.")
     if not user.is_active:

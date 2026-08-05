@@ -40,15 +40,9 @@ def upgrade() -> None:
 
     # New transaction_event_type values must be committed before use on Postgres.
     with op.get_context().autocommit_block():
-        op.execute(
-            "ALTER TYPE transaction_event_type ADD VALUE IF NOT EXISTS 'transfer_scheduled'"
-        )
-        op.execute(
-            "ALTER TYPE transaction_event_type ADD VALUE IF NOT EXISTS 'transfer_completed'"
-        )
-        op.execute(
-            "ALTER TYPE transaction_event_type ADD VALUE IF NOT EXISTS 'transfer_failed'"
-        )
+        op.execute("ALTER TYPE transaction_event_type ADD VALUE IF NOT EXISTS 'transfer_scheduled'")
+        op.execute("ALTER TYPE transaction_event_type ADD VALUE IF NOT EXISTS 'transfer_completed'")
+        op.execute("ALTER TYPE transaction_event_type ADD VALUE IF NOT EXISTS 'transfer_failed'")
 
     transfer_status = sa.Enum(
         "none",
@@ -79,17 +73,13 @@ def upgrade() -> None:
     )
     op.add_column(
         "transactions",
-        sa.Column(
-            "transfer_attempts", sa.Integer(), nullable=False, server_default="0"
-        ),
+        sa.Column("transfer_attempts", sa.Integer(), nullable=False, server_default="0"),
     )
     op.add_column(
         "transactions",
         sa.Column("transfer_last_error", sa.String(500), nullable=True),
     )
-    op.create_index(
-        "ix_transactions_transfer_after", "transactions", ["transfer_after"]
-    )
+    op.create_index("ix_transactions_transfer_after", "transactions", ["transfer_after"])
 
     # Cached Connect readiness flags on advisor profiles.
     for col in ("stripe_charges_enabled", "stripe_payouts_enabled", "stripe_details_submitted"):

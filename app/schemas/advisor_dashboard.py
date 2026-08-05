@@ -42,7 +42,7 @@ class NextUpcomingRead(BaseModel):
     """The advisor's soonest pending/confirmed appointment, if any."""
 
     booking_id: uuid.UUID
-    appointment_id: str  
+    appointment_id: str
     seeker_id: uuid.UUID
     seeker_name: str | None
     service_type: str

@@ -36,6 +36,13 @@ from app.models.booking import Booking
 from app.models.booking_document_request import BookingDocumentRequest
 from app.models.booking_note import BookingNote, BookingNoteAttachment
 from app.models.conversation import Conversation
+from app.models.country_rule import (
+    CountryRule,
+    CountryRulePitfall,
+    CountryRuleProcessNote,
+    CountryRuleRequirement,
+    RulePublishStatus,
+)
 from app.models.device_token import DevicePlatform, DeviceToken
 from app.models.eligibility_rule import EligibilityRule
 from app.models.message import Message, MessageAttachment
@@ -100,6 +107,11 @@ __all__ = [
     "SeekerDocumentComment",
     "EligibilityRule",
     "RegulatoryUpdate",
+    "CountryRule",
+    "CountryRuleRequirement",
+    "CountryRulePitfall",
+    "CountryRuleProcessNote",
+    "RulePublishStatus",
     "Review",
     "Conversation",
     "Message",

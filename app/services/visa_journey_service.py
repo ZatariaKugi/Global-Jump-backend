@@ -218,9 +218,7 @@ def _submission_status(unlocked: bool, *, done: bool) -> JourneyStepStatus:
     return JourneyStepStatus.in_progress
 
 
-def overall_progress(
-    statuses: dict[JourneyStepKey, JourneyStepStatus], doc_progress: int
-) -> int:
+def overall_progress(statuses: dict[JourneyStepKey, JourneyStepStatus], doc_progress: int) -> int:
     """Weighted 0–100 progress over the visible steps only."""
     total = len(VISIBLE_STEP_KEYS)
     if total == 0:

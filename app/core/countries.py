@@ -544,3 +544,34 @@ def country_code(value: str | None) -> str | None:
     if len(stripped) == 2 and stripped.upper() in COUNTRY_NAMES:
         return stripped.upper()
     return _NAME_TO_CODE.get(stripped.casefold())
+
+
+# ── Supported-country whitelist ───────────────────────────────────────────
+# The platform officially operates in these 10 countries only. This gates the
+# public country list and all *new* writes (assessment destination, seeker /
+# advisor profile country fields). Existing rows may still hold other codes —
+# reads resolve them fine via COUNTRY_NAMES; only new writes are constrained.
+SUPPORTED_COUNTRY_CODES: tuple[str, ...] = (
+    "CA",  # Canada
+    "GB",  # United Kingdom
+    "AU",  # Australia
+    "NZ",  # New Zealand
+    "DE",  # Germany
+    "IE",  # Ireland
+    "MX",  # Mexico
+    "ES",  # Spain
+    "PT",  # Portugal
+    "JP",  # Japan
+)
+_SUPPORTED_SET: frozenset[str] = frozenset(SUPPORTED_COUNTRY_CODES)
+
+
+def is_supported_country(code: str | None) -> bool:
+    """True if ``code`` is one of the 10 officially supported countries."""
+    return bool(code) and code.upper() in _SUPPORTED_SET  # type: ignore[union-attr]
+
+
+def supported_countries() -> list[tuple[str, str]]:
+    """The 10 supported ``(code, name)`` pairs, sorted by display name."""
+    pairs = [(code, COUNTRY_NAMES[code]) for code in SUPPORTED_COUNTRY_CODES]
+    return sorted(pairs, key=lambda item: item[1])

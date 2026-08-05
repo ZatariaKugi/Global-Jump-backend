@@ -129,6 +129,10 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str | None = None
     OPENAI_MODEL: str = "gpt-5.4-mini"
     OPENAI_TIMEOUT_SECONDS: float = 20.0
+    # Country-rule policy drafting uses web search, which is much slower than a
+    # plain completion — give it a dedicated, higher timeout.
+    OPENAI_WEBSEARCH_MODEL: str = "gpt-5.4"
+    OPENAI_WEBSEARCH_TIMEOUT_SECONDS: float = 90.0
 
     # Observability ----------------------------------------------------------
     SENTRY_DSN: str | None = None
