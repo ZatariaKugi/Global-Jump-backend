@@ -16,7 +16,7 @@ from app.core.file_storage import resolve_url
 from app.db.session import SessionDep
 from app.models.advisor_profile import AdvisorServiceType
 from app.models.booking import Booking, BookingStatus
-from app.models.booking_note import BookingNoteAttachment
+from app.models.booking_note import BookingNote, BookingNoteAttachment
 from app.models.user import User
 from app.schemas.booking import (
     BookingCancel,
@@ -136,6 +136,53 @@ async def _send_new_request_notification(
     )
 
 
+async def _send_reschedule_notifications(
+    session: SessionDep, booking: Booking, settings: SettingsDep
+) -> None:
+    seeker, advisor = await _party_names(session, booking)
+    notice = await get_notice_hours(session, booking.advisor_id)
+    for recipient, other in ((seeker, advisor), (advisor, seeker)):
+        if recipient is None:
+            continue
+        await email_service.send_booking_rescheduled_email(
+            recipient.email,
+            recipient.full_name or recipient.email,
+            (other.full_name or other.email) if other else "your counterpart",
+            booking_id=str(booking.id),
+            service_type=booking.service_type,
+            start_utc=as_utc(booking.scheduled_start),
+            end_utc=as_utc(booking.scheduled_end),
+            duration_minutes=booking.duration_minutes,
+            price_usd=booking.price_usd,
+            notice_hours=notice,
+            settings=settings,
+        )
+
+
+async def _send_cancellation_notifications(
+    session: SessionDep, booking: Booking, cancelled_by_id: uuid.UUID, settings: SettingsDep
+) -> None:
+    seeker, advisor = await _party_names(session, booking)
+    canceller = next(
+        (u for u in (seeker, advisor) if u is not None and u.id == cancelled_by_id), None
+    )
+    cancelled_by = (canceller.full_name or canceller.email) if canceller else None
+    for recipient, other in ((seeker, advisor), (advisor, seeker)):
+        if recipient is None:
+            continue
+        await email_service.send_booking_cancelled_email(
+            recipient.email,
+            recipient.full_name or recipient.email,
+            (other.full_name or other.email) if other else "your counterpart",
+            booking_id=str(booking.id),
+            service_type=booking.service_type,
+            start_utc=as_utc(booking.scheduled_start),
+            reason=booking.cancellation_reason,
+            cancelled_by=cancelled_by,
+            settings=settings,
+        )
+
+
 async def _send_rejection_notification(
     session: SessionDep, booking: Booking, settings: SettingsDep
 ) -> None:
@@ -150,6 +197,31 @@ async def _send_rejection_notification(
         service_type=booking.service_type,
         start_utc=as_utc(booking.scheduled_start),
         reason=booking.cancellation_reason,
+        settings=settings,
+    )
+
+
+async def _send_note_added_notification(
+    session: SessionDep,
+    booking: Booking,
+    author: User,
+    note: BookingNote,
+    settings: SettingsDep,
+) -> None:
+    seeker, advisor = await _party_names(session, booking)
+    recipient = advisor if author.id == booking.seeker_id else seeker
+    if recipient is None or recipient.id == author.id:
+        return
+    preview = note.body.strip()[:200] if note.body else None
+    await email_service.send_booking_note_added_email(
+        recipient.email,
+        recipient.full_name or recipient.email,
+        author.full_name or author.email,
+        author.full_name or author.email,
+        booking_id=str(booking.id),
+        service_type=booking.service_type,
+        preview=preview,
+        has_attachments=bool(note.attachments),
         settings=settings,
     )
 
@@ -434,6 +506,7 @@ async def cancel_booking(
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
     booking = await booking_service.cancel(session, booking, current_user.id, data.reason)
+    await _send_cancellation_notifications(session, booking, current_user.id, settings)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(session, booking, seeker, advisor, settings),
@@ -454,7 +527,7 @@ async def reschedule_booking(
     booking = await booking_service.reschedule(
         session, booking, current_user.id, data.scheduled_start
     )
-    await _send_confirmations(session, booking, settings)
+    await _send_reschedule_notifications(session, booking, settings)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(session, booking, seeker, advisor, settings),
@@ -527,6 +600,7 @@ async def create_booking_note(
     note = await booking_note_service.create_note(
         session, booking, current_user, data.body, attachments
     )
+    await _send_note_added_notification(session, booking, current_user, note, settings)
     return ResponseEnvelope[BookingNoteRead](
         data=booking_note_service.build_read(note, current_user, settings),
         meta=Meta(request_id=request_id),

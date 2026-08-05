@@ -438,6 +438,17 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
                 invoice_number=f"{txn.invoice_number:08d}",
                 settings=settings,
             )
+        if advisor is not None:
+            await email_service.send_advisor_payment_notification_email(
+                advisor.email,
+                advisor.full_name or advisor.email,
+                seeker.full_name if seeker and seeker.full_name else "A client",
+                service_type=booking.service_type,
+                amount_usd=txn.amount_usd,
+                payout_usd=txn.advisor_payout_usd,
+                invoice_number=f"{txn.invoice_number:08d}",
+                settings=settings,
+            )
         await _notify_payment(
             session,
             txn,

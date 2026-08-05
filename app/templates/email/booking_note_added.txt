@@ -1,0 +1,14 @@
+Hi {{ full_name }},
+
+{{ author_name }} added a note to your consultation.
+
+  Service:  {{ service_type }}
+  With:     {{ other_party }}
+{% if preview %}
+  "{{ preview }}"
+{% endif %}{% if has_attachments %}
+The note includes one or more attachments.
+{% endif %}
+View the full note from your {{ app_name }} dashboard.
+
+— The {{ app_name }} Team

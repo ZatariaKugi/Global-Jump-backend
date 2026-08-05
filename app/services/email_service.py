@@ -636,3 +636,327 @@ async def send_booking_rejected_email(
             booking_id=booking_id,
             error=str(exc),
         )
+
+
+async def send_booking_rescheduled_email(
+    to: str,
+    full_name: str,
+    other_party: str,
+    *,
+    booking_id: str,
+    service_type: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    duration_minutes: int,
+    price_usd: float,
+    notice_hours: int,
+    settings: Settings,
+) -> None:
+    """Notify a party that a consultation was rescheduled (updated ``booking.ics`` attached)."""
+    ctx = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "other_party": other_party,
+        "service_type": service_type,
+        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "duration_minutes": duration_minutes,
+        "price_usd": f"{price_usd:.2f}",
+        "notice_hours": notice_hours,
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info(
+            "booking_rescheduled_issued [no smtp — logged]",
+            to=to,
+            booking_id=booking_id,
+            start_utc=str(start_utc),
+        )
+        return
+
+    ics_content = build_ics(
+        uid=f"{booking_id}@globlejump",
+        summary=f"{settings.EMAILS_FROM_NAME} consultation: {service_type}",
+        description=f"Consultation with {other_party}",
+        start_utc=start_utc,
+        end_utc=end_utc,
+    )
+    ics_upload = UploadFile(
+        filename="booking.ics",
+        file=io.BytesIO(ics_content.encode()),
+        headers=Headers({"content-type": "text/calendar"}),
+    )
+
+    message = _build_message(
+        subject=f"Consultation rescheduled – {settings.EMAILS_FROM_NAME}",
+        recipients=[to],
+        body=_render("booking_rescheduled.html", ctx),
+        subtype=MessageType.html,
+        alternative_body=_render("booking_rescheduled.txt", ctx),
+        attachments=[
+            {
+                "file": ics_upload,
+                "headers": {
+                    "Content-Disposition": 'attachment; filename="booking.ics"',
+                },
+                "mime_type": "text",
+                "mime_subtype": "calendar",
+            }
+        ],
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
+        return
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("booking_rescheduled_sent", to=to, booking_id=booking_id)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "booking_rescheduled_failed_smtp_unavailable",
+            to=to,
+            booking_id=booking_id,
+            error=str(exc),
+        )
+
+
+async def send_booking_cancelled_email(
+    to: str,
+    full_name: str,
+    other_party: str,
+    *,
+    booking_id: str,
+    service_type: str,
+    start_utc: datetime,
+    reason: str | None,
+    cancelled_by: str | None = None,
+    settings: Settings,
+) -> None:
+    """Notify a party that a consultation was cancelled."""
+    ctx: dict[str, object] = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "other_party": other_party,
+        "service_type": service_type,
+        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "reason": reason,
+        "cancelled_by": cancelled_by,
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info(
+            "booking_cancelled_issued [no smtp — logged]",
+            to=to,
+            booking_id=booking_id,
+        )
+        return
+
+    message = _build_message(
+        subject=f"Consultation cancelled – {settings.EMAILS_FROM_NAME}",
+        recipients=[to],
+        body=_render("booking_cancelled.html", ctx),
+        subtype=MessageType.html,
+        alternative_body=_render("booking_cancelled.txt", ctx),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
+        return
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("booking_cancelled_sent", to=to, booking_id=booking_id)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "booking_cancelled_failed_smtp_unavailable",
+            to=to,
+            booking_id=booking_id,
+            error=str(exc),
+        )
+
+
+async def send_advisor_payment_notification_email(
+    to: str,
+    full_name: str,
+    seeker_name: str,
+    *,
+    service_type: str,
+    amount_usd: float,
+    payout_usd: float,
+    invoice_number: str,
+    settings: Settings,
+) -> None:
+    """Notify an advisor that a seeker has paid for their consultation."""
+    ctx = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "seeker_name": seeker_name,
+        "service_type": service_type,
+        "amount_usd": f"{amount_usd:.2f}",
+        "payout_usd": f"{payout_usd:.2f}",
+        "invoice_number": invoice_number,
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info(
+            "advisor_payment_notification_issued [no smtp — logged]",
+            to=to,
+            invoice_number=invoice_number,
+        )
+        return
+
+    message = _build_message(
+        subject=f"Payment received – {settings.EMAILS_FROM_NAME}",
+        recipients=[to],
+        body=_render("advisor_payment_received.html", ctx),
+        subtype=MessageType.html,
+        alternative_body=_render("advisor_payment_received.txt", ctx),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
+        return
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("advisor_payment_notification_sent", to=to, invoice_number=invoice_number)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "advisor_payment_notification_failed_smtp_unavailable",
+            to=to,
+            invoice_number=invoice_number,
+            error=str(exc),
+        )
+
+
+async def send_new_message_email(
+    to: str,
+    full_name: str,
+    sender_name: str,
+    *,
+    conversation_id: str,
+    preview: str,
+    settings: Settings,
+) -> None:
+    """Notify a conversation participant that they received a new message."""
+    conversation_url = f"{settings.FRONTEND_URL}/messages/{conversation_id}"
+    ctx = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "sender_name": sender_name,
+        "preview": preview,
+        "conversation_url": conversation_url,
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info(
+            "new_message_email_issued [no smtp — logged]",
+            to=to,
+            conversation_id=conversation_id,
+        )
+        return
+
+    message = _build_message(
+        subject=f"New message from {sender_name} – {settings.EMAILS_FROM_NAME}",
+        recipients=[to],
+        body=_render("new_message.html", ctx),
+        subtype=MessageType.html,
+        alternative_body=_render("new_message.txt", ctx),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            "List-Unsubscribe": f"<mailto:{settings.EMAILS_FROM}?subject=unsubscribe>",
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
+        return
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("new_message_email_sent", to=to, conversation_id=conversation_id)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "new_message_email_failed_smtp_unavailable",
+            to=to,
+            conversation_id=conversation_id,
+            error=str(exc),
+        )
+
+
+async def send_booking_note_added_email(
+    to: str,
+    full_name: str,
+    author_name: str,
+    other_party: str,
+    *,
+    booking_id: str,
+    service_type: str,
+    preview: str | None,
+    has_attachments: bool,
+    settings: Settings,
+) -> None:
+    """Notify the other party that a note was added to their consultation."""
+    ctx: dict[str, object] = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "author_name": author_name,
+        "other_party": other_party,
+        "service_type": service_type,
+        "preview": preview,
+        "has_attachments": has_attachments,
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info(
+            "booking_note_added_issued [no smtp — logged]",
+            to=to,
+            booking_id=booking_id,
+        )
+        return
+
+    message = _build_message(
+        subject=f"New note on your consultation – {settings.EMAILS_FROM_NAME}",
+        recipients=[to],
+        body=_render("booking_note_added.html", ctx),
+        subtype=MessageType.html,
+        alternative_body=_render("booking_note_added.txt", ctx),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            "List-Unsubscribe": f"<mailto:{settings.EMAILS_FROM}?subject=unsubscribe>",
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
+        return
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("booking_note_added_sent", to=to, booking_id=booking_id)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "booking_note_added_failed_smtp_unavailable",
+            to=to,
+            booking_id=booking_id,
+            error=str(exc),
+        )

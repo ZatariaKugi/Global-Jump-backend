@@ -1,0 +1,14 @@
+Hi {{ full_name }},
+
+{{ seeker_name }} has paid for their consultation with you. Your payout will be
+scheduled per your payout settings.
+
+  Invoice:      #{{ invoice_number }}
+  Service:      {{ service_type }}
+  Client:       {{ seeker_name }}
+  Amount paid:  ${{ amount_usd }}
+  Your payout:  ${{ payout_usd }}
+
+You can view the transaction details from your {{ app_name }} dashboard at any time.
+
+— The {{ app_name }} Team

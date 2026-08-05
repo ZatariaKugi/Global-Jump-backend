@@ -29,7 +29,7 @@ from app.schemas.conversation import (
 )
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.token import TokenPayload
-from app.services import conversation_service, user_service
+from app.services import conversation_service, email_service, user_service
 from app.services.ws_manager import inbox_manager, manager
 
 router = APIRouter(tags=["conversations"])
@@ -63,6 +63,32 @@ async def _inbox_push_to_participants(
                 "unread_count": unread,
             },
         )
+
+
+async def _send_new_message_email(
+    session: AsyncSession,
+    conversation: Conversation,
+    sender: User,
+    message: Message,
+    settings: Settings,
+) -> None:
+    """Email the other participant that they received a new message."""
+    recipient_id = (
+        conversation.advisor_id
+        if sender.id == conversation.seeker_id
+        else conversation.seeker_id
+    )
+    recipient = await session.get(User, recipient_id)
+    if recipient is None or recipient.id == sender.id:
+        return
+    await email_service.send_new_message_email(
+        recipient.email,
+        recipient.full_name or recipient.email,
+        sender.full_name or sender.email,
+        conversation_id=str(conversation.id),
+        preview=conversation_service.message_preview(message) or "New message",
+        settings=settings,
+    )
 
 
 @router.post("/conversations", status_code=201, response_model=ResponseEnvelope[ConversationRead])
@@ -193,6 +219,7 @@ async def send_message(
             ),
         },
     )
+    await _send_new_message_email(session, conversation, current_user, message, settings)
 
     return ResponseEnvelope[MessageRead](data=message_read, meta=Meta(request_id=request_id))
 

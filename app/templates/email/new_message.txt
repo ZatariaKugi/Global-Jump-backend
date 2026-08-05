@@ -1,0 +1,10 @@
+Hi {{ full_name }},
+
+You have a new message from {{ sender_name }} on {{ app_name }}.
+
+  "{{ preview }}"
+
+Open the conversation to reply:
+{{ conversation_url }}
+
+— The {{ app_name }} Team

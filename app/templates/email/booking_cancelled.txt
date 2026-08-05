@@ -1,0 +1,12 @@
+Hi {{ full_name }},
+
+The following consultation has been cancelled{% if cancelled_by %} by {{ cancelled_by }}{% endif %}.
+
+  Service:        {{ service_type }}
+  With:           {{ other_party }}
+  Was scheduled:  {{ start_str }} (UTC)
+{% if reason %}  Reason:         {{ reason }}
+{% endif %}
+You can book a new consultation any time from your {{ app_name }} dashboard.
+
+— The {{ app_name }} Team
