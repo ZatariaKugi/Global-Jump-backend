@@ -217,7 +217,7 @@ async def _send_note_added_notification(
         recipient.email,
         recipient.full_name or recipient.email,
         author.full_name or author.email,
-        author.full_name or author.email,
+        recipient.full_name or recipient.email,
         booking_id=str(booking.id),
         service_type=booking.service_type,
         preview=preview,
