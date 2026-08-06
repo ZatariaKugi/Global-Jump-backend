@@ -15,7 +15,7 @@ class AdminProfileUpdate(BaseModel):
     phone: str | None = Field(default=None, max_length=50)
     country_of_residence: str | None = Field(default=None, min_length=2, max_length=2)
     timezone: str | None = Field(default=None, max_length=64)
-    preferred_language: str | None = Field(default=None, max_length=10)
+    preferred_language: str | None = Field(default=None, max_length=100)
     about: str | None = None
     profile_photo_url: str | None = None
     banner_url: str | None = None

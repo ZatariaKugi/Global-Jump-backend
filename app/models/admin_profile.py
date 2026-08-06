@@ -23,7 +23,7 @@ class AdminProfile(BaseModel):
     phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     country_of_residence: Mapped[str | None] = mapped_column(String(2), nullable=True)
     timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    preferred_language: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    preferred_language: Mapped[str | None] = mapped_column(String(100), nullable=True)
     about: Mapped[str | None] = mapped_column(Text, nullable=True)
     profile_photo_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     banner_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
