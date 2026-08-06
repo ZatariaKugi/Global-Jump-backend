@@ -33,6 +33,9 @@ from app.schemas.booking import (
     BookingRead,
     BookingSort,
     ClientRead,
+    SessionClientRead,
+    SessionDetailRead,
+    SessionTimelineStepRead,
 )
 from app.services import (
     availability_service,
@@ -550,6 +553,7 @@ async def accept(session: AsyncSession, booking: Booking, actor_id: uuid.UUID) -
     if booking.status != BookingStatus.pending:
         raise AppError("Booking is not pending", code="invalid_state")
     booking.status = BookingStatus.confirmed
+    booking.confirmed_at = datetime.now(UTC)
     booking.deal_later_at = None
     booking.updated_by = actor_id
     session.add(booking)
@@ -651,6 +655,7 @@ def _assert_advisor_post_start(booking: Booking, actor_id: uuid.UUID) -> None:
 async def complete(session: AsyncSession, booking: Booking, actor_id: uuid.UUID) -> Booking:
     _assert_advisor_post_start(booking, actor_id)
     booking.status = BookingStatus.completed
+    booking.completed_at = datetime.now(UTC)
     booking.updated_by = actor_id
     session.add(booking)
     await session.flush()
@@ -809,6 +814,85 @@ async def build_details(
         attachments=attachments,
         meeting=_meeting_read(booking),
         ai_suggestions=ai_suggestions,
+    )
+
+
+def _session_timeline(booking: Booking) -> list[SessionTimelineStepRead]:
+    """Derive Session Detail timeline milestones from booking timestamps.
+
+    ``at`` is null for steps we can't back with a timestamp (e.g. payment /
+    confirmation on legacy bookings) — the FE renders those without a date.
+    ``completed`` falls back to ``updated_at`` when the booking is already
+    completed but predates the ``completed_at`` column.
+    """
+    completed_at = booking.completed_at
+    if completed_at is None and booking.status == BookingStatus.completed:
+        completed_at = booking.updated_at
+    steps = [
+        ("booked", "Session Booked", booking.created_at),
+        ("payment", "Payment Completed", booking.paid_at),
+        ("confirmed", "Session Confirmed", booking.confirmed_at),
+        ("upcoming", "Upcoming Session", booking.scheduled_start),
+        ("completed", "Session Completed", completed_at),
+    ]
+    return [
+        SessionTimelineStepRead(
+            id=step_id,
+            label=label,
+            at=as_utc(at) if at is not None else None,
+        )
+        for step_id, label, at in steps
+    ]
+
+
+async def build_session_detail(
+    session: AsyncSession,
+    booking: Booking,
+    seeker: User | None,
+    settings: Settings,
+) -> SessionDetailRead:
+    """Admin Session Detail sheet — client block, timeline, detail rows, meeting.
+
+    Meeting fields (recording url / id / passcode / platform) are null until
+    the meeting is provisioned; the FE keeps its stub for those.
+    """
+    seeker_profile = (
+        (
+            await session.execute(
+                select(SeekerProfile).where(SeekerProfile.user_id == booking.seeker_id)
+            )
+        ).scalar_one_or_none()
+        if seeker is not None
+        else None
+    )
+
+    avatar_url = (
+        resolve_media_url(seeker_profile.profile_photo_url, settings)
+        if seeker_profile and seeker_profile.profile_photo_url
+        else None
+    )
+    language = booking.interpreter_language or (
+        seeker_profile.preferred_language if seeker_profile else None
+    )
+
+    return SessionDetailRead(
+        booking_id=booking.id,
+        status=booking.status,
+        client=SessionClientRead(
+            name=seeker.full_name if seeker else None,
+            email=seeker.email if seeker else None,
+            phone=seeker_profile.phone if seeker_profile else None,
+            avatar_url=avatar_url,
+        ),
+        timeline=_session_timeline(booking),
+        session_type=humanize_slug(booking.service_type) or booking.service_type,
+        duration_minutes=booking.duration_minutes,
+        platform=booking.meeting_platform,
+        topic=humanize_slug(booking.service_type) or booking.service_type,
+        language=language,
+        meeting_recording_url=booking.meeting_recording_url,
+        meeting_id=booking.meeting_id,
+        meeting_passcode=booking.meeting_passcode,
     )
 
 

@@ -190,3 +190,42 @@ class BookingDetailsRead(BaseModel):
     attachments: list[BookingAttachmentRead] = Field(default_factory=list)
     meeting: BookingMeetingRead | None = None
     ai_suggestions: list[BookingAiSuggestionRead] = Field(default_factory=list)
+
+
+class SessionClientRead(BaseModel):
+    """Client block on the admin Session Detail sheet."""
+
+    name: str | None
+    email: str | None
+    phone: str | None
+    avatar_url: str | None
+
+
+class SessionTimelineStepRead(BaseModel):
+    """One milestone in the Session Detail timeline.
+
+    ``at`` is null when the milestone hasn't happened or has no recorded
+    timestamp — the FE renders the step without a date.
+    """
+
+    id: Literal["booked", "payment", "confirmed", "upcoming", "completed"]
+    label: str
+    at: datetime | None = None
+
+
+class SessionDetailRead(BaseModel):
+    """Full payload for the admin Session Detail sheet (client + timeline +
+    detail rows). Meeting fields are null until the meeting is provisioned."""
+
+    booking_id: uuid.UUID
+    status: BookingStatus
+    client: SessionClientRead
+    timeline: list[SessionTimelineStepRead]
+    session_type: str
+    duration_minutes: int
+    platform: str | None = None
+    topic: str | None = None
+    language: str | None = None
+    meeting_recording_url: str | None = None
+    meeting_id: str | None = None
+    meeting_passcode: str | None = None

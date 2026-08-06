@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 from typing import Annotated, Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import AfterValidator, BaseModel, Field, field_validator
 
@@ -17,6 +18,18 @@ from app.models.visa_type import VisaType
 from app.schemas.availability import WeeklySlotInput, WeeklySlotRead
 
 CountryCode = Annotated[str, Field(min_length=2, max_length=2)]
+
+
+def _valid_iana_timezone(v: str) -> str:
+    try:
+        ZoneInfo(v)
+    except Exception as exc:  # noqa: BLE001 — zoneinfo raises several types
+        raise ValueError(f"Unknown IANA timezone: {v}") from exc
+    return v
+
+
+# IANA timezone name (e.g. "Asia/Karachi"), validated against the tz database.
+IanaTimezone = Annotated[str, Field(max_length=64), AfterValidator(_valid_iana_timezone)]
 
 
 def _require_supported_destination(value: str) -> str:
@@ -69,6 +82,8 @@ class AdvisorProfileUpdate(BaseModel):
     profile_photo_url: str | None = None
     banner_url: str | None = None
     country_of_residence: CountryCode | None = None
+    timezone: IanaTimezone | None = None
+    education: str | None = Field(default=None, max_length=200)
     expertise_description: str | None = Field(default=None, max_length=2000)
     years_of_experience: int | None = Field(default=None, ge=0, le=60)
     successful_application_rate: float | None = Field(default=None, ge=0, le=100)
@@ -97,6 +112,8 @@ class AdvisorProfileRead(BaseModel):
     profile_photo_url: str | None
     banner_url: str | None
     country_of_residence: str | None
+    timezone: str | None
+    education: str | None
     expertise_description: str | None
     years_of_experience: int | None
     successful_applications: int | None
@@ -248,6 +265,8 @@ class AdvisorProfilePublicRead(BaseModel):
     profile_photo_url: str | None
     banner_url: str | None
     country_of_residence: str | None
+    timezone: str | None
+    education: str | None
     expertise_description: str | None
     years_of_experience: int | None
     successful_applications: int | None

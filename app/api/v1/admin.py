@@ -52,7 +52,7 @@ from app.schemas.assessment import (
     QuestionUpdate,
 )
 from app.schemas.assessment_threshold import AssessmentThresholdRead, AssessmentThresholdUpsert
-from app.schemas.booking import BookingDetailsRead
+from app.schemas.booking import BookingDetailsRead, SessionDetailRead
 from app.schemas.conversation import FlaggedMessageRead
 from app.schemas.country_rule import (
     CountryRuleGenerateRequest,
@@ -473,9 +473,16 @@ async def list_advisor_sessions(
     settings: SettingsDep,
     request_id: RequestIdDep,
     status: BookingStatus | None = None,
+    search: str | None = None,
 ) -> ResponseEnvelope[list[AdvisorSessionRead]]:
-    """Detail page's Session History tab."""
-    stmt = booking_service.list_for_user_stmt(advisor_id, UserRole.advisor, status=status)
+    """Detail page's Session History tab.
+
+    ``search`` matches appointment number, service type, and the seeker's
+    full name / email (ilike).
+    """
+    stmt = booking_service.list_for_user_stmt(
+        advisor_id, UserRole.advisor, status=status, q=search
+    )
     bookings, total = await paginate(session, stmt, params)
     data = await advisor_admin_service.build_session_reads(session, bookings, settings)
     return ResponseEnvelope[list[AdvisorSessionRead]](
@@ -489,12 +496,27 @@ async def list_advisor_sessions(
 )
 async def get_advisor_earnings_summary(
     advisor_id: uuid.UUID,
+    params: PaginationDep,
     session: SessionDep,
     request_id: RequestIdDep,
+    search: str | None = None,
 ) -> ResponseEnvelope[AdvisorEarningsSummaryRead]:
-    """Detail page's Earnings tab — summary cards + table rows."""
-    data = await advisor_admin_service.get_earnings_summary(session, advisor_id)
-    return ResponseEnvelope[AdvisorEarningsSummaryRead](data=data, meta=Meta(request_id=request_id))
+    """Detail page's Earnings tab — summary cards + a page of table rows.
+
+    Summary card totals cover the advisor's full earnings; ``items`` is
+    paginated (``page``/``page_size``) and filtered by ``search`` (appointment
+    id, seeker name, seeker email). ``meta.pagination.total`` and
+    ``data.transaction_count`` both reflect the search-filtered row count.
+    """
+    stmt = payment_service.list_for_advisor_stmt(advisor_id, q=search)
+    txns, total = await paginate(session, stmt, params)
+    items = await advisor_admin_service.build_earning_rows(session, txns)
+    data = await advisor_admin_service.get_earnings_summary(
+        session, advisor_id, items=items, transaction_count=total
+    )
+    return ResponseEnvelope[AdvisorEarningsSummaryRead](
+        data=data, meta=page_meta(params, total, request_id)
+    )
 
 
 @router.get(
@@ -548,13 +570,17 @@ async def list_advisor_reviews(
     request_id: RequestIdDep,
     flagged: bool | None = None,
     visa_type: OptionalVisaType = None,
+    search: str | None = None,
 ) -> ResponseEnvelope[AdvisorReviewsTabRead]:
     """Detail page's Reviews tab — rating summary + paginated review rows.
 
     Pass ``flagged=true`` to return only reviews awaiting moderation.
     Pass ``visa_type`` (PRD enum) to filter by the seeker's intended visa type.
+    ``search`` matches the seeker's full name or the review text (ilike).
     """
-    stmt = review_service.list_public_stmt(advisor_id, flagged=flagged, visa_type=visa_type)
+    stmt = review_service.list_public_stmt(
+        advisor_id, flagged=flagged, visa_type=visa_type, q=search
+    )
     reviews, total = await paginate(session, stmt, params)
     items = await review_service.build_enriched_reads(session, reviews)
     summary = await review_service.build_tab_summary(session, advisor_id)
@@ -583,6 +609,32 @@ async def get_booking_details_admin(
     seeker = await session.get(User, booking.seeker_id)
     data = await booking_service.build_details(session, booking, seeker)
     return ResponseEnvelope[BookingDetailsRead](data=data, meta=Meta(request_id=request_id))
+
+
+@router.get(
+    "/bookings/{booking_id}/session-detail",
+    response_model=ResponseEnvelope[SessionDetailRead],
+)
+async def get_session_detail_admin(
+    booking_id: uuid.UUID,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[SessionDetailRead]:
+    """Admin Session Detail sheet — client block, timeline, detail rows, meeting.
+
+    Meeting recording/id/passcode and the payment/confirmation timeline steps
+    are null until those events are recorded on the booking.
+    """
+    from app.core.exceptions import NotFoundError
+    from app.models.booking import Booking
+
+    booking = await session.get(Booking, booking_id)
+    if booking is None:
+        raise NotFoundError("Booking not found")
+    seeker = await session.get(User, booking.seeker_id)
+    data = await booking_service.build_session_detail(session, booking, seeker, settings)
+    return ResponseEnvelope[SessionDetailRead](data=data, meta=Meta(request_id=request_id))
 
 
 # ── Advisor Verification Queue (Screen B) ────────────────────────────────────

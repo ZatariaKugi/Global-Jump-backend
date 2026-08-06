@@ -220,6 +220,8 @@ async def get_advisor_detail(
         earnings=total_earned_usd,
         created_at=advisor.created_at,
         title=profile.title,
+        timezone=profile.timezone,
+        education=profile.education,
         bio=profile.bio,
         years_of_experience=profile.years_of_experience,
         successful_applications=profile.successful_applications,
@@ -272,9 +274,17 @@ async def build_session_reads(
     for seeker_id, count in count_rows:
         consultation_counts[seeker_id] = count
 
-    # Seeded country values for Session History UI until seeker profiles are populated.
-    _SEED_COUNTRY_CODE = "GB"
-    _SEED_COUNTRY_NAME = "United Kingdom"
+    # Real seeker residence from their profile (ISO alpha-2), null when unset.
+    residence_rows = (
+        await session.execute(
+            select(SeekerProfile.user_id, SeekerProfile.country_of_residence).where(
+                SeekerProfile.user_id.in_(seeker_ids)
+            )
+        )
+    ).all()
+    residence_codes: dict[uuid.UUID, str | None] = {
+        row[0]: row[1] for row in residence_rows
+    }
 
     out: list[AdvisorSessionRead] = []
     for b in bookings:
@@ -286,11 +296,12 @@ async def build_session_reads(
             advisor_profile_photo_key=photo_key,
             seeker_profile_photo_key=seeker_photos.get(b.seeker_id),
         )
+        residence_code = residence_codes.get(b.seeker_id)
         out.append(
             AdvisorSessionRead(
                 **base.model_dump(),
-                country_code=_SEED_COUNTRY_CODE,
-                country_name=_SEED_COUNTRY_NAME,
+                country_code=residence_code,
+                country_name=country_name(residence_code) if residence_code else None,
                 consultation_count=consultation_counts.get(b.seeker_id, 0),
             )
         )
@@ -298,8 +309,20 @@ async def build_session_reads(
 
 
 async def get_earnings_summary(
-    session: AsyncSession, advisor_id: uuid.UUID
+    session: AsyncSession,
+    advisor_id: uuid.UUID,
+    *,
+    items: list[AdvisorEarningRowRead],
+    transaction_count: int,
 ) -> AdvisorEarningsSummaryRead:
+    """Summary cards over the advisor's *full* earnings, plus a caller-supplied
+    (already paginated/searched) page of ``items``.
+
+    Totals are computed across all non-archived transactions — they are
+    intentionally unaffected by the current page or search filter.
+    ``transaction_count`` is the total number of matching rows (== pagination
+    ``total``), so the FE can show "N transactions" without a second call.
+    """
     advisor = await session.get(User, advisor_id)
     if advisor is None or advisor.role != UserRole.advisor:
         raise NotFoundError("Advisor not found")
@@ -320,18 +343,22 @@ async def get_earnings_summary(
 
     total_earned_usd = float(earnings["total_earned_usd"])  # type: ignore[arg-type]
     total_commission_paid_usd = float(earnings["total_commission_paid_usd"])  # type: ignore[arg-type]
-    transactions = earnings["transactions"]
-    assert isinstance(transactions, list)
-    items = await _build_earning_rows(session, cast(list[Transaction], transactions))
     return AdvisorEarningsSummaryRead(
         total_earned_usd=total_earned_usd,
         total_commission_paid_usd=total_commission_paid_usd,
         available_balance_usd=available,
         total_payouts_usd=round(payout_totals.get(PayoutStatus.completed, 0.0), 2),
         pending_payout_usd=round(payout_totals.get(PayoutStatus.pending, 0.0), 2),
-        transaction_count=len(items),
+        transaction_count=transaction_count,
         items=items,
     )
+
+
+async def build_earning_rows(
+    session: AsyncSession, transactions: list[Transaction]
+) -> list[AdvisorEarningRowRead]:
+    """Public wrapper around the bulk earning-row enrichment (route-facing)."""
+    return await _build_earning_rows(session, transactions)
 
 
 async def _build_earning_rows(

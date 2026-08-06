@@ -420,6 +420,8 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
     booking = await session.get(Booking, txn.booking_id)
     if booking is not None:
         booking.payment_status = PaymentStatus.paid
+        if booking.paid_at is None:
+            booking.paid_at = datetime.now(UTC)
         session.add(booking)
 
     await session.flush()

@@ -117,6 +117,11 @@ class AdvisorProfile(BaseModel):
     country_of_residence: Mapped[str | None] = mapped_column(String(2), nullable=True)
     expertise_description: Mapped[str | None] = mapped_column(String(2000), nullable=True)
 
+    # IANA timezone (e.g. "Asia/Karachi") and free-text education / degree.
+    # Advisor-editable; shown on the admin Overview tab.
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    education: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
     # Expertise
     years_of_experience: Mapped[int | None] = mapped_column(nullable=True)
     successful_applications: Mapped[int | None] = mapped_column(nullable=True)

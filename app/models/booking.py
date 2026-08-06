@@ -80,3 +80,14 @@ class Booking(BaseModel):
     interpreter_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     interpreter_contact: Mapped[str | None] = mapped_column(String(255), nullable=True)
     interpreter_language: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+    meeting_platform: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    meeting_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    meeting_passcode: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    meeting_recording_url: Mapped[str | None] = mapped_column(String(500), nullable=True)

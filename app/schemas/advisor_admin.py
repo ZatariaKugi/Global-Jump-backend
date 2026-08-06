@@ -51,6 +51,8 @@ class AdvisorManagementListRead(BaseModel):
 
 class AdvisorManagementDetailRead(AdvisorManagementListRead):
     title: str | None
+    timezone: str | None  # IANA tz (e.g. "Asia/Karachi"); null if unset
+    education: str | None  # degree / education text; null if unset
     bio: str | None
     years_of_experience: int | None
     successful_applications: int | None
