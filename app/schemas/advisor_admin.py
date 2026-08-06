@@ -78,6 +78,7 @@ class AdvisorEarningRowRead(BaseModel):
 
     appointment_id: str
     booking_id: uuid.UUID
+    transaction_id: uuid.UUID
     seeker_name: str | None
     seeker_email: str | None
     seeker_photo_url: str | None

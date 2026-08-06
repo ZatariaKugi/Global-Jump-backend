@@ -403,6 +403,7 @@ async def _build_earning_rows(
             AdvisorEarningRowRead(
                 appointment_id=payment_service.format_appointment_id(booking.appointment_number),
                 booking_id=txn.booking_id,
+                transaction_id=txn.id,
                 seeker_name=seeker.full_name if seeker else None,
                 seeker_email=seeker.email if seeker else None,
                 seeker_photo_url=photos.get(booking.seeker_id),
