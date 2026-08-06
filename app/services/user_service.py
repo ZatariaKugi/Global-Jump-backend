@@ -13,6 +13,7 @@ from app.core.config import Settings
 from app.core.exceptions import AuthenticationError, ConflictError
 from app.core.file_storage import resolve_media_url
 from app.core.security import hash_password, verify_password
+from app.models.admin_profile import AdminProfile
 from app.models.advisor_profile import AdvisorProfile
 from app.models.notification import NotificationEntityType, NotificationType
 from app.models.seeker_profile import SeekerProfile
@@ -48,7 +49,7 @@ async def get_by_google_sub(session: AsyncSession, google_sub: str) -> User | No
 
 
 async def profile_photo_key(session: AsyncSession, user: User) -> str | None:
-    """Raw stored photo key for seeker/advisor profiles; admins have none."""
+    """Raw stored photo key for seeker/advisor/admin profiles."""
     if user.role == UserRole.seeker:
         seeker_profile = (
             await session.execute(select(SeekerProfile).where(SeekerProfile.user_id == user.id))
@@ -59,6 +60,11 @@ async def profile_photo_key(session: AsyncSession, user: User) -> str | None:
             await session.execute(select(AdvisorProfile).where(AdvisorProfile.user_id == user.id))
         ).scalar_one_or_none()
         return advisor_profile.profile_photo_url if advisor_profile else None
+    if user.role == UserRole.admin:
+        admin_profile = (
+            await session.execute(select(AdminProfile).where(AdminProfile.user_id == user.id))
+        ).scalar_one_or_none()
+        return admin_profile.profile_photo_url if admin_profile else None
     return None
 
 

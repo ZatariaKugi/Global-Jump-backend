@@ -5,6 +5,7 @@ Alembic autogenerate can see them.
 """
 
 from app.models.activity_log import ActivityLog
+from app.models.admin_profile import AdminProfile
 from app.models.advisor_availability import (
     AdvisorAvailabilityOverride,
     AdvisorWeeklySlot,
@@ -70,6 +71,7 @@ from app.models.user import User
 from app.models.visa_type import VisaType
 
 __all__ = [
+    "AdminProfile",
     "User",
     "VisaType",
     "ActivityLog",

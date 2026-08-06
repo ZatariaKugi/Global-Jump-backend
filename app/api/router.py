@@ -6,6 +6,7 @@ from fastapi import APIRouter
 
 from app.api.v1 import (
     admin,
+    admin_profile,
     advisors,
     assessments,
     auth,
@@ -42,3 +43,4 @@ api_router.include_router(assessments.router)
 api_router.include_router(uploads.router)
 api_router.include_router(tickets.router)
 api_router.include_router(admin.router)
+api_router.include_router(admin_profile.router)
