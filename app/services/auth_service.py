@@ -14,12 +14,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.core.exceptions import AuthenticationError
+from app.core.exceptions import AuthenticationError, ConflictError
 from app.core.security import (
     create_access_token,
     generate_token,
     hash_password,
     hash_token,
+    verify_password,
 )
 from app.models.token import RefreshToken, TokenPurpose, UserToken
 from app.models.user import User, UserRole, VerificationStatus
@@ -167,13 +168,26 @@ async def verify_email(session: AsyncSession, raw_token: str) -> User:
 
 
 async def _issue_password_reset_token(session: AsyncSession, user: User, settings: Settings) -> str:
+    # Invalidate all previous unused password_reset tokens for this user so
+    # only the latest link works.
+    now = datetime.now(UTC)
+    result = await session.execute(
+        select(UserToken).where(
+            UserToken.user_id == user.id,
+            UserToken.purpose == TokenPurpose.password_reset,
+            UserToken.used_at.is_(None),
+        )
+    )
+    for old_record in result.scalars():
+        old_record.used_at = now
+        session.add(old_record)
+
     raw = generate_token()
     record = UserToken(
         user_id=user.id,
         token_hash=hash_token(raw),
         purpose=TokenPurpose.password_reset,
-        expires_at=datetime.now(UTC)
-        + timedelta(minutes=settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES),
+        expires_at=now + timedelta(minutes=settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES),
     )
     session.add(record)
     await session.flush()
@@ -223,6 +237,11 @@ async def reset_password(
     user = await session.get(User, record.user_id)
     if user is None:
         raise AuthenticationError("User not found")
+
+    if user.hashed_password and verify_password(new_password, user.hashed_password):
+        raise ConflictError(
+            "New password must be different from your current password"
+        )
 
     user.hashed_password = hash_password(new_password)
     record.used_at = now

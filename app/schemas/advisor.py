@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+from app.core.security import validate_password_strength
 from app.models.user import SignupSource, VerificationStatus
 from app.schemas.user import UserRead
 
@@ -14,6 +15,11 @@ class AdvisorCreate(BaseModel):
     full_name: str = Field(min_length=1, max_length=255)
     signup_source: SignupSource | None = None
     # role is hardcoded to advisor server-side
+
+    @field_validator("password")
+    @classmethod
+    def _check_password_strength(cls, v: str) -> str:
+        return validate_password_strength(v)
 
 
 class AdvisorRead(UserRead):

@@ -11,6 +11,7 @@ hashing and ``PyJWT`` for tokens. Supports two token issuers:
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -45,6 +46,32 @@ def hash_password(password: str) -> str:
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return _password_hash.verify(plain_password, hashed_password)
+
+
+_PASSWORD_RULES = re.compile(
+    r"^(?=.*[A-Z])(?=.*[a-z])(?=.*\d)(?=.*[@#$%^&*!]).+$"
+)
+
+
+def validate_password_strength(password: str) -> str:
+    """Enforce password rules for signup + reset (NOT login).
+
+    Rules: 8-128 chars, >=1 uppercase, >=1 lowercase, >=1 digit,
+    >=1 special (@#$%^&*!), no spaces.
+    """
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters long")
+    if len(password) > 128:
+        raise ValueError("Password must be at most 128 characters long")
+    if " " in password:
+        raise ValueError("Password must not contain spaces")
+    if not _PASSWORD_RULES.match(password):
+        raise ValueError(
+            "Password must include at least one uppercase letter, "
+            "one lowercase letter, one number, and one special character "
+            "(@#$%^&*!)"
+        )
+    return password
 
 
 # --- Local token issuance --------------------------------------------------

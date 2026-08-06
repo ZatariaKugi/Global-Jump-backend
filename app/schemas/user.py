@@ -5,8 +5,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+from app.core.security import validate_password_strength
 from app.models.user import SignupSource, UserRole
 
 
@@ -19,6 +20,11 @@ class UserCreate(UserBase):
     password: str = Field(min_length=8, max_length=128)
     signup_source: SignupSource | None = None
     # role is intentionally NOT exposed — public registration always creates seeker
+
+    @field_validator("password")
+    @classmethod
+    def _check_password_strength(cls, v: str) -> str:
+        return validate_password_strength(v)
 
 
 class UserUpdate(BaseModel):

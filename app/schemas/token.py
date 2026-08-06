@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import uuid
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
+from app.core.security import validate_password_strength
 from app.models.user import UserRole, VerificationStatus
 
 
@@ -66,3 +67,8 @@ class ResendVerificationRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def _check_password_strength(cls, v: str) -> str:
+        return validate_password_strength(v)
