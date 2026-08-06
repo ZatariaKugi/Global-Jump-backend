@@ -11,7 +11,7 @@ from app.core.file_storage import resolve_media_url
 from app.models.admin_profile import AdminProfile
 from app.models.user import User
 from app.schemas.admin_profile import AdminProfileRead, AdminProfileUpdate
-from app.schemas.settings import Settings
+from app.core.config import Settings
 
 
 async def get_by_user_id(
