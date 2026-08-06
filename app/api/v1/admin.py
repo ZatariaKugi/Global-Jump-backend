@@ -709,6 +709,20 @@ async def verify_user_account(
     return ResponseEnvelope[UserDetailRead](data=data, meta=Meta(request_id=request_id))
 
 
+@router.post("/users/{user_id}/unverify", response_model=ResponseEnvelope[UserDetailRead])
+async def unverify_user_account(
+    user_id: uuid.UUID,
+    session: SessionDep,
+    request_id: RequestIdDep,
+    admin_principal: CurrentPrincipal,
+) -> ResponseEnvelope[UserDetailRead]:
+    """Admin override — clears ``email_verified_at`` so the user's status
+    reverts to *unverified*.  Rejects if the account is currently suspended."""
+    await user_admin_service.unverify_account(session, user_id, admin_principal.id)
+    data = await user_admin_service.get_user_detail(session, user_id)
+    return ResponseEnvelope[UserDetailRead](data=data, meta=Meta(request_id=request_id))
+
+
 @router.post("/users/{user_id}/reset-password", status_code=204)
 async def trigger_password_reset(
     user_id: uuid.UUID,

@@ -89,6 +89,7 @@ async def complete_onboarding(
         intended_destination=data.intended_destination,
         annual_income_band=data.annual_income_band,
         nationality=data.nationality,
+        country_of_residence=data.country_of_residence,
         education_level=data.education_level,
         employment_status=data.employment_status,
         employer_name=data.employer_name,

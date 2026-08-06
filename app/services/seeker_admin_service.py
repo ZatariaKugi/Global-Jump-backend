@@ -100,17 +100,19 @@ async def build_list_read(session: AsyncSession, users: list[User]) -> list[Seek
         booking_counts[booking_seeker_id] = count
     result = []
     for u in users:
-        residence = profiles[u.id].country_of_residence if u.id in profiles else None
+        profile = profiles.get(u.id)
+        residence = profile.country_of_residence if profile else None
         result.append(
             SeekerListRead(
                 id=u.id,
                 full_name=u.full_name,
                 email=u.email,
+                profile_photo_url=profile.profile_photo_url if profile else None,
                 country_of_residence=residence,
                 country_of_residence_name=country_name(residence),
-                intended_visa_type=profiles[u.id].intended_visa_type if u.id in profiles else None,
+                intended_visa_type=profile.intended_visa_type if profile else None,
                 intended_visa_type_name=visa_type_name(
-                    profiles[u.id].intended_visa_type if u.id in profiles else None
+                    profile.intended_visa_type if profile else None
                 ),
                 status=user_admin_service.compute_status(u),
                 ai_assessment_count=ai_counts.get(u.id, 0),
@@ -144,6 +146,7 @@ async def get_seeker_detail(session: AsyncSession, user_id: uuid.UUID) -> Seeker
         id=user.id,
         full_name=user.full_name,
         email=user.email,
+        profile_photo_url=profile.profile_photo_url,
         country_of_residence=profile.country_of_residence,
         country_of_residence_name=country_name(profile.country_of_residence),
         intended_visa_type=profile.intended_visa_type,

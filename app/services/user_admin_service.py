@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.config import Settings
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import ConflictError, NotFoundError
 from app.models.seeker_profile import SeekerProfile
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.user_admin import AccountStatus, UserDetailRead, UserListRead
@@ -192,6 +192,25 @@ async def verify_account(session: AsyncSession, user_id: uuid.UUID, admin_id: uu
         user.pre_suspend_verification_status = None
         user.is_suspended = False
         user.is_active = True
+    session.add(user)
+    await session.flush()
+    await session.refresh(user)
+    return user
+
+
+async def unverify_account(session: AsyncSession, user_id: uuid.UUID, admin_id: uuid.UUID) -> User:
+    """Clear ``email_verified_at`` so the list status becomes *unverified*.
+
+    Rejects if the account is currently suspended — the admin must reactivate
+    first.
+    """
+    user = await session.get(User, user_id)
+    if user is None:
+        raise NotFoundError("User not found")
+    if user.is_suspended:
+        raise ConflictError("Account is suspended; reactivate before unverifying")
+    user.email_verified_at = None
+    user.updated_by = admin_id
     session.add(user)
     await session.flush()
     await session.refresh(user)

@@ -99,6 +99,7 @@ class OnboardingSubmit(BaseModel):
     # Steps 5-6 (optional — user may skip) — full country name (e.g. "Pakistan") or 2-letter
     # code; normalised to the code below
     nationality: str | None = Field(default=None, min_length=2, max_length=100)
+    country_of_residence: str | None = Field(default=None, min_length=2, max_length=100)
     education_level: EducationLevel | None = None
     employment_status: EmploymentStatus | None = None
     employer_name: str | None = Field(default=None, max_length=255)
@@ -119,6 +120,16 @@ class OnboardingSubmit(BaseModel):
     @field_validator("nationality")
     @classmethod
     def _resolve_nationality(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        code = country_code(value)
+        if code is None:
+            raise ValueError(f"Unrecognized country: {value!r}")
+        return code
+
+    @field_validator("country_of_residence")
+    @classmethod
+    def _resolve_country_of_residence(cls, value: str | None) -> str | None:
         if value is None:
             return None
         code = country_code(value)

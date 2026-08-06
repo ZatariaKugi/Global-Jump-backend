@@ -16,6 +16,7 @@ class SeekerListRead(BaseModel):
     id: uuid.UUID
     full_name: str | None
     email: str
+    profile_photo_url: str | None
     country_of_residence: str | None
     country_of_residence_name: str | None
     intended_visa_type: OptionalVisaType
