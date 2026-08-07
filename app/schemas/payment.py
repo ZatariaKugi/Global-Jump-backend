@@ -66,13 +66,23 @@ class TransactionFinanceRead(TransactionAdminRead):
     service_type: str
     scheduled_start: datetime
     invoice_id: str | None = None
+    display_id: str | None = None
     display_status: PaymentDisplayStatus = "pending"
     seeker_email: str | None = None
     advisor_email: str | None = None
+    seeker_phone: str | None = None
+    advisor_phone: str | None = None
     seeker_country: str | None = None
     # Fully-qualified (presigned S3 or absolute) URLs for Next.js <Image>; null → initials.
     seeker_photo_url: str | None = None
     advisor_photo_url: str | None = None
+    # Card details from Stripe (null for pending/failed where no charge exists).
+    card_brand: str | None = None
+    card_last4: str | None = None
+    # Transfer lifecycle — exposed so FE can hide Refund before transfer / when window closed.
+    transfer_status: str | None = None
+    # Free-text admin note on the payment.
+    admin_note: str | None = None
 
 
 class TransactionAdvisorRead(TransactionRead):

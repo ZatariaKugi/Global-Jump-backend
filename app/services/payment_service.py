@@ -86,6 +86,14 @@ def format_invoice_id(invoice_number: int | None) -> str | None:
     return f"INV-{invoice_number:08d}"
 
 
+def _build_display_id(txn: Transaction) -> str:
+    """Public display ID: INV-… for paid, TXN-… for pending/failed."""
+    if txn.invoice_number is not None:
+        return f"INV-{txn.invoice_number:08d}"
+    # Use first 8 hex chars of the transaction UUID for a short, stable public ID.
+    return f"TXN-{txn.id.hex[:8].upper()}"
+
+
 def format_appointment_id(appointment_number: int) -> str:
     return f"#{appointment_number:07d}"
 
@@ -390,6 +398,8 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
         pi_id = str(_stripe_get(raw_pi, "id") or "") or None
 
     charge_id: str | None = None
+    card_brand: str | None = None
+    card_last4: str | None = None
     if pi_id:
         try:
             pi = await stripe.PaymentIntent.retrieve_async(pi_id, expand=["latest_charge"])
@@ -400,12 +410,21 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
                     if isinstance(latest_charge, dict)
                     else str(_stripe_get(latest_charge, "id") or latest_charge)
                 )
+                # Extract card brand + last-4 from charge payment_method_details.
+                pmd = _stripe_get(latest_charge, "payment_method_details")
+                if pmd is not None:
+                    card = _stripe_get(pmd, "card")
+                    if card is not None:
+                        card_brand = str(_stripe_get(card, "brand") or None) or None
+                        card_last4 = str(_stripe_get(card, "last4") or None) or None
         except stripe.StripeError as exc:
             log.warning("webhook_pi_retrieve_failed", pi_id=pi_id, error=str(exc))
 
     txn.status = TransactionStatus.succeeded
     txn.stripe_payment_intent_id = pi_id
     txn.stripe_charge_id = charge_id
+    txn.card_brand = card_brand
+    txn.card_last4 = card_last4
     txn.invoice_number = await _next_invoice_number(session)
     # Arm the delayed payout: hold the advisor's share, then let the sweep transfer
     # it after the window. Refunds are only possible while transfer_status is pending.
@@ -593,8 +612,11 @@ async def refund_transaction(
     ).scalar_one_or_none()
     if txn is None:
         raise NotFoundError("Transaction not found")
-    if txn.status != TransactionStatus.succeeded:
-        raise AppError("Only succeeded transactions can be refunded", code="not_refundable")
+    if txn.status not in (TransactionStatus.succeeded, TransactionStatus.partially_refunded):
+        raise AppError(
+            "Only succeeded or partially-refunded transactions can be refunded",
+            code="not_refundable",
+        )
     # Refund window: closed once the advisor payout has been transferred.
     if txn.transfer_status in (TransferStatus.completed, TransferStatus.failed):
         raise AppError("The refund window has closed for this payment", code="refund_window_closed")
@@ -603,6 +625,12 @@ async def refund_transaction(
     if refund_amount > txn.amount_usd:
         raise AppError(
             "Refund amount cannot exceed the transaction amount", code="refund_amount_too_large"
+        )
+    # Cap cumulative refund to transaction amount.
+    already_refunded = txn.refunded_amount_usd or 0.0
+    if already_refunded + refund_amount > txn.amount_usd:
+        raise AppError(
+            "Refund would exceed total transaction amount", code="refund_amount_too_large"
         )
 
     refund_params: dict[str, str | int] = {}
@@ -618,12 +646,15 @@ async def refund_transaction(
     # Same overloaded-kwargs stub mismatch as the checkout call above.
     await stripe.Refund.create_async(**refund_params)  # type: ignore[arg-type]
 
-    is_full = refund_amount >= txn.amount_usd
+    # Accumulate refunded amount for partial-refund support.
+    already_refunded = txn.refunded_amount_usd or 0.0
+    cumulative_refunded = already_refunded + refund_amount
+    is_full = cumulative_refunded >= txn.amount_usd
     txn.status = TransactionStatus.refunded if is_full else TransactionStatus.partially_refunded
     txn.refunded_at = datetime.now(UTC)
     txn.refunded_by = admin_id
     txn.refund_reason = reason
-    txn.refunded_amount_usd = refund_amount
+    txn.refunded_amount_usd = cumulative_refunded
     txn.updated_by = admin_id
     # Cancel the pending payout so the sweep never fires — nothing was transferred,
     # so the refund comes entirely from the platform balance.
@@ -1393,7 +1424,10 @@ async def finance_read(
         service_type=booking.service_type,
         scheduled_start=booking.scheduled_start,
         invoice_id=format_invoice_id(txn.invoice_number),
+        display_id=_build_display_id(txn),
         display_status=display_status(txn),
+        seeker_phone=seeker_profile.phone if seeker_profile else None,
+        advisor_phone=advisor_profile.phone if advisor_profile else None,
         seeker_country=seeker_profile.country_of_residence if seeker_profile else None,
         seeker_photo_url=resolve_media_url(
             seeker_profile.profile_photo_url if seeker_profile else None, settings
@@ -1401,6 +1435,10 @@ async def finance_read(
         advisor_photo_url=resolve_media_url(
             advisor_profile.profile_photo_url if advisor_profile else None, settings
         ),
+        card_brand=txn.card_brand,
+        card_last4=txn.card_last4,
+        transfer_status=txn.transfer_status.value if txn.transfer_status else None,
+        admin_note=txn.admin_note,
     )
 
 

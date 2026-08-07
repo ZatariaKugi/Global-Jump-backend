@@ -80,6 +80,13 @@ class Transaction(BaseModel):
         String(50), default="card", server_default="card", nullable=False
     )
 
+    # Card brand + last-4 digits captured from Stripe on checkout completion.
+    card_brand: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    card_last4: Mapped[str | None] = mapped_column(String(4), nullable=True)
+
+    # Free-text admin note visible on the Finance detail panel.
+    admin_note: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+
     status: Mapped[TransactionStatus] = mapped_column(
         SAEnum(TransactionStatus, name="transaction_status"),
         default=TransactionStatus.pending,

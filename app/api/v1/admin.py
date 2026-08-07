@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
 
 from app.api.deps import CurrentPrincipal, RequestIdDep, SettingsDep, require_role
 from app.api.pagination import PaginationDep, page_meta, paginate
@@ -1323,6 +1324,36 @@ async def refund_payment(
     txn = await payment_service.refund_transaction(
         session, transaction_id, principal.id, body.reason, settings, body.amount_usd
     )
+    data = await payment_service.finance_read(session, txn, settings)
+    return ResponseEnvelope[TransactionFinanceRead](
+        data=data,
+        meta=Meta(request_id=request_id),
+    )
+
+
+class AdminNoteUpdate(BaseModel):
+    admin_note: str | None = None
+
+
+@router.patch(
+    "/payments/{transaction_id}/note",
+    response_model=ResponseEnvelope[TransactionFinanceRead],
+)
+async def update_payment_note(
+    transaction_id: uuid.UUID,
+    body: AdminNoteUpdate,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[TransactionFinanceRead]:
+    """Set or clear the admin note on a payment."""
+    txn = await payment_service.get_by_id(session, transaction_id)
+    txn.admin_note = body.admin_note
+    txn.updated_by = principal.id
+    session.add(txn)
+    await session.flush()
+    await session.refresh(txn)
     data = await payment_service.finance_read(session, txn, settings)
     return ResponseEnvelope[TransactionFinanceRead](
         data=data,
