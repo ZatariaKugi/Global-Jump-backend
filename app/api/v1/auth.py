@@ -325,7 +325,11 @@ async def resend_verification(
     session: SessionDep,
     settings: SettingsDep,
 ) -> None:
-    """Resend the email verification token. Always 204 to prevent email enumeration."""
+    """Resend the email verification token. Always 204 to prevent email enumeration.
+
+    Only unverified accounts receive a new email. Issuing a new token revokes any
+    previous unused verification links for that user.
+    """
     enforce_cooldown(f"resend-verification:{body.email}", cooldown_seconds=60)
     user = await user_service.get_by_email(session, body.email)
     if user is None or user.is_email_verified:

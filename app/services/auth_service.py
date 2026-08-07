@@ -119,10 +119,33 @@ async def _revoke_all_refresh_tokens(session: AsyncSession, user_id: uuid.UUID) 
 # ---------------------------------------------------------------------------
 
 
+async def _revoke_unused_email_verification_tokens(
+    session: AsyncSession, user_id: uuid.UUID
+) -> None:
+    """Invalidate outstanding email-verification links before issuing a new one."""
+    now = datetime.now(UTC)
+    result = await session.execute(
+        select(UserToken).where(
+            UserToken.user_id == user_id,
+            UserToken.purpose == TokenPurpose.email_verification,
+            UserToken.used_at.is_(None),
+        )
+    )
+    for old_record in result.scalars():
+        old_record.used_at = now
+        session.add(old_record)
+    await session.flush()
+
+
 async def create_email_verification_token(
     session: AsyncSession, user: User, settings: Settings
 ) -> str:
-    """Generate + store a UserToken for email verification.  Returns the raw token."""
+    """Generate + store a UserToken for email verification.  Returns the raw token.
+
+    Any previous unused verification links for this user are revoked so only the
+    latest email works (same pattern as password reset).
+    """
+    await _revoke_unused_email_verification_tokens(session, user.id)
     raw = generate_token()
     record = UserToken(
         user_id=user.id,
@@ -152,6 +175,13 @@ async def verify_email(session: AsyncSession, raw_token: str) -> User:
     user = await session.get(User, record.user_id)
     if user is None:
         raise AuthenticationError("User not found")
+
+    if user.is_email_verified:
+        # Burn the token so a stale link cannot be replayed after verification.
+        record.used_at = now
+        session.add(record)
+        await session.flush()
+        raise ConflictError("Email is already verified", code="already_verified")
 
     user.email_verified_at = now
     record.used_at = now
