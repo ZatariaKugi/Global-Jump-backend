@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import io
 import uuid
+from datetime import UTC, datetime, timedelta
 
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.models.booking import Booking, BookingStatus, PaymentStatus
 from app.services.ws_manager import ConnectionManager
 from tests.test_bookings import _bookable_advisor, _seeker, _slot_iso
 
 CONVERSATIONS = "/api/v1/conversations"
+BOOKINGS = "/api/v1/bookings"
 
 
 async def _user_id(client: AsyncClient, headers: dict) -> str:
@@ -37,11 +41,43 @@ async def _booked_pair(client: AsyncClient, engine) -> tuple[str, dict, str, dic
     return advisor_id, advisor_headers, seeker_id, cust_headers
 
 
+async def _chat_ready_pair(
+    client: AsyncClient,
+    engine,
+    *,
+    in_window: bool = True,
+) -> tuple[str, dict, str, dict]:
+    """Confirmed + paid booking; slot wraps ``now`` when ``in_window`` is true."""
+    advisor_id, advisor_headers, seeker_id, cust_headers = await _booked_pair(client, engine)
+
+    bookings = await client.get(BOOKINGS, headers=cust_headers)
+    booking_id = bookings.json()["data"][0]["id"]
+    resp = await client.post(f"{BOOKINGS}/{booking_id}/accept", headers=advisor_headers)
+    assert resp.status_code == 200, resp.text
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        booking = await session.get(Booking, uuid.UUID(booking_id))
+        assert booking is not None
+        now = datetime.now(UTC)
+        if in_window:
+            booking.scheduled_start = now - timedelta(minutes=5)
+            booking.scheduled_end = now + timedelta(minutes=25)
+        else:
+            booking.scheduled_start = now + timedelta(hours=1)
+            booking.scheduled_end = now + timedelta(hours=2)
+        booking.status = BookingStatus.confirmed
+        booking.payment_status = PaymentStatus.paid
+        await session.commit()
+
+    return advisor_id, advisor_headers, seeker_id, cust_headers
+
+
 # ── Conversation creation ────────────────────────────────────────────────────
 
 
 async def test_create_conversation_without_booking(client: AsyncClient, engine) -> None:
-    """Pre-booking chat is allowed — seeker can open a thread with any advisor."""
+    """Seeker can open a thread without a booking; send is gated separately."""
     advisor_id, _, _ = await _bookable_advisor(client, engine)
     _, cust_headers = await _seeker(client)
 
@@ -52,6 +88,7 @@ async def test_create_conversation_without_booking(client: AsyncClient, engine) 
     data = resp.json()["data"]
     assert data["advisor_id"] == advisor_id
     assert data["other_party_id"] == advisor_id
+    assert data["chat_send_enabled"] is False
 
 
 async def test_create_conversation_happy_path_and_idempotent(client: AsyncClient, engine) -> None:
@@ -69,6 +106,7 @@ async def test_create_conversation_happy_path_and_idempotent(client: AsyncClient
     assert data["other_party_name"] == "Bookable Advisor"
     assert data["unread_count"] == 0
     assert data["last_message_at"] is None
+    assert data["chat_send_enabled"] is False
 
     # Idempotent — calling again returns the same conversation.
     resp = await client.post(
@@ -115,7 +153,7 @@ async def test_create_conversation_rejects_invalid_participants(
 
 
 async def test_send_and_list_messages_with_unread_and_preview(client: AsyncClient, engine) -> None:
-    advisor_id, advisor_headers, seeker_id, cust_headers = await _booked_pair(client, engine)
+    advisor_id, advisor_headers, seeker_id, cust_headers = await _chat_ready_pair(client, engine)
     resp = await client.post(
         CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
     )
@@ -155,7 +193,7 @@ async def test_send_and_list_messages_with_unread_and_preview(client: AsyncClien
 
 
 async def test_send_message_requires_body_or_attachment(client: AsyncClient, engine) -> None:
-    advisor_id, _, _, cust_headers = await _booked_pair(client, engine)
+    advisor_id, _, _, cust_headers = await _chat_ready_pair(client, engine)
     resp = await client.post(
         CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
     )
@@ -171,7 +209,7 @@ async def test_send_message_requires_body_or_attachment(client: AsyncClient, eng
 
 
 async def test_send_message_with_attachment(client: AsyncClient, engine) -> None:
-    advisor_id, _, _, cust_headers = await _booked_pair(client, engine)
+    advisor_id, _, _, cust_headers = await _chat_ready_pair(client, engine)
     resp = await client.post(
         CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
     )
@@ -214,7 +252,7 @@ async def test_send_message_with_attachment(client: AsyncClient, engine) -> None
 
 
 async def test_send_attachment_only_message(client: AsyncClient, engine) -> None:
-    advisor_id, _, _, cust_headers = await _booked_pair(client, engine)
+    advisor_id, _, _, cust_headers = await _chat_ready_pair(client, engine)
     resp = await client.post(
         CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
     )
@@ -251,11 +289,83 @@ async def test_send_attachment_only_message(client: AsyncClient, engine) -> None
     assert data["attachments"][0]["file_name"] == "photo.jpg"
 
 
+async def test_send_message_blocked_outside_booking_slot(client: AsyncClient, engine) -> None:
+    advisor_id, _, _, cust_headers = await _chat_ready_pair(client, engine, in_window=False)
+    resp = await client.post(
+        CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
+    )
+    conversation_id = resp.json()["data"]["id"]
+    assert resp.json()["data"]["chat_send_enabled"] is False
+
+    resp = await client.post(
+        f"{CONVERSATIONS}/{conversation_id}/messages",
+        json={"body": "Too early"},
+        headers=cust_headers,
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "chat_inactive"
+
+
+async def test_send_message_allowed_during_booking_slot(client: AsyncClient, engine) -> None:
+    advisor_id, _, _, cust_headers = await _chat_ready_pair(client, engine, in_window=True)
+    resp = await client.post(
+        CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
+    )
+    conversation_id = resp.json()["data"]["id"]
+    assert resp.json()["data"]["chat_send_enabled"] is True
+
+    resp = await client.post(
+        f"{CONVERSATIONS}/{conversation_id}/messages",
+        json={"body": "During the session"},
+        headers=cust_headers,
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_message_history_readable_after_slot_ends(client: AsyncClient, engine) -> None:
+    advisor_id, _, _, cust_headers = await _chat_ready_pair(client, engine, in_window=True)
+    resp = await client.post(
+        CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
+    )
+    conversation_id = resp.json()["data"]["id"]
+
+    resp = await client.post(
+        f"{CONVERSATIONS}/{conversation_id}/messages",
+        json={"body": "Hello during slot"},
+        headers=cust_headers,
+    )
+    assert resp.status_code == 201, resp.text
+
+    bookings = await client.get(BOOKINGS, headers=cust_headers)
+    booking_id = bookings.json()["data"][0]["id"]
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        booking = await session.get(Booking, uuid.UUID(booking_id))
+        assert booking is not None
+        now = datetime.now(UTC)
+        booking.scheduled_start = now - timedelta(hours=2)
+        booking.scheduled_end = now - timedelta(hours=1)
+        await session.commit()
+
+    resp = await client.post(
+        f"{CONVERSATIONS}/{conversation_id}/messages",
+        json={"body": "After slot"},
+        headers=cust_headers,
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "chat_inactive"
+
+    resp = await client.get(f"{CONVERSATIONS}/{conversation_id}/messages", headers=cust_headers)
+    assert resp.status_code == 200
+    assert len(resp.json()["data"]) == 1
+    assert resp.json()["data"][0]["body"] == "Hello during slot"
+
+
 # ── Read receipts ────────────────────────────────────────────────────────────
 
 
 async def test_mark_message_read(client: AsyncClient, engine) -> None:
-    advisor_id, advisor_headers, _, cust_headers = await _booked_pair(client, engine)
+    advisor_id, advisor_headers, _, cust_headers = await _chat_ready_pair(client, engine)
     resp = await client.post(
         CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
     )
@@ -293,7 +403,7 @@ async def test_mark_message_read(client: AsyncClient, engine) -> None:
 
 
 async def test_sender_can_edit_own_message(client: AsyncClient, engine) -> None:
-    advisor_id, advisor_headers, _, cust_headers = await _booked_pair(client, engine)
+    advisor_id, advisor_headers, _, cust_headers = await _chat_ready_pair(client, engine)
     resp = await client.post(
         CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
     )
@@ -317,7 +427,7 @@ async def test_sender_can_edit_own_message(client: AsyncClient, engine) -> None:
 
 
 async def test_non_sender_cannot_edit_message(client: AsyncClient, engine) -> None:
-    advisor_id, advisor_headers, _, cust_headers = await _booked_pair(client, engine)
+    advisor_id, advisor_headers, _, cust_headers = await _chat_ready_pair(client, engine)
     resp = await client.post(
         CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
     )
@@ -336,7 +446,7 @@ async def test_non_sender_cannot_edit_message(client: AsyncClient, engine) -> No
 
 
 async def test_edit_rejects_empty_body(client: AsyncClient, engine) -> None:
-    advisor_id, _, _, cust_headers = await _booked_pair(client, engine)
+    advisor_id, _, _, cust_headers = await _chat_ready_pair(client, engine)
     resp = await client.post(
         CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
     )
@@ -357,7 +467,7 @@ async def test_edit_rejects_empty_body(client: AsyncClient, engine) -> None:
 
 
 async def test_sender_can_delete_own_message(client: AsyncClient, engine) -> None:
-    advisor_id, advisor_headers, _, cust_headers = await _booked_pair(client, engine)
+    advisor_id, advisor_headers, _, cust_headers = await _chat_ready_pair(client, engine)
     resp = await client.post(
         CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
     )
@@ -382,7 +492,7 @@ async def test_sender_can_delete_own_message(client: AsyncClient, engine) -> Non
 
 
 async def test_non_sender_cannot_delete_message(client: AsyncClient, engine) -> None:
-    advisor_id, advisor_headers, _, cust_headers = await _booked_pair(client, engine)
+    advisor_id, advisor_headers, _, cust_headers = await _chat_ready_pair(client, engine)
     resp = await client.post(
         CONVERSATIONS, json={"other_user_id": advisor_id}, headers=cust_headers
     )
@@ -447,7 +557,7 @@ async def test_other_party_online_reflects_presence(client: AsyncClient, engine)
 async def test_report_and_admin_moderation_flow(
     client: AsyncClient, engine, admin_token: str
 ) -> None:
-    advisor_id, advisor_headers, _, cust_headers = await _booked_pair(client, engine)
+    advisor_id, advisor_headers, _, cust_headers = await _chat_ready_pair(client, engine)
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
 
     resp = await client.post(

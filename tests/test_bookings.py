@@ -5,11 +5,13 @@ from __future__ import annotations
 import io
 import uuid
 from datetime import UTC, date, datetime, time, timedelta
+from unittest.mock import AsyncMock, patch
 
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.models.booking import Booking
+from app.models.booking import Booking, PaymentStatus
+from app.models.transaction import Transaction, TransactionStatus
 from tests.test_advisor_search import _make_advisor
 
 BOOKINGS = "/api/v1/bookings"
@@ -391,6 +393,49 @@ async def _pending_booking(
     return resp.json()["data"]["id"], advisor_headers, cust_headers, day
 
 
+async def _succeeded_transaction_for_booking(
+    engine, booking_id: str, amount_usd: float
+) -> None:
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        commission_usd = round(amount_usd * 0.15, 2)
+        tax_usd = round(amount_usd * 0.08, 2)
+        advisor_payout_usd = round(amount_usd - commission_usd - tax_usd, 2)
+        session.add(
+            Transaction(
+                booking_id=uuid.UUID(booking_id),
+                stripe_checkout_session_id=f"cs_test_{uuid.uuid4().hex[:8]}",
+                stripe_charge_id="ch_test_fake",
+                amount_usd=amount_usd,
+                commission_rate=0.15,
+                commission_usd=commission_usd,
+                tax_rate=0.08,
+                tax_usd=tax_usd,
+                advisor_payout_usd=advisor_payout_usd,
+                status=TransactionStatus.succeeded,
+                invoice_number=1,
+                created_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+
+
+async def _paid_pending_booking(
+    client: AsyncClient, engine, hour: int = 10
+) -> tuple[str, dict, dict]:
+    """Pending booking with a succeeded payment (pay-first flow)."""
+    booking_id, advisor_headers, cust_headers, _ = await _pending_booking(client, engine, hour)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        booking = await session.get(Booking, uuid.UUID(booking_id))
+        assert booking is not None
+        price_usd = booking.price_usd
+        booking.payment_status = PaymentStatus.paid
+        await session.commit()
+    await _succeeded_transaction_for_booking(engine, booking_id, amount_usd=price_usd)
+    return booking_id, advisor_headers, cust_headers
+
+
 async def test_advisor_can_accept_pending_booking(client: AsyncClient, engine) -> None:
     booking_id, advisor_headers, _, _ = await _pending_booking(client, engine)
     resp = await client.post(f"{BOOKINGS}/{booking_id}/accept", headers=advisor_headers)
@@ -415,6 +460,69 @@ async def test_advisor_can_reject_pending_booking(client: AsyncClient, engine) -
     data = resp.json()["data"]
     assert data["status"] == "rejected"
     assert data["cancellation_reason"] == "Not a good fit"
+
+
+async def test_reject_paid_booking_auto_refunds(client: AsyncClient, engine) -> None:
+    booking_id, advisor_headers, _ = await _paid_pending_booking(client, engine)
+
+    with patch(
+        "app.services.payment_service.stripe.Refund.create_async", new=AsyncMock()
+    ) as mock_refund:
+        resp = await client.post(
+            f"{BOOKINGS}/{booking_id}/reject",
+            json={"reason": "Schedule conflict"},
+            headers=advisor_headers,
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["status"] == "rejected"
+    assert resp.json()["data"]["payment_status"] == "refunded"
+    mock_refund.assert_awaited_once()
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        txn = (
+            await session.execute(
+                Transaction.__table__.select().where(
+                    Transaction.booking_id == uuid.UUID(booking_id)
+                )
+            )
+        ).mappings().one()
+        assert txn["status"] == TransactionStatus.refunded
+
+
+async def test_cancel_paid_confirmed_booking_auto_refunds(client: AsyncClient, engine) -> None:
+    booking_id, advisor_headers, cust_headers = await _paid_pending_booking(client, engine)
+    resp = await client.post(f"{BOOKINGS}/{booking_id}/accept", headers=advisor_headers)
+    assert resp.status_code == 200, resp.text
+
+    with patch(
+        "app.services.payment_service.stripe.Refund.create_async", new=AsyncMock()
+    ) as mock_refund:
+        resp = await client.post(
+            f"{BOOKINGS}/{booking_id}/cancel",
+            json={"reason": "Plans changed"},
+            headers=cust_headers,
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["status"] == "cancelled"
+    assert resp.json()["data"]["payment_status"] == "refunded"
+    mock_refund.assert_awaited_once()
+
+
+async def test_reject_unpaid_booking_does_not_call_stripe(client: AsyncClient, engine) -> None:
+    booking_id, advisor_headers, _, _ = await _pending_booking(client, engine)
+
+    with patch(
+        "app.services.payment_service.stripe.Refund.create_async", new=AsyncMock()
+    ) as mock_refund:
+        resp = await client.post(
+            f"{BOOKINGS}/{booking_id}/reject",
+            json={"reason": "Not available"},
+            headers=advisor_headers,
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["payment_status"] == "unpaid"
+    mock_refund.assert_not_awaited()
 
 
 async def test_cannot_accept_already_confirmed_booking(client: AsyncClient, engine) -> None:

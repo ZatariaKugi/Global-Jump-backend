@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import Select, and_, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.types import String
 
 from app.core.config import Settings
@@ -42,11 +43,24 @@ from app.services import (
     booking_document_service,
     booking_note_service,
     notification_service,
+    payment_service,
 )
 from app.services.availability_service import as_utc
 
 DEFAULT_NOTICE_HOURS = 24
 _ACTIVE_UPCOMING = (BookingStatus.pending, BookingStatus.confirmed)
+
+
+def _chat_eligible_payment_clause() -> ColumnElement[bool]:
+    """Confirmed bookings that are paid or advisor-waived (free-book)."""
+    return or_(
+        Booking.payment_status == PaymentStatus.paid,
+        Booking.price_usd <= 0,
+    )
+
+
+def _in_chat_window_clause(now: datetime) -> ColumnElement[bool]:
+    return and_(Booking.scheduled_start <= now, Booking.scheduled_end >= now)
 
 
 def _booking_summary(booking: Booking) -> str:
@@ -439,6 +453,63 @@ async def get_next_upcoming(
     return result.scalars().first()
 
 
+async def is_chat_send_allowed(
+    session: AsyncSession, seeker_id: uuid.UUID, advisor_id: uuid.UUID
+) -> bool:
+    """Whether messaging is allowed for this pair right now.
+
+    Send is permitted only during a confirmed, paid (or free) booking's
+    scheduled time window. Read access is not gated here.
+    """
+    now = datetime.now(UTC)
+    result = await session.execute(
+        select(Booking.id)
+        .where(Booking.seeker_id == seeker_id)
+        .where(Booking.advisor_id == advisor_id)
+        .where(Booking.status == BookingStatus.confirmed)
+        .where(_chat_eligible_payment_clause())
+        .where(_in_chat_window_clause(now))
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def get_current_chat_booking_for_pair(
+    session: AsyncSession, seeker_id: uuid.UUID, advisor_id: uuid.UUID
+) -> Booking | None:
+    """In-slot booking for a seeker↔advisor pair (soonest-ending if several overlap)."""
+    now = datetime.now(UTC)
+    result = await session.execute(
+        select(Booking)
+        .where(Booking.seeker_id == seeker_id)
+        .where(Booking.advisor_id == advisor_id)
+        .where(Booking.status == BookingStatus.confirmed)
+        .where(_chat_eligible_payment_clause())
+        .where(_in_chat_window_clause(now))
+        .order_by(Booking.scheduled_end.asc())
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
+async def get_current_chat_booking(
+    session: AsyncSession, user_id: uuid.UUID, role: UserRole
+) -> Booking | None:
+    """Current user's in-slot booking for the Chat Now banner (soonest-ending)."""
+    column = Booking.advisor_id if role == UserRole.advisor else Booking.seeker_id
+    now = datetime.now(UTC)
+    result = await session.execute(
+        select(Booking)
+        .where(column == user_id)
+        .where(Booking.status == BookingStatus.confirmed)
+        .where(_chat_eligible_payment_clause())
+        .where(_in_chat_window_clause(now))
+        .order_by(Booking.scheduled_end.asc())
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
 async def read_booking(
     session: AsyncSession, booking: Booking, *, settings: Settings
 ) -> BookingRead:
@@ -490,7 +561,11 @@ async def _enforce_seeker_notice(
 
 
 async def cancel(
-    session: AsyncSession, booking: Booking, actor_id: uuid.UUID, reason: str | None
+    session: AsyncSession,
+    booking: Booking,
+    actor_id: uuid.UUID,
+    reason: str | None,
+    settings: Settings,
 ) -> Booking:
     _assert_active(booking)
     await _enforce_seeker_notice(session, booking, actor_id)
@@ -501,6 +576,9 @@ async def cancel(
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    await payment_service.auto_refund_booking_if_paid(
+        session, booking, actor_id, reason, settings
+    )
     await _notify_booking(
         session,
         booking,
@@ -571,7 +649,11 @@ async def accept(session: AsyncSession, booking: Booking, actor_id: uuid.UUID) -
 
 
 async def reject(
-    session: AsyncSession, booking: Booking, actor_id: uuid.UUID, reason: str | None
+    session: AsyncSession,
+    booking: Booking,
+    actor_id: uuid.UUID,
+    reason: str | None,
+    settings: Settings,
 ) -> Booking:
     """Advisor declines a pending request."""
     if actor_id != booking.advisor_id:
@@ -585,6 +667,9 @@ async def reject(
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    await payment_service.auto_refund_booking_if_paid(
+        session, booking, actor_id, reason, settings
+    )
     await _notify_booking(
         session,
         booking,

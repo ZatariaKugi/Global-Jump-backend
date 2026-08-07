@@ -267,11 +267,14 @@ async def list_my_bookings(
     ] = None,
     sort: Annotated[BookingSort, Query()] = "-updated_at",
 ) -> BookingsListResponse:
-    """Appointments table (newest ``updated_at`` first) + ``next_upcoming`` for Chat Now.
+    """Appointments list + ``next_upcoming`` and ``active_chat_booking``.
 
     ``next_upcoming`` is the soonest pending/confirmed booking with
     ``scheduled_start >= now`` — independent of list filters/sort. Do not use
     ``data[0]`` for the banner.
+
+    ``active_chat_booking`` is the in-slot confirmed+paid booking for Chat Now
+    (null outside the scheduled window).
     """
     role = current_user.role
     types = [t.value for t in service_type] if service_type else None
@@ -281,11 +284,15 @@ async def list_my_bookings(
     bookings, total = await paginate(session, stmt, params)
 
     next_booking = await booking_service.get_next_upcoming(session, current_user.id, role)
+    chat_booking = await booking_service.get_current_chat_booking(session, current_user.id, role)
 
     user_ids = {b.seeker_id for b in bookings} | {b.advisor_id for b in bookings}
     if next_booking is not None:
         user_ids.add(next_booking.seeker_id)
         user_ids.add(next_booking.advisor_id)
+    if chat_booking is not None:
+        user_ids.add(chat_booking.seeker_id)
+        user_ids.add(chat_booking.advisor_id)
     users: dict[uuid.UUID, User] = {}
     for uid in user_ids:
         user = await session.get(User, uid)
@@ -297,12 +304,17 @@ async def list_my_bookings(
     if next_booking is not None:
         advisor_ids.add(next_booking.advisor_id)
         seeker_ids.add(next_booking.seeker_id)
+    if chat_booking is not None:
+        advisor_ids.add(chat_booking.advisor_id)
+        seeker_ids.add(chat_booking.seeker_id)
     photos = await booking_service.advisor_photo_keys(session, advisor_ids)
     seeker_photos = await booking_service.seeker_photo_keys(session, seeker_ids)
 
     booking_ids = {b.id for b in bookings}
     if next_booking is not None:
         booking_ids.add(next_booking.id)
+    if chat_booking is not None:
+        booking_ids.add(chat_booking.id)
     review_ids = await booking_service.review_ids_by_booking(session, booking_ids)
 
     def _row(b: Booking) -> BookingRead:
@@ -319,6 +331,7 @@ async def list_my_bookings(
     return BookingsListResponse(
         data=[_row(b) for b in bookings],
         next_upcoming=_row(next_booking) if next_booking is not None else None,
+        active_chat_booking=_row(chat_booking) if chat_booking is not None else None,
         meta=page_meta(params, total, request_id),
     )
 
@@ -399,7 +412,7 @@ async def reject_booking(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
-    booking = await booking_service.reject(session, booking, current_user.id, data.reason)
+    booking = await booking_service.reject(session, booking, current_user.id, data.reason, settings)
     await _send_rejection_notification(session, booking, settings)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
@@ -505,7 +518,7 @@ async def cancel_booking(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
-    booking = await booking_service.cancel(session, booking, current_user.id, data.reason)
+    booking = await booking_service.cancel(session, booking, current_user.id, data.reason, settings)
     await _send_cancellation_notifications(session, booking, current_user.id, settings)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](

@@ -27,7 +27,7 @@ from app.schemas.conversation import (
     MessageRead,
     OtherPartyRole,
 )
-from app.services import notification_service
+from app.services import booking_service, notification_service
 from app.services.ws_manager import manager
 
 PUBLIC_STATUSES = (ModerationStatus.visible, ModerationStatus.flagged)
@@ -195,6 +195,14 @@ async def send_message(
     attachments = attachments or []
     if not body and not attachments:
         raise AppError("Message must contain text or an attachment", code="empty_message")
+
+    if not await booking_service.is_chat_send_allowed(
+        session, conversation.seeker_id, conversation.advisor_id
+    ):
+        raise AppError(
+            "Messaging is only available during your scheduled session time",
+            code="chat_inactive",
+        )
 
     now = datetime.now(UTC)
     message = Message(
@@ -495,6 +503,9 @@ async def build_conversation_read(
         last_message_at=conversation.last_message_at,
         last_message_preview=message_preview(last),
         unread_count=unread,
+        chat_send_enabled=await booking_service.is_chat_send_allowed(
+            session, conversation.seeker_id, conversation.advisor_id
+        ),
         created_at=conversation.created_at,
     )
 

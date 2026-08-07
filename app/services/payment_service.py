@@ -588,6 +588,136 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
     log.info("payment_refunded_via_webhook", booking_id=str(txn.booking_id))
 
 
+async def _refund_transaction_record(
+    session: AsyncSession,
+    txn: Transaction,
+    initiated_by: uuid.UUID,
+    reason: str | None,
+    settings: Settings,
+    amount_usd: float | None = None,
+) -> Transaction:
+    """Issue a full or partial Stripe refund for a locked transaction row."""
+    if txn.status not in (TransactionStatus.succeeded, TransactionStatus.partially_refunded):
+        raise AppError(
+            "Only succeeded or partially-refunded transactions can be refunded",
+            code="not_refundable",
+        )
+    if txn.transfer_status in (TransferStatus.completed, TransferStatus.failed):
+        raise AppError("The refund window has closed for this payment", code="refund_window_closed")
+
+    refund_amount = amount_usd if amount_usd is not None else txn.amount_usd
+    if refund_amount > txn.amount_usd:
+        raise AppError(
+            "Refund amount cannot exceed the transaction amount", code="refund_amount_too_large"
+        )
+    already_refunded = txn.refunded_amount_usd or 0.0
+    if already_refunded + refund_amount > txn.amount_usd:
+        raise AppError(
+            "Refund would exceed total transaction amount", code="refund_amount_too_large"
+        )
+
+    refund_params: dict[str, str | int] = {}
+    if txn.stripe_payment_intent_id:
+        refund_params["payment_intent"] = txn.stripe_payment_intent_id
+    elif txn.stripe_charge_id:
+        refund_params["charge"] = txn.stripe_charge_id
+    else:
+        raise AppError("No Stripe charge found for this transaction", code="no_charge")
+    if amount_usd is not None:
+        refund_params["amount"] = int(round(amount_usd * 100))
+
+    await stripe.Refund.create_async(**refund_params)  # type: ignore[arg-type]
+
+    cumulative_refunded = already_refunded + refund_amount
+    is_full = cumulative_refunded >= txn.amount_usd
+    txn.status = TransactionStatus.refunded if is_full else TransactionStatus.partially_refunded
+    txn.refunded_at = datetime.now(UTC)
+    txn.refunded_by = initiated_by
+    txn.refund_reason = reason
+    txn.refunded_amount_usd = cumulative_refunded
+    txn.updated_by = initiated_by
+    if txn.transfer_status == TransferStatus.pending:
+        txn.transfer_status = TransferStatus.cancelled
+    session.add(txn)
+    await _log_event(session, txn.id, TransactionEventType.refunded)
+    if is_full:
+        await _log_event(session, txn.id, TransactionEventType.closed)
+
+    booking = await session.get(Booking, txn.booking_id)
+    if booking is not None:
+        booking.payment_status = PaymentStatus.refunded
+        session.add(booking)
+        await _notify_payment(
+            session,
+            txn,
+            recipient_id=booking.seeker_id,
+            type=NotificationType.payment_refunded,
+            title="Payment refunded",
+            body=f"${refund_amount:.2f} refunded for {booking.service_type}",
+            actor_id=initiated_by,
+        )
+
+    await session.flush()
+    await session.refresh(txn)
+    return txn
+
+
+async def refund_booking_payment(
+    session: AsyncSession,
+    booking_id: uuid.UUID,
+    initiated_by: uuid.UUID,
+    reason: str | None,
+    settings: Settings,
+    amount_usd: float | None = None,
+) -> Transaction:
+    """Full or partial refund for the payment tied to a booking."""
+    _init_stripe(settings)
+    txn = (
+        await session.execute(
+            select(Transaction).where(Transaction.booking_id == booking_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if txn is None:
+        raise NotFoundError("Transaction not found")
+    return await _refund_transaction_record(
+        session, txn, initiated_by, reason, settings, amount_usd
+    )
+
+
+async def auto_refund_booking_if_paid(
+    session: AsyncSession,
+    booking: Booking,
+    actor_id: uuid.UUID,
+    reason: str | None,
+    settings: Settings,
+) -> None:
+    """Best-effort full refund when a paid booking is rejected or cancelled.
+
+    Failures are logged but do not block the booking state transition — admin can
+    refund manually from the Payments screen if the window has closed.
+    """
+    if booking.payment_status != PaymentStatus.paid:
+        return
+    try:
+        await refund_booking_payment(
+            session,
+            booking.id,
+            actor_id,
+            reason,
+            settings,
+        )
+    except (AppError, NotFoundError) as exc:
+        code = exc.code if isinstance(exc, AppError) else "not_found"
+        log.warning(
+            "booking_auto_refund_failed",
+            booking_id=str(booking.id),
+            code=code,
+            detail=str(exc),
+        )
+    else:
+        log.info("booking_auto_refunded", booking_id=str(booking.id), actor_id=str(actor_id))
+
+
 async def refund_transaction(
     session: AsyncSession,
     transaction_id: uuid.UUID,
@@ -612,75 +742,10 @@ async def refund_transaction(
     ).scalar_one_or_none()
     if txn is None:
         raise NotFoundError("Transaction not found")
-    if txn.status not in (TransactionStatus.succeeded, TransactionStatus.partially_refunded):
-        raise AppError(
-            "Only succeeded or partially-refunded transactions can be refunded",
-            code="not_refundable",
-        )
-    # Refund window: closed once the advisor payout has been transferred.
-    if txn.transfer_status in (TransferStatus.completed, TransferStatus.failed):
-        raise AppError("The refund window has closed for this payment", code="refund_window_closed")
 
-    refund_amount = amount_usd if amount_usd is not None else txn.amount_usd
-    if refund_amount > txn.amount_usd:
-        raise AppError(
-            "Refund amount cannot exceed the transaction amount", code="refund_amount_too_large"
-        )
-    # Cap cumulative refund to transaction amount.
-    already_refunded = txn.refunded_amount_usd or 0.0
-    if already_refunded + refund_amount > txn.amount_usd:
-        raise AppError(
-            "Refund would exceed total transaction amount", code="refund_amount_too_large"
-        )
-
-    refund_params: dict[str, str | int] = {}
-    if txn.stripe_payment_intent_id:
-        refund_params["payment_intent"] = txn.stripe_payment_intent_id
-    elif txn.stripe_charge_id:
-        refund_params["charge"] = txn.stripe_charge_id
-    else:
-        raise AppError("No Stripe charge found for this transaction", code="no_charge")
-    if amount_usd is not None:
-        refund_params["amount"] = int(round(amount_usd * 100))
-
-    # Same overloaded-kwargs stub mismatch as the checkout call above.
-    await stripe.Refund.create_async(**refund_params)  # type: ignore[arg-type]
-
-    # Accumulate refunded amount for partial-refund support.
-    already_refunded = txn.refunded_amount_usd or 0.0
-    cumulative_refunded = already_refunded + refund_amount
-    is_full = cumulative_refunded >= txn.amount_usd
-    txn.status = TransactionStatus.refunded if is_full else TransactionStatus.partially_refunded
-    txn.refunded_at = datetime.now(UTC)
-    txn.refunded_by = admin_id
-    txn.refund_reason = reason
-    txn.refunded_amount_usd = cumulative_refunded
-    txn.updated_by = admin_id
-    # Cancel the pending payout so the sweep never fires — nothing was transferred,
-    # so the refund comes entirely from the platform balance.
-    if txn.transfer_status == TransferStatus.pending:
-        txn.transfer_status = TransferStatus.cancelled
-    session.add(txn)
-    await _log_event(session, txn.id, TransactionEventType.refunded)
-    if is_full:
-        await _log_event(session, txn.id, TransactionEventType.closed)
-
-    booking = await session.get(Booking, txn.booking_id)
-    if booking is not None:
-        booking.payment_status = PaymentStatus.refunded
-        session.add(booking)
-        await _notify_payment(
-            session,
-            txn,
-            recipient_id=booking.seeker_id,
-            type=NotificationType.payment_refunded,
-            title="Payment refunded",
-            body=f"${refund_amount:.2f} refunded for {booking.service_type}",
-            actor_id=admin_id,
-        )
-
-    await session.flush()
-    await session.refresh(txn)
+    txn = await _refund_transaction_record(
+        session, txn, admin_id, reason, settings, amount_usd
+    )
     log.info(
         "payment_refunded_by_admin", transaction_id=str(transaction_id), admin_id=str(admin_id)
     )

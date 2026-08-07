@@ -70,6 +70,7 @@ class ConversationRead(BaseModel):
     last_message_at: datetime | None
     last_message_preview: str | None
     unread_count: int
+    chat_send_enabled: bool
     created_at: datetime
 
 

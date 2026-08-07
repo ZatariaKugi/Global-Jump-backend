@@ -134,6 +134,7 @@ class BookingsListResponse(BaseModel):
     success: bool = True
     data: list[BookingRead]
     next_upcoming: BookingRead | None = None
+    active_chat_booking: BookingRead | None = None
     meta: Meta = Field(default_factory=Meta)
 
 
