@@ -1319,21 +1319,27 @@ async def export_seeker_history_csv(
 
 
 async def seeker_payment_summary(
-    session: AsyncSession, seeker_id: uuid.UUID
+    session: AsyncSession,
+    seeker_id: uuid.UUID,
+    *,
+    date_from: date | None = None,
+    date_to: date | None = None,
 ) -> SeekerPaymentSummaryRead:
-    rows = (
-        (
-            await session.execute(
-                select(Transaction)
-                .join(Booking, Booking.id == Transaction.booking_id)
-                .where(Booking.seeker_id == seeker_id)
-                .where(Transaction.is_archived.is_(False))
-                .order_by(Transaction.created_at.desc())
-            )
-        )
-        .scalars()
-        .all()
+    stmt = (
+        select(Transaction)
+        .join(Booking, Booking.id == Transaction.booking_id)
+        .where(Booking.seeker_id == seeker_id)
+        .where(Transaction.is_archived.is_(False))
     )
+    if date_from is not None:
+        start = datetime(date_from.year, date_from.month, date_from.day, tzinfo=UTC)
+        stmt = stmt.where(Transaction.created_at >= start)
+    if date_to is not None:
+        end = datetime(date_to.year, date_to.month, date_to.day, tzinfo=UTC) + timedelta(days=1)
+        stmt = stmt.where(Transaction.created_at < end)
+    stmt = stmt.order_by(Transaction.created_at.desc())
+
+    rows = list((await session.execute(stmt)).scalars().all())
     total_paid = 0.0
     pending_amount = 0.0
     refund_amount = 0.0

@@ -3,20 +3,34 @@
 from __future__ import annotations
 
 import io
+import uuid
 
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.config import get_settings
+from app.models.seeker_document import DocumentCategory, SeekerDocument, SeekerDocumentStatus
+from app.models.user import User, UserRole
+from app.services import seeker_document_service
+from tests.test_analytics import _seed_user
 from tests.test_bookings import _bookable_advisor, _seeker, _slot_iso
 
 BOOKINGS = "/api/v1/bookings"
 DOCUMENTS = "/api/v1/users/me/documents"
 
 
-async def _upload_seeker_document(client: AsyncClient, headers: dict) -> dict:
+async def _upload_document(
+    client: AsyncClient,
+    headers: dict,
+    *,
+    category: str,
+    document_name: str,
+    file_name: str = "doc.pdf",
+) -> dict:
     upload = await client.post(
         "/api/v1/uploads",
         headers=headers,
-        files={"file": ("passport.pdf", io.BytesIO(b"%PDF-1.4 fake"), "application/pdf")},
+        files={"file": (file_name, io.BytesIO(b"%PDF-1.4 fake"), "application/pdf")},
         data={"category": "seeker_document"},
     )
     assert upload.status_code == 201, upload.text
@@ -26,16 +40,64 @@ async def _upload_seeker_document(client: AsyncClient, headers: dict) -> dict:
         DOCUMENTS,
         json={
             "file_key": file_info["file_key"],
-            "file_name": "passport.pdf",
+            "file_name": file_name,
             "file_size_bytes": file_info["file_size_bytes"],
             "content_type": "application/pdf",
-            "category": "passport",
-            "document_name": "Passport Copy",
+            "category": category,
+            "document_name": document_name,
         },
         headers=headers,
     )
     assert resp.status_code == 201, resp.text
     return resp.json()["data"]
+
+
+async def _upload_seeker_document(client: AsyncClient, headers: dict) -> dict:
+    return await _upload_document(
+        client,
+        headers,
+        category="passport",
+        document_name="Passport Copy",
+        file_name="passport.pdf",
+    )
+
+
+def _checklist_item(summary, category: DocumentCategory):
+    for item in summary.checklist:
+        if item.category == category:
+            return item
+    raise AssertionError(f"checklist missing category {category!r}")
+
+
+async def _seed_document(
+    engine,
+    seeker_id: uuid.UUID,
+    *,
+    category: DocumentCategory,
+    status: SeekerDocumentStatus = SeekerDocumentStatus.under_review,
+    document_name: str = "doc.pdf",
+) -> uuid.UUID:
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        doc = SeekerDocument(
+            seeker_id=seeker_id,
+            category=category,
+            document_name=document_name,
+            file_url=f"/uploads/seeker_document/{seeker_id}/{document_name}",
+            content_type="application/pdf",
+            status=status,
+            created_by=seeker_id,
+        )
+        session.add(doc)
+        await session.commit()
+        await session.refresh(doc)
+        return doc.id
+
+
+async def _portfolio_summary(engine, seeker_id: uuid.UUID):
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        return await seeker_document_service.portfolio_summary(session, seeker_id)
 
 
 async def _booked_pair(client: AsyncClient, engine) -> tuple[str, dict, dict]:
@@ -94,6 +156,163 @@ async def test_seeker_cannot_comment_on_another_seekers_document(client: AsyncCl
         f"{DOCUMENTS}/{document['id']}/comments", json={"body": "hi"}, headers=other_headers
     )
     assert resp.status_code == 404
+
+
+# ── Documents summary checklist ───────────────────────────────────────────────
+
+
+async def test_portfolio_summary_includes_other_category_as_missing(engine) -> None:
+    seeker_id = await _seed_user(engine, "summary-missing@test.com", "Seeker", UserRole.seeker)
+    await _seed_document(engine, seeker_id, category=DocumentCategory.passport)
+
+    summary = await _portfolio_summary(engine, seeker_id)
+
+    assert len(summary.checklist) == 5
+    other = _checklist_item(summary, DocumentCategory.other)
+    assert other.label == "Other"
+    assert other.status == "missing"
+    assert other.document_id is None
+    assert summary.missing == 4
+    assert summary.progress_percent == 0
+
+
+async def test_portfolio_summary_other_under_review(engine) -> None:
+    seeker_id = await _seed_user(engine, "summary-other@test.com", "Seeker", UserRole.seeker)
+    other_id = await _seed_document(
+        engine,
+        seeker_id,
+        category=DocumentCategory.other,
+        document_name="Misc Certificate",
+    )
+
+    summary = await _portfolio_summary(engine, seeker_id)
+    other = _checklist_item(summary, DocumentCategory.other)
+    assert other.status == "under_review"
+    assert other.document_id == other_id
+
+
+async def test_portfolio_summary_other_rollup_prefers_under_review_over_rejected(
+    engine,
+) -> None:
+    seeker_id = await _seed_user(engine, "summary-rollup@test.com", "Seeker", UserRole.seeker)
+    await _seed_document(
+        engine,
+        seeker_id,
+        category=DocumentCategory.other,
+        status=SeekerDocumentStatus.rejected,
+        document_name="Rejected Misc",
+    )
+    reviewing_id = await _seed_document(
+        engine,
+        seeker_id,
+        category=DocumentCategory.other,
+        document_name="Replacement Misc",
+    )
+
+    summary = await _portfolio_summary(engine, seeker_id)
+    other = _checklist_item(summary, DocumentCategory.other)
+    assert other.status == "under_review"
+    assert other.document_id == reviewing_id
+
+
+async def test_portfolio_summary_progress_percent_counts_five_categories(engine) -> None:
+    seeker_id = await _seed_user(engine, "summary-progress@test.com", "Seeker", UserRole.seeker)
+    await _seed_document(
+        engine,
+        seeker_id,
+        category=DocumentCategory.passport,
+        status=SeekerDocumentStatus.under_review,
+    )
+
+    summary = await _portfolio_summary(engine, seeker_id)
+    assert summary.progress_percent == 0
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        doc = (
+            await session.execute(
+                seeker_document_service.list_by_seeker_stmt(
+                    seeker_id, category=DocumentCategory.passport
+                )
+            )
+        ).scalar_one()
+        doc.status = SeekerDocumentStatus.approved
+        session.add(doc)
+        await session.commit()
+
+    summary = await _portfolio_summary(engine, seeker_id)
+    assert summary.progress_percent == 20
+
+
+# ── Comment metadata ──────────────────────────────────────────────────────────
+
+
+async def test_build_comment_read_includes_author_role(engine) -> None:
+    seeker_id = await _seed_user(engine, "comment-role-seeker@test.com", "Seeker", UserRole.seeker)
+    advisor_id = await _seed_user(
+        engine, "comment-role-advisor@test.com", "Advisor", UserRole.advisor
+    )
+    doc_id = await _seed_document(engine, seeker_id, category=DocumentCategory.passport)
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        document = await session.get(SeekerDocument, doc_id)
+        assert document is not None
+        seeker_comment = await seeker_document_service.add_comment(
+            session, document, seeker_id, "Seeker note"
+        )
+        advisor_comment = await seeker_document_service.add_comment(
+            session, document, advisor_id, "Advisor note"
+        )
+        await session.commit()
+        seeker = await session.get(User, seeker_id)
+        advisor = await session.get(User, advisor_id)
+        seeker_read = seeker_document_service.build_comment_read(seeker_comment, seeker)
+        advisor_read = seeker_document_service.build_comment_read(advisor_comment, advisor)
+
+    assert seeker_read.author_role == "seeker"
+    assert advisor_read.author_role == "advisor"
+
+
+async def test_build_reads_includes_comments_count(engine) -> None:
+    settings = get_settings()
+    seeker_id = await _seed_user(engine, "comment-count@test.com", "Seeker", UserRole.seeker)
+    advisor_id = await _seed_user(engine, "comment-count-adv@test.com", "Advisor", UserRole.advisor)
+    doc_id = await _seed_document(engine, seeker_id, category=DocumentCategory.passport)
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        document = await session.get(SeekerDocument, doc_id)
+        assert document is not None
+        await seeker_document_service.add_comment(session, document, seeker_id, "one")
+        await seeker_document_service.add_comment(session, document, advisor_id, "two")
+        await session.commit()
+
+        reads = await seeker_document_service.build_reads(session, [document], settings)
+        assert len(reads) == 1
+        assert reads[0].comments_count == 2
+
+        counts = await seeker_document_service.comment_counts_for_documents(session, [doc_id])
+        assert counts[doc_id] == 2
+
+
+async def test_list_comments_oldest_first(engine) -> None:
+    seeker_id = await _seed_user(engine, "comment-order@test.com", "Seeker", UserRole.seeker)
+    doc_id = await _seed_document(engine, seeker_id, category=DocumentCategory.passport)
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        document = await session.get(SeekerDocument, doc_id)
+        assert document is not None
+        first = await seeker_document_service.add_comment(session, document, seeker_id, "first")
+        second = await seeker_document_service.add_comment(session, document, seeker_id, "second")
+        await session.commit()
+
+        stmt = seeker_document_service.list_comments_stmt(doc_id)
+        comments = list((await session.execute(stmt)).scalars().all())
+
+    assert [c.id for c in comments] == [first.id, second.id]
+    assert [c.body for c in comments] == ["first", "second"]
 
 
 # ── Advisor review ────────────────────────────────────────────────────────────

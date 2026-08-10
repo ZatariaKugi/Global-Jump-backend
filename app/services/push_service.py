@@ -29,21 +29,33 @@ logger = get_logger(__name__)
 
 _RETRY_BASE_SECONDS = 30
 _SWEEP_BATCH_SIZE = 100
+# When init fails (bad/missing credentials), log once and stop retrying every sweep.
+_firebase_init_failed_path: str | None = None
+_push_disabled_logged = False
 
 
 def init_firebase(settings: Settings) -> bool:
     """Initialise the Firebase Admin app once. Returns True when push is usable."""
+    global _firebase_init_failed_path, _push_disabled_logged
     if not settings.push_enabled:
-        logger.info("push_disabled [no FIREBASE_CREDENTIALS_FILE — notifications stay in-app]")
+        if not _push_disabled_logged:
+            logger.info("push_disabled [no FIREBASE_CREDENTIALS_FILE — notifications stay in-app]")
+            _push_disabled_logged = True
         return False
     if firebase_admin._apps:
+        _firebase_init_failed_path = None
         return True
+    cred_path = settings.FIREBASE_CREDENTIALS_FILE
+    if cred_path and _firebase_init_failed_path == cred_path:
+        return False
     try:
-        cred = credentials.Certificate(settings.FIREBASE_CREDENTIALS_FILE)
+        cred = credentials.Certificate(cred_path)
         firebase_admin.initialize_app(cred)
     except Exception:  # noqa: BLE001 — bad credentials must not crash startup
+        _firebase_init_failed_path = cred_path
         logger.exception("firebase_init_failed")
         return False
+    _firebase_init_failed_path = None
     logger.info("firebase_initialized")
     return True
 
@@ -81,7 +93,6 @@ async def run_due_pushes(session: AsyncSession, settings: Settings) -> int:
     # leave pending rows untouched so a later successful init delivers them (do NOT
     # mass-skip, which would silently drop every queued push).
     if not firebase_admin._apps and not init_firebase(settings):
-        logger.warning("push_sweep_skipped [firebase not initialised — leaving rows pending]")
         return 0
 
     # Expire stale backlog so a freshly-enabled FCM never blasts old rows.

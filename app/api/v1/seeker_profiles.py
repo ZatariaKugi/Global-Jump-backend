@@ -253,7 +253,7 @@ async def upload_document(
     file_url = resolve_url(f"/uploads/{data.file_key}", settings)
     document = await seeker_document_service.create(session, current_user.id, data, file_url)
     return ResponseEnvelope[SeekerDocumentRead](
-        data=seeker_document_service.build_read(document, settings),
+        data=await seeker_document_service.build_read_enriched(session, document, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -265,6 +265,9 @@ async def upload_document(
     description=(
         "Totals for overview cards (total / approved / under_review / missing) plus "
         "the required-category checklist and progress percent. "
+        "The checklist is one row per required category (not per uploaded file); "
+        "status is rolled up from all active docs in that category. "
+        "Individual file names are on ``GET /users/me/documents``. "
         "Optional ``visa_type`` scopes tallies to that visa (untagged docs included)."
     ),
 )
@@ -319,7 +322,7 @@ async def list_my_documents(
     )
     documents, total = await paginate(session, stmt, params)
     return ResponseEnvelope[list[SeekerDocumentRead]](
-        data=[seeker_document_service.build_read(d, settings) for d in documents],
+        data=await seeker_document_service.build_reads(session, list(documents), settings),
         meta=page_meta(params, total, request_id),
     )
 
@@ -342,7 +345,7 @@ async def update_my_document(
         session, document, data, current_user.id
     )
     return ResponseEnvelope[SeekerDocumentRead](
-        data=seeker_document_service.build_read(document, settings),
+        data=await seeker_document_service.build_read_enriched(session, document, settings),
         meta=Meta(request_id=request_id),
     )
 

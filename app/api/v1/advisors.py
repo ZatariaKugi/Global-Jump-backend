@@ -1060,7 +1060,7 @@ async def list_client_documents(
     documents, total = await paginate(session, stmt, params)
     seeker = await seeker_document_service.build_client_seeker_brief(session, seeker_id, settings)
     return ResponseEnvelope[list[SeekerDocumentRead]](
-        data=[seeker_document_service.build_read(d, settings) for d in documents],
+        data=await seeker_document_service.build_reads(session, list(documents), settings),
         meta=page_meta(params, total, request_id, seeker=seeker),
     )
 
@@ -1084,7 +1084,7 @@ async def review_client_document(
     document = await seeker_document_service.get_for_seeker(session, document_id, seeker_id)
     document = await seeker_document_service.set_status(session, document, data, current_user.id)
     return ResponseEnvelope[SeekerDocumentRead](
-        data=seeker_document_service.build_read(document, settings),
+        data=await seeker_document_service.build_read_enriched(session, document, settings),
         meta=Meta(request_id=request_id),
     )
 

@@ -1479,7 +1479,7 @@ async def list_seeker_documents_admin(
     stmt = seeker_document_service.list_by_seeker_stmt(seeker_id)
     documents, total = await paginate(session, stmt, params)
     return ResponseEnvelope[list[SeekerDocumentRead]](
-        data=[seeker_document_service.build_read(d, settings) for d in documents],
+        data=await seeker_document_service.build_reads(session, list(documents), settings),
         meta=page_meta(params, total, request_id),
     )
 
@@ -1500,7 +1500,7 @@ async def review_seeker_document_admin(
     document = await seeker_document_service.get_for_seeker(session, document_id, seeker_id)
     document = await seeker_document_service.set_status(session, document, body, principal.id)
     return ResponseEnvelope[SeekerDocumentRead](
-        data=seeker_document_service.build_read(document, settings),
+        data=await seeker_document_service.build_read_enriched(session, document, settings),
         meta=Meta(request_id=request_id),
     )
 

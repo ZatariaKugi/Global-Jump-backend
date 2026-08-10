@@ -127,9 +127,29 @@ async def get_payment_summary(
     current_user: CurrentUser,
     session: SessionDep,
     request_id: RequestIdDep,
+    period: Annotated[PaymentPeriod | None, Query()] = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
 ) -> ResponseEnvelope[SeekerPaymentSummaryRead]:
-    """Seeker Payments summary cards (Total Paid / Pending / Refund / Last)."""
-    data = await payment_service.seeker_payment_summary(session, current_user.id)
+    """Seeker Payments summary cards (Total Paid / Pending / Refund / Last).
+
+    Optional ``period`` (``7d`` / ``30d`` / ``90d`` / ``365d`` / ``all``) scopes
+    totals the same way as ``GET /payments/history``. Explicit ``date_from`` /
+    ``date_to`` override ``period``.
+    """
+    _, resolved_from, resolved_to = _history_filters(
+        service_type=None,
+        visa_type=None,
+        period=period,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    data = await payment_service.seeker_payment_summary(
+        session,
+        current_user.id,
+        date_from=resolved_from,
+        date_to=resolved_to,
+    )
     return ResponseEnvelope[SeekerPaymentSummaryRead](data=data, meta=Meta(request_id=request_id))
 
 

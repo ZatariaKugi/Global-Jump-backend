@@ -14,6 +14,7 @@ from app.models.seeker_document import DocumentCategory, SeekerDocumentStatus
 
 CustomerDocumentsRowStatus = Literal["pending", "completed", "rejected"]
 ChecklistItemStatus = Literal["approved", "under_review", "rejected", "missing"]
+DocumentCommentAuthorRole = Literal["seeker", "advisor", "admin"]
 
 
 class ClientSeekerBrief(BaseModel):
@@ -67,6 +68,7 @@ class SeekerDocumentRead(BaseModel):
     reviewed_at: datetime | None
     reviewed_by: uuid.UUID | None
     created_at: datetime
+    comments_count: int = 0
 
 
 class DocumentChecklistItem(BaseModel):
@@ -118,5 +120,6 @@ class DocumentCommentRead(BaseModel):
     document_id: uuid.UUID
     author_id: uuid.UUID
     author_name: str | None
+    author_role: DocumentCommentAuthorRole | None = None
     body: str
     created_at: datetime

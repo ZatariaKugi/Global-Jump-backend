@@ -29,6 +29,7 @@ from app.schemas.seeker_document import (
     CustomerDocumentsRowRead,
     CustomerDocumentsRowStatus,
     DocumentChecklistItem,
+    DocumentCommentAuthorRole,
     DocumentCommentRead,
     DocumentPortfolioSummary,
     SeekerDocumentCreate,
@@ -39,11 +40,12 @@ from app.schemas.seeker_document import (
 from app.services import booking_service
 
 # Required portfolio categories for the seeker Documents checklist / Missing card.
-REQUIRED_CHECKLIST: tuple[tuple[DocumentCategory, str], ...] = (
-    (DocumentCategory.passport, "Passport"),
-    (DocumentCategory.finance, "Bank Statement"),
-    (DocumentCategory.supporting, "Employment Letter"),
-    (DocumentCategory.educational, "Academic Certification"),
+REQUIRED_CHECKLIST: tuple[DocumentCategory, ...] = (
+    DocumentCategory.passport,
+    DocumentCategory.finance,
+    DocumentCategory.supporting,
+    DocumentCategory.educational,
+    DocumentCategory.other,
 )
 
 
@@ -231,7 +233,7 @@ async def portfolio_summary(
     checklist: list[DocumentChecklistItem] = []
     missing = 0
     required_approved = 0
-    for category, label in REQUIRED_CHECKLIST:
+    for category in REQUIRED_CHECKLIST:
         status, document_id = _checklist_status_for_docs(by_category.get(category, []))
         if status == "missing":
             missing += 1
@@ -240,7 +242,7 @@ async def portfolio_summary(
         checklist.append(
             DocumentChecklistItem(
                 category=category,
-                label=label,
+                label=category.value.capitalize(),
                 status=status,
                 document_id=document_id,
             )
@@ -278,12 +280,36 @@ async def add_comment(
 def list_comments_stmt(document_id: uuid.UUID) -> Select[tuple[SeekerDocumentComment]]:
     return (
         select(SeekerDocumentComment)
-        .where(SeekerDocumentComment.document_id == document_id)
+        .where(
+            SeekerDocumentComment.document_id == document_id,
+            SeekerDocumentComment.is_archived.is_(False),
+        )
         .order_by(SeekerDocumentComment.created_at.asc())
     )
 
 
-def build_read(document: SeekerDocument, settings: Settings) -> SeekerDocumentRead:
+async def comment_counts_for_documents(
+    session: AsyncSession, document_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, int]:
+    """Active comment totals per document (excludes archived comments)."""
+    if not document_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(SeekerDocumentComment.document_id, func.count())
+            .where(
+                SeekerDocumentComment.document_id.in_(document_ids),
+                SeekerDocumentComment.is_archived.is_(False),
+            )
+            .group_by(SeekerDocumentComment.document_id)
+        )
+    ).all()
+    return {doc_id: int(n) for doc_id, n in rows}
+
+
+def build_read(
+    document: SeekerDocument, settings: Settings, *, comments_count: int = 0
+) -> SeekerDocumentRead:
     return SeekerDocumentRead(
         id=document.id,
         seeker_id=document.seeker_id,
@@ -298,7 +324,22 @@ def build_read(document: SeekerDocument, settings: Settings) -> SeekerDocumentRe
         reviewed_at=document.reviewed_at,
         reviewed_by=document.reviewed_by,
         created_at=document.created_at,
+        comments_count=comments_count,
     )
+
+
+async def build_reads(
+    session: AsyncSession, documents: list[SeekerDocument], settings: Settings
+) -> list[SeekerDocumentRead]:
+    counts = await comment_counts_for_documents(session, [d.id for d in documents])
+    return [build_read(d, settings, comments_count=counts.get(d.id, 0)) for d in documents]
+
+
+async def build_read_enriched(
+    session: AsyncSession, document: SeekerDocument, settings: Settings
+) -> SeekerDocumentRead:
+    counts = await comment_counts_for_documents(session, [document.id])
+    return build_read(document, settings, comments_count=counts.get(document.id, 0))
 
 
 async def build_client_seeker_brief(
@@ -318,11 +359,15 @@ async def build_client_seeker_brief(
 
 
 def build_comment_read(comment: SeekerDocumentComment, author: User | None) -> DocumentCommentRead:
+    author_role: DocumentCommentAuthorRole | None = None
+    if author is not None:
+        author_role = author.role.value
     return DocumentCommentRead(
         id=comment.id,
         document_id=comment.document_id,
         author_id=comment.author_id,
         author_name=author.full_name if author else None,
+        author_role=author_role,
         body=comment.body,
         created_at=comment.created_at,
     )
