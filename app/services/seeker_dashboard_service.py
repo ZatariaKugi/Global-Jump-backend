@@ -137,7 +137,9 @@ async def get_dashboard(
     next_booking = await booking_service.get_next_upcoming(session, seeker_id, UserRole.seeker)
     next_upcoming: BookingRead | None = None
     if next_booking is not None:
-        next_upcoming = await booking_service.read_booking(session, next_booking, settings=settings)
+        next_upcoming = await booking_service.read_booking(
+            session, next_booking, settings=settings, viewer_role=UserRole.seeker
+        )
 
     state = await visa_journey_service.compute_state(
         session, seeker_id, visa_type=visa_type, country=country

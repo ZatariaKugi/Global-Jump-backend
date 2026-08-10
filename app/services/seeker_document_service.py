@@ -38,6 +38,7 @@ from app.schemas.seeker_document import (
     SeekerDocumentUpdate,
 )
 from app.services import booking_service
+from app.services.availability_service import as_utc
 
 # Required portfolio categories for the seeker Documents checklist / Missing card.
 REQUIRED_CHECKLIST: tuple[DocumentCategory, ...] = (
@@ -512,6 +513,9 @@ async def build_customer_document_rows(
                 latest_doc_at[seeker_id] = max_updated
 
     rows: list[CustomerDocumentsRowRead] = []
+    notice_map = await booking_service.notice_hours_by_advisor(
+        session, {b.advisor_id for b in bookings}
+    )
     for booking in bookings:
         seeker = seekers.get(booking.seeker_id)
         if seeker is None:
@@ -524,6 +528,12 @@ async def build_customer_document_rows(
             tallies["rejected"],
         )
         updated = latest_doc_at.get(booking.seeker_id) or booking.updated_at or booking.created_at
+        notice_hours = notice_map.get(booking.advisor_id, booking_service.DEFAULT_NOTICE_HOURS)
+        can_reschedule, _can_cancel = booking_service.compute_capabilities(
+            booking,
+            cancellation_notice_hours=notice_hours,
+            viewer_role=UserRole.advisor,
+        )
         rows.append(
             CustomerDocumentsRowRead(
                 booking_id=booking.id,
@@ -536,6 +546,9 @@ async def build_customer_document_rows(
                 booking_status=booking.status,
                 documents_count=tallies["total"],
                 documents_status=status,
+                scheduled_start=as_utc(booking.scheduled_start),
+                scheduled_end=as_utc(booking.scheduled_end),
+                can_reschedule=can_reschedule,
                 updated_at=updated,
             )
         )

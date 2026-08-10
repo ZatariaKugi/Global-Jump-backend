@@ -108,6 +108,9 @@ class CustomerDocumentsRowRead(BaseModel):
     # pending = zero docs, any under_review, or mixed approved/rejected;
     # completed = all approved; rejected = all rejected (none under_review).
     documents_status: CustomerDocumentsRowStatus
+    scheduled_start: datetime
+    scheduled_end: datetime
+    can_reschedule: bool = False
     updated_at: datetime
 
 

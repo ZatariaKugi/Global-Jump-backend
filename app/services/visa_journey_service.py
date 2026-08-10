@@ -2,6 +2,11 @@
 
 No separate journey table: step status is computed from existing portfolio data
 for the requested (or profile-default) visa type + destination country.
+
+Advisor-step progress considers **any** active consultation: the Advisor stage
+completes when at least one pending/confirmed/completed booking is paid, even
+if other advisors still have unpaid sessions. Suggestions and ``booking_id`` use
+the most recently updated paid booking (else the latest active booking).
 """
 
 from __future__ import annotations
@@ -104,15 +109,30 @@ async def _latest_assessment(
     return (await session.execute(stmt)).scalars().first()
 
 
-async def _latest_booking(session: AsyncSession, seeker_id: uuid.UUID) -> Booking | None:
-    stmt = (
+async def _active_bookings(session: AsyncSession, seeker_id: uuid.UUID) -> list[Booking]:
+    """All non-terminal bookings for the seeker (newest ``updated_at`` first)."""
+    result = await session.execute(
         select(Booking)
         .where(Booking.seeker_id == seeker_id)
         .where(Booking.status.in_(_ACTIVE_BOOKING))
         .order_by(Booking.updated_at.desc())
-        .limit(1)
     )
-    return (await session.execute(stmt)).scalars().first()
+    return list(result.scalars().all())
+
+
+def _pick_primary_booking(bookings: list[Booking]) -> Booking | None:
+    """Representative booking for suggestions / doc-request prep.
+
+    Prefer the most recently updated **paid** active booking; otherwise the
+    most recently updated active booking. Lets journey logic reflect *any*
+    paid consultation across advisors without changing the response shape.
+    """
+    if not bookings:
+        return None
+    paid = [b for b in bookings if b.payment_status == PaymentStatus.paid]
+    if paid:
+        return paid[0]  # already sorted by updated_at desc
+    return bookings[0]
 
 
 async def _open_document_requests(
@@ -178,12 +198,12 @@ def _assessment_status(assessment: Assessment | None) -> JourneyStepStatus:
     return JourneyStepStatus.in_progress
 
 
-def _advisor_status(booking: Booking | None, unlocked: bool) -> JourneyStepStatus:
+def _advisor_status(bookings: list[Booking], unlocked: bool) -> JourneyStepStatus:
     if not unlocked:
         return JourneyStepStatus.pending
-    if booking is None:
+    if not bookings:
         return JourneyStepStatus.pending
-    if booking.payment_status == PaymentStatus.paid:
+    if any(b.payment_status == PaymentStatus.paid for b in bookings):
         return JourneyStepStatus.completed
     return JourneyStepStatus.in_progress
 
@@ -309,14 +329,15 @@ async def compute_state(
 ) -> JourneyState:
     """Compute step statuses (all ``STEP_KEYS``) from portfolio data."""
     assessment = await _latest_assessment(session, seeker_id, visa_type, country)
-    booking = await _latest_booking(session, seeker_id)
+    bookings = await _active_bookings(session, seeker_id)
+    primary_booking = _pick_primary_booking(bookings)
     summary = await seeker_document_service.portfolio_summary(
         session, seeker_id, visa_type=visa_type
     )
 
     assessment_st = _assessment_status(assessment)
     advisor_unlocked = assessment_st == JourneyStepStatus.completed
-    advisor_st = _advisor_status(booking, advisor_unlocked)
+    advisor_st = _advisor_status(bookings, advisor_unlocked)
 
     docs_unlocked = advisor_st in (
         JourneyStepStatus.completed,
@@ -329,8 +350,12 @@ async def compute_state(
 
     prep_unlocked = docs_st == JourneyStepStatus.completed
     prep_done = False
-    if prep_unlocked and booking is not None:
-        prep_done = await _all_requests_fulfilled(session, booking.id)
+    if prep_unlocked and bookings:
+        candidates = [b for b in bookings if b.payment_status == PaymentStatus.paid] or bookings
+        for booking in candidates:
+            if await _all_requests_fulfilled(session, booking.id):
+                prep_done = True
+                break
     prep_st = _app_prep_status(prep_unlocked, prep_done)
 
     # Documentation completing (all docs advisor-approved) also completes submission.
@@ -348,7 +373,7 @@ async def compute_state(
     }
     return JourneyState(
         assessment=assessment,
-        booking=booking,
+        booking=primary_booking,
         summary=summary,
         statuses=statuses,
     )

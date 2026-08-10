@@ -121,6 +121,9 @@ class BookingRead(BaseModel):
     review_id: uuid.UUID | None = None
     created_at: datetime
     updated_at: datetime
+    can_reschedule: bool = False
+    can_cancel: bool = False
+    cancellation_notice_hours: int = 24
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -158,6 +161,9 @@ class BookingHistoryRead(BaseModel):
     notes: list[BookingNoteRead]
     document_requests: list[DocumentRequestRead]
     created_at: datetime
+    can_reschedule: bool = False
+    can_cancel: bool = False
+    cancellation_notice_hours: int = 24
 
 
 class BookingAttachmentRead(BaseModel):
@@ -220,6 +226,10 @@ class SessionDetailRead(BaseModel):
 
     booking_id: uuid.UUID
     status: BookingStatus
+    scheduled_start: datetime
+    can_reschedule: bool = False
+    can_cancel: bool = False
+    cancellation_notice_hours: int = 24
     client: SessionClientRead
     timeline: list[SessionTimelineStepRead]
     session_type: str

@@ -242,7 +242,11 @@ async def get_advisor_detail(
 
 
 async def build_session_reads(
-    session: AsyncSession, bookings: list[Booking], settings: Settings
+    session: AsyncSession,
+    bookings: list[Booking],
+    settings: Settings,
+    *,
+    viewer_role: UserRole = UserRole.advisor,
 ) -> list[AdvisorSessionRead]:
     """Session History tab — bulk seeker name + consultation counts (not N+1)."""
     if not bookings:
@@ -286,8 +290,11 @@ async def build_session_reads(
         row[0]: row[1] for row in residence_rows
     }
 
+    notice_map = await booking_service.notice_hours_by_advisor(session, {advisor_id})
+
     out: list[AdvisorSessionRead] = []
     for b in bookings:
+        notice_hours = notice_map.get(b.advisor_id, booking_service.DEFAULT_NOTICE_HOURS)
         base = booking_service.build_read(
             b,
             seekers.get(b.seeker_id),
@@ -295,6 +302,8 @@ async def build_session_reads(
             settings=settings,
             advisor_profile_photo_key=photo_key,
             seeker_profile_photo_key=seeker_photos.get(b.seeker_id),
+            cancellation_notice_hours=notice_hours,
+            viewer_role=viewer_role,
         )
         residence_code = residence_codes.get(b.seeker_id)
         out.append(

@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info(
         "scheduler_started",
         sweep_seconds=settings.TRANSFER_SWEEP_SECONDS,
+        booking_expiry_sweep_seconds=settings.BOOKING_EXPIRY_SWEEP_SECONDS,
         push_sweep_seconds=settings.NOTIFICATION_PUSH_SWEEP_SECONDS,
         push_enabled=settings.push_enabled,
     )

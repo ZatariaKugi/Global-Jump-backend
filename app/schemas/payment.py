@@ -95,6 +95,7 @@ class TransactionAdvisorRead(TransactionRead):
     scheduled_start: datetime
     appointment_id: str | None = None
     invoice_id: str | None = None
+    display_id: str | None = None
     display_status: PaymentDisplayStatus = "pending"
     seeker_photo_url: str | None = None
     platform_fee_usd: float = 0.0
@@ -108,6 +109,7 @@ class SeekerPaymentRead(BaseModel):
     id: uuid.UUID
     booking_id: uuid.UUID
     invoice_id: str | None
+    display_id: str | None = None
     advisor_id: uuid.UUID
     advisor_name: str | None
     advisor_email: str | None

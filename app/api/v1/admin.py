@@ -53,7 +53,12 @@ from app.schemas.assessment import (
     QuestionUpdate,
 )
 from app.schemas.assessment_threshold import AssessmentThresholdRead, AssessmentThresholdUpsert
-from app.schemas.booking import BookingDetailsRead, SessionDetailRead
+from app.schemas.booking import (
+    BookingDetailsRead,
+    BookingRead,
+    BookingReschedule,
+    SessionDetailRead,
+)
 from app.schemas.conversation import FlaggedMessageRead
 from app.schemas.country_rule import (
     CountryRuleGenerateRequest,
@@ -485,7 +490,9 @@ async def list_advisor_sessions(
         advisor_id, UserRole.advisor, status=status, q=search
     )
     bookings, total = await paginate(session, stmt, params)
-    data = await advisor_admin_service.build_session_reads(session, bookings, settings)
+    data = await advisor_admin_service.build_session_reads(
+        session, bookings, settings, viewer_role=UserRole.admin
+    )
     return ResponseEnvelope[list[AdvisorSessionRead]](
         data=data, meta=page_meta(params, total, request_id)
     )
@@ -634,8 +641,46 @@ async def get_session_detail_admin(
     if booking is None:
         raise NotFoundError("Booking not found")
     seeker = await session.get(User, booking.seeker_id)
-    data = await booking_service.build_session_detail(session, booking, seeker, settings)
+    data = await booking_service.build_session_detail(
+        session, booking, seeker, settings, viewer_role=UserRole.admin
+    )
     return ResponseEnvelope[SessionDetailRead](data=data, meta=Meta(request_id=request_id))
+
+
+@router.post(
+    "/bookings/{booking_id}/reschedule",
+    response_model=ResponseEnvelope[BookingRead],
+)
+async def reschedule_booking_admin(
+    booking_id: uuid.UUID,
+    data: BookingReschedule,
+    admin_principal: CurrentPrincipal,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[BookingRead]:
+    """Admin reschedule — same slot rules as seeker/advisor; no notice window."""
+    from app.api.v1.bookings import _party_names, _read_booking, _send_reschedule_notifications
+    from app.core.exceptions import NotFoundError
+    from app.models.booking import Booking
+
+    if admin_principal.user is None:
+        raise NotFoundError("Admin user required")
+
+    booking = await session.get(Booking, booking_id)
+    if booking is None:
+        raise NotFoundError("Booking not found")
+    booking = await booking_service.reschedule(
+        session, booking, admin_principal.id, data.scheduled_start
+    )
+    await _send_reschedule_notifications(session, booking, settings)
+    seeker, advisor = await _party_names(session, booking)
+    return ResponseEnvelope[BookingRead](
+        data=await _read_booking(
+            session, booking, seeker, advisor, settings, viewer_role=UserRole.admin
+        ),
+        meta=Meta(request_id=request_id),
+    )
 
 
 # ── Advisor Verification Queue (Screen B) ────────────────────────────────────

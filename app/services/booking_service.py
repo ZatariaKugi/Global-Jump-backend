@@ -13,6 +13,7 @@ from sqlalchemy.types import String
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import resolve_media_url
+from app.core.logging import get_logger
 from app.core.visa_types import humanize_slug
 from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorOfferedService, AdvisorProfile, AdvisorService
@@ -48,6 +49,68 @@ from app.services import (
 from app.services.availability_service import as_utc
 
 DEFAULT_NOTICE_HOURS = 24
+UNACCEPTED_BOOKING_EXPIRY_REASON = (
+    "Advisor did not accept before the scheduled session time"
+)
+
+log = get_logger(__name__)
+
+
+def _before_start(booking: Booking, now: datetime) -> bool:
+    return now < as_utc(booking.scheduled_start)
+
+
+def _seeker_within_notice_window(booking: Booking, notice_hours: int, now: datetime) -> bool:
+    """True when the seeker is still allowed to cancel/reschedule (not late)."""
+    deadline = as_utc(booking.scheduled_start) - timedelta(hours=notice_hours)
+    return now <= deadline
+
+
+def compute_capabilities(
+    booking: Booking,
+    *,
+    cancellation_notice_hours: int,
+    viewer_role: UserRole,
+    now: datetime | None = None,
+) -> tuple[bool, bool]:
+    """Return ``(can_reschedule, can_cancel)`` for the viewing party."""
+    now = now or datetime.now(UTC)
+    if not _before_start(booking, now):
+        return False, False
+
+    if viewer_role == UserRole.advisor:
+        can_reschedule = booking.status == BookingStatus.confirmed
+        can_cancel = booking.status in (BookingStatus.pending, BookingStatus.confirmed)
+        return can_reschedule, can_cancel
+
+    if viewer_role == UserRole.admin:
+        active = booking.status in (BookingStatus.pending, BookingStatus.confirmed)
+        return active, active
+
+    # Seeker — pending or confirmed, and outside the advisor notice window.
+    if booking.status not in (BookingStatus.pending, BookingStatus.confirmed):
+        return False, False
+    if _seeker_within_notice_window(booking, cancellation_notice_hours, now):
+        return True, True
+    return False, False
+
+
+async def notice_hours_by_advisor(
+    session: AsyncSession, advisor_ids: set[uuid.UUID]
+) -> dict[uuid.UUID, int]:
+    if not advisor_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(AdvisorProfile.user_id, AdvisorProfile.cancellation_notice_hours).where(
+                AdvisorProfile.user_id.in_(advisor_ids)
+            )
+        )
+    ).all()
+    return {
+        user_id: (hours if hours is not None else DEFAULT_NOTICE_HOURS)
+        for user_id, hours in rows
+    }
 _ACTIVE_UPCOMING = (BookingStatus.pending, BookingStatus.confirmed)
 
 
@@ -117,9 +180,16 @@ def build_read(
     advisor_profile_photo_key: str | None = None,
     seeker_profile_photo_key: str | None = None,
     review_id: uuid.UUID | None = None,
+    cancellation_notice_hours: int = DEFAULT_NOTICE_HOURS,
+    viewer_role: UserRole = UserRole.seeker,
 ) -> BookingRead:
     platform_fee = round(booking.price_usd * settings.PLATFORM_COMMISSION_RATE, 2)
     advisor_fee = round(booking.price_usd - platform_fee, 2)
+    can_reschedule, can_cancel = compute_capabilities(
+        booking,
+        cancellation_notice_hours=cancellation_notice_hours,
+        viewer_role=viewer_role,
+    )
     return BookingRead(
         id=booking.id,
         appointment_id=appointment_id_str(booking),
@@ -150,6 +220,9 @@ def build_read(
         review_id=review_id,
         created_at=booking.created_at,
         updated_at=booking.updated_at,
+        can_reschedule=can_reschedule,
+        can_cancel=can_cancel,
+        cancellation_notice_hours=cancellation_notice_hours,
     )
 
 
@@ -511,7 +584,11 @@ async def get_current_chat_booking(
 
 
 async def read_booking(
-    session: AsyncSession, booking: Booking, *, settings: Settings
+    session: AsyncSession,
+    booking: Booking,
+    *,
+    settings: Settings,
+    viewer_role: UserRole = UserRole.seeker,
 ) -> BookingRead:
     """Fully-resolved ``BookingRead`` (party names, photos, review id) for
     callers outside the bookings router — e.g. the seeker dashboard banner."""
@@ -520,6 +597,7 @@ async def read_booking(
     advisor_photos = await advisor_photo_keys(session, {booking.advisor_id})
     seeker_photos = await seeker_photo_keys(session, {booking.seeker_id})
     review_ids = await review_ids_by_booking(session, {booking.id})
+    notice_hours = await get_notice_hours(session, booking.advisor_id)
     return build_read(
         booking,
         seeker,
@@ -528,6 +606,8 @@ async def read_booking(
         advisor_profile_photo_key=advisor_photos.get(booking.advisor_id),
         seeker_profile_photo_key=seeker_photos.get(booking.seeker_id),
         review_id=review_ids.get(booking.id),
+        cancellation_notice_hours=notice_hours,
+        viewer_role=viewer_role,
     )
 
 
@@ -681,6 +761,82 @@ async def reject(
     return booking
 
 
+async def expire_unaccepted_pending_bookings(
+    session: AsyncSession, settings: Settings
+) -> int:
+    """Cancel pending bookings past ``scheduled_start`` without advisor acceptance.
+
+    Paid bookings are fully refunded via Stripe (same path as reject/cancel).
+    Uses ``FOR UPDATE SKIP LOCKED`` so multiple app instances do not double-process.
+    Returns the number of bookings expired this pass.
+    """
+    now = datetime.now(UTC)
+    due = list(
+        (
+            await session.execute(
+                select(Booking)
+                .where(
+                    Booking.status == BookingStatus.pending,
+                    Booking.scheduled_start < now,
+                )
+                .with_for_update(skip_locked=True)
+                .limit(100)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    expired = 0
+    for booking in due:
+        if booking.status != BookingStatus.pending:
+            continue
+        was_paid = booking.payment_status == PaymentStatus.paid
+        booking.status = BookingStatus.cancelled
+        booking.cancellation_reason = UNACCEPTED_BOOKING_EXPIRY_REASON
+        booking.cancelled_by = None
+        booking.updated_by = None
+        session.add(booking)
+        await session.flush()
+        await session.refresh(booking)
+
+        if was_paid:
+            await payment_service.auto_refund_booking_if_paid(
+                session,
+                booking,
+                booking.seeker_id,
+                UNACCEPTED_BOOKING_EXPIRY_REASON,
+                settings,
+            )
+
+        await _notify_booking(
+            session,
+            booking,
+            recipient_id=booking.seeker_id,
+            actor_id=booking.advisor_id,
+            type=NotificationType.booking_cancelled,
+            title="Consultation request expired",
+            body=UNACCEPTED_BOOKING_EXPIRY_REASON,
+        )
+        await _notify_booking(
+            session,
+            booking,
+            recipient_id=booking.advisor_id,
+            actor_id=booking.seeker_id,
+            type=NotificationType.booking_cancelled,
+            title="Unaccepted consultation expired",
+            body=UNACCEPTED_BOOKING_EXPIRY_REASON,
+        )
+        log.info(
+            "booking_expired_unaccepted",
+            booking_id=str(booking.id),
+            paid=was_paid,
+        )
+        expired += 1
+
+    return expired
+
+
 async def deal_later(session: AsyncSession, booking: Booking, actor_id: uuid.UUID) -> Booking:
     """Advisor defers Accept/Reject on a pending consultation request (stays pending)."""
     if actor_id != booking.advisor_id:
@@ -780,6 +936,8 @@ async def build_history(
     seeker: User | None,
     advisor: User | None,
     settings: Settings,
+    *,
+    viewer_role: UserRole = UserRole.seeker,
 ) -> BookingHistoryRead:
     """Consultation History screen — booking summary + notes + document requests."""
     notes_result = await session.execute(booking_note_service.list_for_booking_stmt(booking.id))
@@ -793,6 +951,13 @@ async def build_history(
 
     docs_result = await session.execute(booking_document_service.list_for_booking_stmt(booking.id))
     docs = list(docs_result.scalars().all())
+
+    notice_hours = await get_notice_hours(session, booking.advisor_id)
+    can_reschedule, can_cancel = compute_capabilities(
+        booking,
+        cancellation_notice_hours=notice_hours,
+        viewer_role=viewer_role,
+    )
 
     return BookingHistoryRead(
         id=booking.id,
@@ -814,6 +979,9 @@ async def build_history(
         ],
         document_requests=[booking_document_service.build_read(d, settings) for d in docs],
         created_at=booking.created_at,
+        can_reschedule=can_reschedule,
+        can_cancel=can_cancel,
+        cancellation_notice_hours=notice_hours,
     )
 
 
@@ -935,6 +1103,8 @@ async def build_session_detail(
     booking: Booking,
     seeker: User | None,
     settings: Settings,
+    *,
+    viewer_role: UserRole = UserRole.admin,
 ) -> SessionDetailRead:
     """Admin Session Detail sheet — client block, timeline, detail rows, meeting.
 
@@ -960,9 +1130,20 @@ async def build_session_detail(
         seeker_profile.preferred_language if seeker_profile else None
     )
 
+    notice_hours = await get_notice_hours(session, booking.advisor_id)
+    can_reschedule, can_cancel = compute_capabilities(
+        booking,
+        cancellation_notice_hours=notice_hours,
+        viewer_role=viewer_role,
+    )
+
     return SessionDetailRead(
         booking_id=booking.id,
         status=booking.status,
+        scheduled_start=as_utc(booking.scheduled_start),
+        can_reschedule=can_reschedule,
+        can_cancel=can_cancel,
+        cancellation_notice_hours=notice_hours,
         client=SessionClientRead(
             name=seeker.full_name if seeker else None,
             email=seeker.email if seeker else None,

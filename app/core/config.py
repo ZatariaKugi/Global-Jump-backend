@@ -107,6 +107,9 @@ class Settings(BaseSettings):
     # automatic Connect transfer fires. Refunds are only possible during this window.
     PAYOUT_HOLD_MINUTES: int = 2
     TRANSFER_SWEEP_SECONDS: int = 60  # how often the background sweep runs due transfers
+    # Pending bookings whose scheduled_start passed without advisor acceptance are
+    # cancelled (and paid ones refunded) on this interval.
+    BOOKING_EXPIRY_SWEEP_SECONDS: int = 300
     INVOICE_FROM_ADDRESS: str | None = None  # optional platform address on invoices
     INVOICE_FROM_PHONE: str | None = None  # optional platform phone on invoices
 

@@ -948,7 +948,9 @@ async def create_booking_for_client(
     await _send_confirmations(session, booking, settings)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
-        data=await _read_booking(session, booking, seeker, advisor, settings),
+        data=await _read_booking(
+            session, booking, seeker, advisor, settings, viewer_role=current_user.role
+        ),
         meta=Meta(request_id=request_id),
     )
 
