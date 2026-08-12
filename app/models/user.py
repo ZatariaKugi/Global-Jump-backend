@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import DateTime, String
+from sqlalchemy import DateTime, Integer, String
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -96,6 +96,11 @@ class User(BaseModel):
     # tied to the Google account, not just a re-assignable email address.
     google_sub: Mapped[str | None] = mapped_column(
         String(255), unique=True, index=True, nullable=True, sort_order=108
+    )
+    # Bumped on password reset (and similar) so existing access JWTs fail auth
+    # immediately — refresh-token revoke alone cannot kill live access tokens.
+    token_version: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False, sort_order=109
     )
 
     @property

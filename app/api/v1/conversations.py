@@ -404,6 +404,10 @@ async def _authenticate_websocket(
     user = await user_service.get_by_id(session, payload.sub)
     if user is None or not user.is_active:
         return None
+    if (
+        payload.token_version if payload.token_version is not None else 0
+    ) != user.token_version:
+        return None
     return user
 
 

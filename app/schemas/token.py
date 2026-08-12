@@ -37,6 +37,9 @@ class TokenPayload(BaseModel):
     sub: uuid.UUID
     iss: str | None = None
     role: str | None = None
+    # Session epoch — must match ``User.token_version`` for local tokens.
+    # Missing claim (pre-migration JWTs) is treated as 0.
+    token_version: int | None = None
     impersonated_by: uuid.UUID | None = None
     imp: bool | None = None
 
@@ -62,6 +65,14 @@ class ForgotPasswordRequest(BaseModel):
 
 class ResendVerificationRequest(BaseModel):
     email: EmailStr
+
+
+class ResetPasswordValidateRequest(BaseModel):
+    token: str
+
+
+class ResetPasswordValidateRead(BaseModel):
+    valid: bool = True
 
 
 class ResetPasswordRequest(BaseModel):
