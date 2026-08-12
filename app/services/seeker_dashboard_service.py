@@ -2,8 +2,11 @@
 the latest completed assessment, and AI advisor matching into one payload.
 Distinct from dashboard_service.py (admin home) and advisor_dashboard_service.py.
 
-An optional ``days`` window scopes the completed-assessment lookup and the
-documents-uploaded tile — everything else is current-state.
+AI matches always come from the seeker's latest completed assessment
+overall (same as the assessment result page and
+GET /assessments/{id}/matched-advisors) — visa/country and the ``days``
+window do not filter matches. The optional ``days`` window only scopes
+``stats.documents_uploaded``; everything else is current-state.
 """
 
 from __future__ import annotations
@@ -55,23 +58,27 @@ _STATUS_PROGRESS: dict[JourneyStepStatus, int] = {
 async def _latest_completed_assessment(
     session: AsyncSession,
     user_id: uuid.UUID,
-    visa_type: VisaType | None,
-    country: str | None,
-    since: datetime | None = None,
 ) -> Assessment | None:
-    stmt = select(Assessment).where(
-        Assessment.user_id == user_id,
-        Assessment.status == AssessmentStatus.completed,
+    """Latest completed assessment for the seeker, regardless of scope.
+
+    The dashboard's AI Matched list must match what the assessment result
+    page and GET /assessments/{id}/matched-advisors show, which always
+    match on the assessment the user actually completed. Visa/country/
+    days filters are not applied here — see get_dashboard for how the
+    optional ``days`` window still scopes ``stats.documents_uploaded``.
+    """
+    stmt = (
+        select(Assessment)
+        .where(
+            Assessment.user_id == user_id,
+            Assessment.status == AssessmentStatus.completed,
+        )
+        .order_by(
+            Assessment.completed_at.desc().nulls_last(),
+            Assessment.created_at.desc(),
+        )
+        .limit(1)
     )
-    if visa_type is not None:
-        stmt = stmt.where(Assessment.visa_type == visa_type.value)
-    if country is not None:
-        stmt = stmt.where(Assessment.destination_country == country.upper())
-    if since is not None:
-        stmt = stmt.where(Assessment.completed_at >= since)
-    stmt = stmt.order_by(
-        Assessment.completed_at.desc().nulls_last(), Assessment.created_at.desc()
-    ).limit(1)
     return (await session.execute(stmt)).scalars().first()
 
 
@@ -155,9 +162,7 @@ async def get_dashboard(
     )
     application_status = int(round(100 * completed_steps / total_steps)) if total_steps else 0
 
-    assessment = await _latest_completed_assessment(
-        session, seeker_id, visa_type, country, since=since
-    )
+    assessment = await _latest_completed_assessment(session, seeker_id)
 
     matched: list[AdvisorMatchRead] = []
     if assessment is not None:
