@@ -58,6 +58,7 @@ async def impersonate(
         extra_claims={
             "role": target.role.value,
             "email_verified": target.is_email_verified,
+            "token_version": target.token_version,
             "impersonated_by": str(admin.id),
             "imp": True,
         },

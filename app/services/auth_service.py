@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.core.exceptions import AuthenticationError, ConflictError
+from app.core.exceptions import AppError, AuthenticationError, ConflictError
 from app.core.security import (
     create_access_token,
     generate_token,
@@ -23,7 +23,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models.token import RefreshToken, TokenPurpose, UserToken
-from app.models.user import User, UserRole, VerificationStatus
+from app.models.user import AuthProvider, User, UserRole, VerificationStatus
 
 # ---------------------------------------------------------------------------
 # Refresh-token pair
@@ -37,7 +37,11 @@ async def create_token_pair(
     access_token = create_access_token(
         subject=user.id,
         settings=settings,
-        extra_claims={"role": user.role.value, "email_verified": user.is_email_verified},
+        extra_claims={
+            "role": user.role.value,
+            "email_verified": user.is_email_verified,
+            "token_version": user.token_version,
+        },
     )
     raw_refresh = generate_token()
     refresh_record = RefreshToken(
@@ -131,8 +135,9 @@ async def _revoke_unused_email_verification_tokens(
             UserToken.used_at.is_(None),
         )
     )
-    for old_record in result.scalars():
+    for old_record in result.scalars().all():
         old_record.used_at = now
+        old_record.expires_at = now
         session.add(old_record)
     await session.flush()
 
@@ -169,8 +174,18 @@ async def verify_email(session: AsyncSession, raw_token: str) -> User:
     )
     record = result.scalar_one_or_none()
     now = datetime.now(UTC)
-    if record is None or record.used_at is not None or record.expires_at < now:
+    if record is None:
         raise AuthenticationError("Invalid or expired verification token")
+    if record.used_at is not None:
+        raise AppError(
+            "This verification link has already been used",
+            code="verify_token_used",
+        )
+    if _as_utc(record.expires_at) <= now:
+        raise AppError(
+            "Verification link has expired",
+            code="verify_token_expired",
+        )
 
     user = await session.get(User, record.user_id)
     if user is None:
@@ -185,6 +200,7 @@ async def verify_email(session: AsyncSession, raw_token: str) -> User:
 
     user.email_verified_at = now
     record.used_at = now
+    record.expires_at = now
     session.add(user)
     session.add(record)
     await session.flush()
@@ -197,9 +213,20 @@ async def verify_email(session: AsyncSession, raw_token: str) -> User:
 # ---------------------------------------------------------------------------
 
 
+def assert_password_reset_allowed(user: User) -> None:
+    """Google sign-in accounts cannot use the password-reset flow."""
+    if user.auth_provider == AuthProvider.google or user.hashed_password is None:
+        raise AppError(
+            "This account uses Google sign-in. Password reset is not available — "
+            "please continue with Google.",
+            code="google_account_no_password_reset",
+        )
+
+
 async def _issue_password_reset_token(session: AsyncSession, user: User, settings: Settings) -> str:
     # Invalidate all previous unused password_reset tokens for this user so
-    # only the latest link works.
+    # only the latest link works (GJ-FP-020).
+    assert_password_reset_allowed(user)
     now = datetime.now(UTC)
     result = await session.execute(
         select(UserToken).where(
@@ -208,8 +235,9 @@ async def _issue_password_reset_token(session: AsyncSession, user: User, setting
             UserToken.used_at.is_(None),
         )
     )
-    for old_record in result.scalars():
+    for old_record in result.scalars().all():
         old_record.used_at = now
+        old_record.expires_at = now
         session.add(old_record)
 
     raw = generate_token()
@@ -248,10 +276,17 @@ async def create_password_reset_token_for_user(
     return await _issue_password_reset_token(session, user, settings)
 
 
-async def reset_password(
-    session: AsyncSession, raw_token: str, new_password: str, settings: Settings
-) -> User:
-    """Validate token, hash the new password, and revoke all existing refresh tokens."""
+def _as_utc(value: datetime) -> datetime:
+    """Normalise DB datetimes so expiry checks are timezone-safe."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+async def _get_valid_password_reset_token(
+    session: AsyncSession, raw_token: str
+) -> UserToken:
+    """Return an unused, unexpired password-reset token or raise AppError."""
     token_hash = hash_token(raw_token)
     result = await session.execute(
         select(UserToken).where(
@@ -261,12 +296,54 @@ async def reset_password(
     )
     record = result.scalar_one_or_none()
     now = datetime.now(UTC)
-    if record is None or record.used_at is not None or record.expires_at < now:
-        raise AuthenticationError("Invalid or expired reset token")
+    if record is None:
+        raise AppError(
+            "Link has expired or is no longer valid",
+            code="reset_token_invalid",
+        )
+    # Expiry first so superseded (force-expired) and timed-out links share a
+    # clear "expired" message (GJ-FP-020 / GJ-FP-046).
+    if _as_utc(record.expires_at) <= now:
+        raise AppError(
+            "Reset link has expired",
+            code="reset_token_expired",
+        )
+    if record.used_at is not None:
+        raise AppError(
+            "This reset link has already been used",
+            code="reset_token_used",
+        )
+    return record
+
+
+async def validate_password_reset_token(session: AsyncSession, raw_token: str) -> None:
+    """Confirm a reset link is still usable (for FE page-load checks). Does not consume it."""
+    record = await _get_valid_password_reset_token(session, raw_token)
+    user = await session.get(User, record.user_id)
+    if user is None:
+        raise AppError(
+            "Link has expired or is no longer valid",
+            code="reset_token_invalid",
+        )
+    assert_password_reset_allowed(user)
+
+
+async def reset_password(
+    session: AsyncSession, raw_token: str, new_password: str, settings: Settings
+) -> User:
+    """Validate token, hash the new password, and invalidate every active session.
+
+    Refresh tokens are revoked and ``token_version`` is bumped so existing access
+    JWTs fail auth on the next request (immediate logout everywhere). The reset
+    token is marked used + expired so the same link cannot be reused.
+    """
+    record = await _get_valid_password_reset_token(session, raw_token)
+    now = datetime.now(UTC)
 
     user = await session.get(User, record.user_id)
     if user is None:
         raise AuthenticationError("User not found")
+    assert_password_reset_allowed(user)
 
     if user.hashed_password and verify_password(new_password, user.hashed_password):
         raise ConflictError(
@@ -274,7 +351,10 @@ async def reset_password(
         )
 
     user.hashed_password = hash_password(new_password)
+    user.token_version = user.token_version + 1
+    # Single-use: mark consumed and force-expire so a second submit fails validation.
     record.used_at = now
+    record.expires_at = now
     session.add(user)
     session.add(record)
     await _revoke_all_refresh_tokens(session, user.id)

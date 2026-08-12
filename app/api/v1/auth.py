@@ -31,6 +31,8 @@ from app.schemas.token import (
     RefreshRequest,
     ResendVerificationRequest,
     ResetPasswordRequest,
+    ResetPasswordValidateRead,
+    ResetPasswordValidateRequest,
     TokenPair,
 )
 from app.schemas.user import UserCreate, UserRead
@@ -349,14 +351,36 @@ async def forgot_password(
     session: SessionDep,
     settings: SettingsDep,
 ) -> None:
-    """Request a password reset email. Always 204 to prevent email enumeration."""
+    """Request a password reset email."""
     enforce_cooldown(f"forgot-password:{body.email}", cooldown_seconds=60)
-    raw_token = await auth_service.create_password_reset_token(session, body.email, settings)
-    if raw_token is not None:
-        user = await user_service.get_by_email(session, body.email)
-        await send_password_reset_email(
-            body.email, user.full_name or "" if user else "", raw_token, settings
-        )
+    user = await user_service.get_by_email(session, body.email)
+    if user is None:
+        raise NotFoundError("No account found with this email")
+    raw_token = await auth_service.create_password_reset_token_for_user(session, user, settings)
+    await send_password_reset_email(
+        body.email, user.full_name or "", raw_token, settings
+    )
+
+
+@router.post(
+    "/reset-password/validate",
+    response_model=ResponseEnvelope[ResetPasswordValidateRead],
+)
+async def validate_reset_password_token(
+    body: ResetPasswordValidateRequest,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[ResetPasswordValidateRead]:
+    """Check whether a reset link is still usable (call on reset-page load).
+
+    Used / expired / unknown tokens return 400 with
+    ``Link has expired or is no longer valid``.
+    """
+    await auth_service.validate_password_reset_token(session, body.token)
+    return ResponseEnvelope[ResetPasswordValidateRead](
+        data=ResetPasswordValidateRead(valid=True),
+        meta=Meta(request_id=request_id),
+    )
 
 
 @router.post("/reset-password", response_model=ResponseEnvelope[UserRead])

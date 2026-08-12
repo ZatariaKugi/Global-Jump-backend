@@ -10,3 +10,8 @@ Thanks for your payment. Here's your receipt.
 You can view or download the full invoice from your {{ app_name }} dashboard at any time.
 
 — The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}

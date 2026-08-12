@@ -70,6 +70,10 @@ async def get_current_principal(
     user = await user_service.get_by_id(session, payload.sub)
     if user is None:
         raise AuthenticationError("User not found or inactive")
+    # Missing ``token_version`` (pre-migration JWTs) counts as 0 — still valid
+    # until a password reset bumps ``User.token_version``.
+    if (payload.token_version if payload.token_version is not None else 0) != user.token_version:
+        raise AuthenticationError("Session expired. Please sign in again.")
     if user.role == UserRole.advisor and user.verification_status == VerificationStatus.rejected:
         raise AuthenticationError("Your account was rejected by an admin. Please contact support.")
     # Pending / under-review advisors are allowed through so they can complete

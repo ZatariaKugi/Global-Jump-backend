@@ -8,3 +8,8 @@ Open the conversation to reply:
 {{ conversation_url }}
 
 — The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}

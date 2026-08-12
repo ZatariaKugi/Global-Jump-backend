@@ -9,3 +9,8 @@ You have a new consultation request awaiting your response.
 Please accept or reject this request from your {{ app_name }} dashboard.
 
 — The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}

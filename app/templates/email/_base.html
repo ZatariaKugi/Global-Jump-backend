@@ -1,0 +1,319 @@
+{# Shared Global Jump email chrome — Figma “Email Templates” design system.
+   Brand: #003897 header/CTA, #E8E8E8 page, white card radius 24px.
+   Child templates set `title`, `headline`, and fill `content`. #}
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="x-apple-disable-message-reformatting" />
+  <title>{% block title %}{{ app_name }}{% endblock %}</title>
+  <!--[if mso]>
+  <noscript>
+    <xml>
+      <o:OfficeDocumentSettings>
+        <o:PixelsPerInch>96</o:PixelsPerInch>
+      </o:OfficeDocumentSettings>
+    </xml>
+  </noscript>
+  <![endif]-->
+  <style>
+    * { box-sizing: border-box; }
+    body, table, td, a { -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
+    table, td { mso-table-lspace: 0pt; mso-table-rspace: 0pt; border-collapse: collapse; }
+    img { -ms-interpolation-mode: bicubic; border: 0; outline: none; text-decoration: none; }
+    body {
+      margin: 0 !important;
+      padding: 0 !important;
+      width: 100% !important;
+      background-color: #E8E8E8;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    }
+    a { color: #003897; }
+    .wrapper { width: 100%; background-color: #E8E8E8; padding: 40px 16px; }
+    .card {
+      max-width: 600px;
+      margin: 0 auto;
+      background: #FFFFFF;
+      border-radius: 24px;
+      overflow: hidden;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.03);
+    }
+    .header {
+      background-color: #003897;
+      padding: 72px 24px;
+      min-height: 180px;
+      height: 180px;
+      text-align: center;
+      vertical-align: middle;
+      border-radius: 16px 16px 0 0;
+    }
+    .brand {
+      color: #FFFFFF;
+      font-size: 20px;
+      font-weight: 800;
+      font-family: Lato, Inter, Arial, sans-serif;
+      letter-spacing: 0.2px;
+      text-decoration: none;
+    }
+    .brand-mark {
+      display: inline-block;
+      vertical-align: middle;
+      width: 32px;
+      height: 32px;
+      margin-right: 12px;
+      border-radius: 50%;
+      background: linear-gradient(145deg, #FFFFFF 40%, #FDB626 100%);
+      line-height: 32px;
+      text-align: center;
+      color: #003897;
+      font-size: 15px;
+      font-weight: 800;
+    }
+    .body { padding: 32px 36px 24px; text-align: center; }
+    .headline {
+      margin: 0 0 16px;
+      color: #2D2D2E;
+      font-size: 24px;
+      font-weight: 700;
+      line-height: 32px;
+    }
+    .body-text {
+      margin: 0 0 16px;
+      color: #5C5C5E;
+      font-size: 14px;
+      font-weight: 400;
+      line-height: 22px;
+    }
+    .body-text strong { color: #2D2D2E; font-weight: 600; }
+    .btn-wrap { text-align: center; padding: 8px 0 36px; }
+    .btn {
+      display: inline-block;
+      background-color: #003897;
+      color: #FFFFFF !important;
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 600;
+      font-family: Inter, Arial, sans-serif;
+      padding: 14px 32px;
+      border-radius: 24px;
+      box-shadow: 0 6px 12px rgba(0, 0, 0, 0.03);
+      mso-padding-alt: 14px 32px;
+    }
+    .divider {
+      border: 0;
+      border-top: 1px solid #EAEAEA;
+      margin: 0;
+    }
+    .details {
+      width: 100%;
+      margin: 8px 0 20px;
+      text-align: left;
+      border: 1px solid #EAEAEA;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .details td {
+      padding: 12px 16px;
+      font-size: 14px;
+      line-height: 20px;
+      border-bottom: 1px solid #F0F0F0;
+      color: #2D2D2E;
+    }
+    .details tr:last-child td { border-bottom: 0; }
+    .details .label {
+      width: 38%;
+      color: #9E9E9E;
+      font-weight: 500;
+      background: #FAFBFC;
+    }
+    .quote {
+      margin: 8px 0 20px;
+      padding: 14px 16px;
+      background: #F5F6F7;
+      border-radius: 12px;
+      color: #5C5C5E;
+      font-size: 14px;
+      line-height: 20px;
+      text-align: left;
+      font-style: italic;
+    }
+    .info-box {
+      margin: 8px 0 16px;
+      padding: 12px 16px;
+      background: #F5F6F7;
+      border-radius: 12px;
+      color: #2D2D2E;
+      font-size: 14px;
+      line-height: 20px;
+    }
+    .fallback {
+      margin: 0 0 8px;
+      color: #9E9E9E;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .fallback-url {
+      margin: 0 0 16px;
+      padding: 10px 14px;
+      background: #F5F6F7;
+      border-radius: 8px;
+      color: #5C5C5E;
+      font-size: 12px;
+      word-break: break-all;
+      font-family: 'Courier New', Courier, monospace;
+      text-align: left;
+    }
+    .support {
+      padding: 24px 36px;
+      text-align: center;
+      color: #5C5C5E;
+      font-size: 14px;
+      line-height: 18px;
+    }
+    .support a {
+      color: #003897;
+      font-weight: 600;
+      text-decoration: none;
+    }
+    .social { text-align: center; padding: 0 0 20px; }
+    .social a {
+      display: inline-block;
+      width: 32px;
+      height: 32px;
+      margin: 0 6px;
+      background: #F5F6F7;
+      border-radius: 16px;
+      color: #2D2D2E;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 32px;
+      text-decoration: none;
+      text-align: center;
+    }
+    .nav-links {
+      text-align: center;
+      padding: 0 24px 24px;
+      color: #5C5C5E;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .nav-links a { color: #5C5C5E; text-decoration: none; }
+    .nav-sep { color: #9E9E9E; margin: 0 6px; }
+    .legal {
+      padding: 0 36px 20px;
+      text-align: center;
+      color: #9E9E9E;
+      font-size: 14px;
+      line-height: 18px;
+    }
+    .copyright {
+      padding: 0 36px 36px;
+      text-align: center;
+      color: #9E9E9E;
+      font-size: 12px;
+      line-height: 14px;
+    }
+    @media only screen and (max-width: 620px) {
+      .body, .support, .legal { padding-left: 24px !important; padding-right: 24px !important; }
+      .headline { font-size: 22px !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+      <tr>
+        <td align="center">
+          <table role="presentation" class="card" width="600" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;width:100%;background:#FFFFFF;border-radius:24px;overflow:hidden;">
+            {# ── Brand header ─────────────────────────────────────────── #}
+            <tr>
+              <td class="header" height="180" style="background-color:#003897;padding:56px 24px;height:180px;min-height:180px;text-align:center;vertical-align:middle;">
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center" style="margin:0 auto;">
+                  <tr>
+                    <td style="padding:0 18px;vertical-align:middle;">
+                      <img src="{{ sparkle_url }}" width="20" height="20" alt="" style="display:block;width:20px;height:20px;border:0;" />
+                    </td>
+                    <td style="padding:0;vertical-align:middle;">
+                      <a href="{{ frontend_url }}" style="text-decoration:none;">
+                        <img src="{{ logo_url }}" width="160" height="38" alt="{{ app_name }}" style="display:block;width:160px;height:auto;max-width:160px;border:0;" />
+                      </a>
+                    </td>
+                    <td style="padding:0 18px;vertical-align:middle;">
+                      <img src="{{ sparkle_url }}" width="20" height="20" alt="" style="display:block;width:20px;height:20px;border:0;" />
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            {# ── Main content ─────────────────────────────────────────── #}
+            <tr>
+              <td class="body" style="padding:32px 36px 24px;text-align:center;">
+                {% block content %}{% endblock %}
+              </td>
+            </tr>
+
+            {# ── Shared footer ────────────────────────────────────────── #}
+            <tr>
+              <td style="padding:0;">
+                <hr class="divider" style="border:0;border-top:1px solid #EAEAEA;margin:0;" />
+              </td>
+            </tr>
+            <tr>
+              <td class="support" style="padding:24px 36px;text-align:center;color:#5C5C5E;font-size:14px;line-height:18px;">
+                If you have any questions, please visit our
+                <a href="{{ faq_url }}" style="color:#003897;font-weight:600;text-decoration:none;">FAQs</a>
+                or email us at
+                <a href="mailto:{{ support_email }}" style="color:#003897;font-weight:600;text-decoration:none;">{{ support_email }}</a>.
+                Our team can answer questions about your account or help you with your journey.
+              </td>
+            </tr>
+            <tr>
+              <td class="social" style="text-align:center;padding:0 0 20px;">
+                <a href="{{ social_facebook_url }}" style="display:inline-block;margin:0 6px;text-decoration:none;">
+                  <img src="{{ icon_facebook_url }}" width="32" height="32" alt="Facebook" style="display:block;width:32px;height:32px;border:0;" />
+                </a>
+                <a href="{{ social_instagram_url }}" style="display:inline-block;margin:0 6px;text-decoration:none;">
+                  <img src="{{ icon_instagram_url }}" width="32" height="32" alt="Instagram" style="display:block;width:32px;height:32px;border:0;" />
+                </a>
+                <a href="{{ social_x_url }}" style="display:inline-block;margin:0 6px;text-decoration:none;">
+                  <img src="{{ icon_x_url }}" width="32" height="32" alt="X" style="display:block;width:32px;height:32px;border:0;" />
+                </a>
+                <a href="{{ social_youtube_url }}" style="display:inline-block;margin:0 6px;text-decoration:none;">
+                  <img src="{{ icon_youtube_url }}" width="32" height="32" alt="YouTube" style="display:block;width:32px;height:32px;border:0;" />
+                </a>
+              </td>
+            </tr>
+            <tr>
+              <td class="nav-links" style="text-align:center;padding:0 24px 24px;color:#5C5C5E;font-size:12px;font-weight:500;">
+                <a href="{{ how_it_works_url }}" style="color:#5C5C5E;text-decoration:none;">How it works</a>
+                <span class="nav-sep" style="color:#9E9E9E;margin:0 6px;">|</span>
+                <a href="{{ faq_url }}" style="color:#5C5C5E;text-decoration:none;">FAQs</a>
+                <span class="nav-sep" style="color:#9E9E9E;margin:0 6px;">|</span>
+                <a href="{{ terms_url }}" style="color:#5C5C5E;text-decoration:none;">T&amp;Cs</a>
+                <span class="nav-sep" style="color:#9E9E9E;margin:0 6px;">|</span>
+                <a href="{{ privacy_url }}" style="color:#5C5C5E;text-decoration:none;">Privacy Policy</a>
+              </td>
+            </tr>
+            <tr>
+              <td class="legal" style="padding:0 36px 20px;text-align:center;color:#9E9E9E;font-size:14px;line-height:18px;">
+                You have received this email as a registered user of {{ app_name }}.
+                To stop receiving similar service messages, or to manage your communication preferences,
+                please visit your <a href="{{ account_settings_url }}" style="color:#9E9E9E;">Account Settings</a>.
+              </td>
+            </tr>
+            <tr>
+              <td class="copyright" style="padding:0 36px 36px;text-align:center;color:#9E9E9E;font-size:12px;line-height:14px;">
+                &copy; {{ year }} {{ app_name }}. All rights reserved.
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </div>
+</body>
+</html>

@@ -15,3 +15,8 @@ Need to reschedule or cancel again? Please do so at least {{ notice_hours }}
 hours before the session via your {{ app_name }} dashboard.
 
 — The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}

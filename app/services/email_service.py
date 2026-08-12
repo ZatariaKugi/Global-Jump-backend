@@ -25,6 +25,18 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 _TEMPLATES_DIR = pathlib.Path(__file__).parent.parent / "templates" / "email"
+_EMAIL_ASSETS_DIR = pathlib.Path(__file__).resolve().parents[2] / "public" / "email"
+
+# Inline brand images (PNG). SVG is blocked by Gmail/Outlook; CID avoids relying
+# on a publicly reachable API host for every recipient's mail client.
+_BRAND_CID_ASSETS: tuple[tuple[str, str], ...] = (
+    ("gj-logo", "logo.png"),
+    ("gj-sparkle", "sparkle.png"),
+    ("gj-facebook", "facebook.png"),
+    ("gj-instagram", "instagram.png"),
+    ("gj-x", "x.png"),
+    ("gj-youtube", "youtube.png"),
+)
 
 _jinja = Environment(
     loader=FileSystemLoader(str(_TEMPLATES_DIR)),
@@ -32,8 +44,57 @@ _jinja = Environment(
 )
 
 
-def _render(template_name: str, ctx: dict[str, object]) -> str:
-    return str(_jinja.get_template(template_name).render(**ctx))
+def _brand_cid_attachments() -> list[dict[str, object]]:
+    attachments: list[dict[str, object]] = []
+    for cid, filename in _BRAND_CID_ASSETS:
+        path = _EMAIL_ASSETS_DIR / filename
+        if not path.is_file():
+            logger.warning("email_brand_asset_missing", path=str(path))
+            continue
+        attachments.append(
+            {
+                "file": str(path),
+                "headers": {
+                    "Content-ID": f"<{cid}>",
+                    "Content-Disposition": f'inline; filename="{filename}"',
+                },
+                "mime_type": "image",
+                "mime_subtype": "png",
+            }
+        )
+    return attachments
+
+
+def _brand_defaults(settings: Settings) -> dict[str, object]:
+    frontend = settings.FRONTEND_URL.rstrip("/")
+    return {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "year": datetime.now(UTC).year,
+        "frontend_url": frontend,
+        "support_email": "help@globaljump.com",
+        "faq_url": f"{frontend}/faqs",
+        "how_it_works_url": f"{frontend}/how-it-works",
+        "terms_url": f"{frontend}/terms",
+        "privacy_url": f"{frontend}/privacy",
+        "account_settings_url": f"{frontend}/settings",
+        "social_facebook_url": "https://www.facebook.com/globaljump",
+        "social_instagram_url": "https://www.instagram.com/globaljump",
+        "social_x_url": "https://x.com/globaljump",
+        "social_youtube_url": "https://www.youtube.com/@globaljump",
+        # CID refs match Content-ID on inline PNG attachments.
+        "logo_url": "cid:gj-logo",
+        "sparkle_url": "cid:gj-sparkle",
+        "icon_facebook_url": "cid:gj-facebook",
+        "icon_instagram_url": "cid:gj-instagram",
+        "icon_x_url": "cid:gj-x",
+        "icon_youtube_url": "cid:gj-youtube",
+    }
+
+
+def _render(template_name: str, ctx: dict[str, object], settings: Settings) -> str:
+    """Render an email template with shared Global Jump brand defaults."""
+    merged = {**_brand_defaults(settings), **ctx}
+    return str(_jinja.get_template(template_name).render(**merged))
 
 
 # SendGrid rewrites links/embeds tracking pixels by default, which routes mail through a
@@ -55,9 +116,18 @@ def _build_message(**kwargs: object) -> MessageSchema | None:
     """Build a MessageSchema, or ``None`` when the recipient fails email validation.
 
     Reserved TLDs used in seed data (e.g. ``*.test``) raise pydantic
-    ``ValidationError`` on ``recipients`` — callers must treat that as a
-    soft skip so account mutations never 500 on mail construction.
+    ``ValidationError`` on ``recipients`` — callers must treat that as a soft skip
+    so account mutations never 500 on mail construction.
+
+    Brand PNG icons are always attached inline (CID) so HTML templates can
+    reference ``cid:gj-logo`` etc. without an external image host.
     """
+    existing = kwargs.get("attachments")
+    brand = _brand_cid_attachments()
+    if isinstance(existing, list):
+        kwargs["attachments"] = [*existing, *brand]
+    elif brand:
+        kwargs["attachments"] = brand
     try:
         return MessageSchema(**kwargs)
     except ValidationError as exc:
@@ -108,8 +178,8 @@ async def send_verification_email(
         )
         return
 
-    html_body = _render("verify_email.html", ctx)
-    text_body = _render("verify_email.txt", ctx)
+    html_body = _render("verify_email.html", ctx, settings)
+    text_body = _render("verify_email.txt", ctx, settings)
 
     message = _build_message(
         subject=f"Verify your email address – {settings.EMAILS_FROM_NAME}",
@@ -166,9 +236,9 @@ async def send_advisor_welcome_email(
     message = _build_message(
         subject=f"Welcome to {settings.EMAILS_FROM_NAME} — you're approved!",
         recipients=[to],
-        body=_render("advisor_welcome.html", ctx),
+        body=_render("advisor_welcome.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("advisor_welcome.txt", ctx),
+        alternative_body=_render("advisor_welcome.txt", ctx, settings),
         headers={
             "X-Priority": "3",
             "X-Mailer": settings.EMAILS_FROM_NAME,
@@ -220,9 +290,9 @@ async def send_advisor_rejected_email(
     message = _build_message(
         subject=f"Your {settings.EMAILS_FROM_NAME} advisor application",
         recipients=[to],
-        body=_render("advisor_rejected.html", ctx),
+        body=_render("advisor_rejected.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("advisor_rejected.txt", ctx),
+        alternative_body=_render("advisor_rejected.txt", ctx, settings),
         headers={
             "X-Priority": "3",
             "X-Mailer": settings.EMAILS_FROM_NAME,
@@ -270,9 +340,9 @@ async def send_advisor_pending_email(
     message = _build_message(
         subject=f"Your {settings.EMAILS_FROM_NAME} application is pending review",
         recipients=[to],
-        body=_render("advisor_pending.html", ctx),
+        body=_render("advisor_pending.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("advisor_pending.txt", ctx),
+        alternative_body=_render("advisor_pending.txt", ctx, settings),
         headers={
             "X-Priority": "3",
             "X-Mailer": settings.EMAILS_FROM_NAME,
@@ -319,8 +389,8 @@ async def send_password_reset_email(
         )
         return
 
-    html_body = _render("reset_password.html", ctx)
-    text_body = _render("reset_password.txt", ctx)
+    html_body = _render("reset_password.html", ctx, settings)
+    text_body = _render("reset_password.txt", ctx, settings)
 
     message = _build_message(
         subject=f"Reset your {settings.EMAILS_FROM_NAME} password",
@@ -382,9 +452,9 @@ async def send_payment_receipt_email(
     message = _build_message(
         subject=f"Payment receipt – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
-        body=_render("payment_receipt.html", ctx),
+        body=_render("payment_receipt.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("payment_receipt.txt", ctx),
+        alternative_body=_render("payment_receipt.txt", ctx, settings),
         headers={
             "X-Priority": "3",
             "X-Mailer": settings.EMAILS_FROM_NAME,
@@ -489,9 +559,9 @@ async def send_booking_confirmation_email(
     message = _build_message(
         subject=f"Booking confirmed – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
-        body=_render("booking_confirmation.html", ctx),
+        body=_render("booking_confirmation.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("booking_confirmation.txt", ctx),
+        alternative_body=_render("booking_confirmation.txt", ctx, settings),
         attachments=[
             {
                 "file": ics_upload,
@@ -568,9 +638,9 @@ async def send_booking_meeting_email(
     message = _build_message(
         subject=subject,
         recipients=[to],
-        body=_render("booking_meeting.html", ctx),
+        body=_render("booking_meeting.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("booking_meeting.txt", ctx),
+        alternative_body=_render("booking_meeting.txt", ctx, settings),
         headers={
             "X-Priority": "3",
             "X-Mailer": settings.EMAILS_FROM_NAME,
@@ -624,9 +694,9 @@ async def send_new_consultation_request_email(
     message = _build_message(
         subject=f"New consultation request – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
-        body=_render("new_consultation_request.html", ctx),
+        body=_render("new_consultation_request.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("new_consultation_request.txt", ctx),
+        alternative_body=_render("new_consultation_request.txt", ctx, settings),
         headers={
             "X-Priority": "3",
             "X-Mailer": settings.EMAILS_FROM_NAME,
@@ -682,9 +752,9 @@ async def send_booking_rejected_email(
     message = _build_message(
         subject=f"Consultation request declined – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
-        body=_render("booking_rejected.html", ctx),
+        body=_render("booking_rejected.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("booking_rejected.txt", ctx),
+        alternative_body=_render("booking_rejected.txt", ctx, settings),
         headers={
             "X-Priority": "3",
             "X-Mailer": settings.EMAILS_FROM_NAME,
@@ -759,9 +829,9 @@ async def send_booking_rescheduled_email(
     message = _build_message(
         subject=f"Consultation rescheduled – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
-        body=_render("booking_rescheduled.html", ctx),
+        body=_render("booking_rescheduled.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("booking_rescheduled.txt", ctx),
+        alternative_body=_render("booking_rescheduled.txt", ctx, settings),
         attachments=[
             {
                 "file": ics_upload,
@@ -829,9 +899,9 @@ async def send_booking_cancelled_email(
     message = _build_message(
         subject=f"Consultation cancelled – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
-        body=_render("booking_cancelled.html", ctx),
+        body=_render("booking_cancelled.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("booking_cancelled.txt", ctx),
+        alternative_body=_render("booking_cancelled.txt", ctx, settings),
         headers={
             "X-Priority": "3",
             "X-Mailer": settings.EMAILS_FROM_NAME,
@@ -888,9 +958,9 @@ async def send_advisor_payment_notification_email(
     message = _build_message(
         subject=f"Payment received – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
-        body=_render("advisor_payment_received.html", ctx),
+        body=_render("advisor_payment_received.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("advisor_payment_received.txt", ctx),
+        alternative_body=_render("advisor_payment_received.txt", ctx, settings),
         headers={
             "X-Priority": "3",
             "X-Mailer": settings.EMAILS_FROM_NAME,
@@ -944,9 +1014,9 @@ async def send_new_message_email(
     message = _build_message(
         subject=f"New message from {sender_name} – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
-        body=_render("new_message.html", ctx),
+        body=_render("new_message.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("new_message.txt", ctx),
+        alternative_body=_render("new_message.txt", ctx, settings),
         headers={
             "X-Priority": "3",
             "X-Mailer": settings.EMAILS_FROM_NAME,
@@ -1005,9 +1075,9 @@ async def send_booking_note_added_email(
     message = _build_message(
         subject=f"New note on your consultation – {settings.EMAILS_FROM_NAME}",
         recipients=[to],
-        body=_render("booking_note_added.html", ctx),
+        body=_render("booking_note_added.html", ctx, settings),
         subtype=MessageType.html,
-        alternative_body=_render("booking_note_added.txt", ctx),
+        alternative_body=_render("booking_note_added.txt", ctx, settings),
         headers={
             "X-Priority": "3",
             "X-Mailer": settings.EMAILS_FROM_NAME,
