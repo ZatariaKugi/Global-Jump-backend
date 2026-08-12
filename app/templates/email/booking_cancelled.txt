@@ -10,3 +10,8 @@ The following consultation has been cancelled{% if cancelled_by %} by {{ cancell
 You can book a new consultation any time from your {{ app_name }} dashboard.
 
 — The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}

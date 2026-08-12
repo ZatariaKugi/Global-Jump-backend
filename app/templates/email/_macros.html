@@ -1,0 +1,38 @@
+{# Reusable fragments for Global Jump transactional emails. #}
+
+{% macro cta(url, label) -%}
+  <div class="btn-wrap" style="text-align:center;padding:8px 0 28px;">
+    <a href="{{ url }}" class="btn" style="display:inline-block;background-color:#003897;color:#FFFFFF !important;text-decoration:none;font-size:14px;font-weight:600;padding:14px 32px;border-radius:24px;">{{ label }}</a>
+  </div>
+{%- endmacro %}
+
+{% macro headline(text) -%}
+  <h1 class="headline" style="margin:0 0 16px;color:#2D2D2E;font-size:24px;font-weight:700;line-height:32px;">{{ text }}</h1>
+{%- endmacro %}
+
+{% macro paragraph(text) -%}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;font-weight:400;line-height:22px;">{{ text }}</p>
+{%- endmacro %}
+
+{% macro info_box(text) -%}
+  <div class="info-box" style="margin:8px 0 16px;padding:12px 16px;background:#F5F6F7;border-radius:12px;color:#2D2D2E;font-size:14px;line-height:20px;">{{ text }}</div>
+{%- endmacro %}
+
+{% macro quote(text) -%}
+  <div class="quote" style="margin:8px 0 20px;padding:14px 16px;background:#F5F6F7;border-radius:12px;color:#5C5C5E;font-size:14px;line-height:20px;text-align:left;font-style:italic;">{{ text }}</div>
+{%- endmacro %}
+
+{% macro details_open() -%}
+  <table role="presentation" class="details" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;margin:8px 0 20px;text-align:left;border:1px solid #EAEAEA;border-radius:12px;overflow:hidden;">
+{%- endmacro %}
+
+{% macro details_row(label, value) -%}
+  <tr>
+    <td class="label" style="padding:12px 16px;font-size:14px;line-height:20px;border-bottom:1px solid #F0F0F0;width:38%;color:#9E9E9E;font-weight:500;background:#FAFBFC;">{{ label }}</td>
+    <td style="padding:12px 16px;font-size:14px;line-height:20px;border-bottom:1px solid #F0F0F0;color:#2D2D2E;">{{ value }}</td>
+  </tr>
+{%- endmacro %}
+
+{% macro details_close() -%}
+  </table>
+{%- endmacro %}

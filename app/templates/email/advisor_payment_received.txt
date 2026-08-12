@@ -12,3 +12,8 @@ scheduled per your payout settings.
 You can view the transaction details from your {{ app_name }} dashboard at any time.
 
 — The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}

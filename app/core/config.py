@@ -94,6 +94,10 @@ class Settings(BaseSettings):
     EMAILS_FROM: str = "noreply@globlejump.io"
     EMAILS_FROM_NAME: str = "GlobleJump"
     FRONTEND_URL: str = "http://localhost:3000"
+    # Absolute public API origin used for email asset URLs (logo / social icons).
+    # Example: https://stg-api.globaljump.com  — falls back to GOOGLE_REDIRECT_URI host
+    # then http://localhost:8000 when unset.
+    PUBLIC_API_URL: str | None = None
 
     # Encryption & file storage ---------------------------------------------
     ENCRYPTION_KEY: str = ""  # base64url-encoded 32-byte key (AES-256)
@@ -206,6 +210,19 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return Environment.production == self.ENVIRONMENT
+
+    @property
+    def public_api_url(self) -> str:
+        """Origin for publicly reachable API URLs (email images, etc.)."""
+        if self.PUBLIC_API_URL:
+            return self.PUBLIC_API_URL.rstrip("/")
+        if self.GOOGLE_REDIRECT_URI:
+            from urllib.parse import urlsplit
+
+            parts = urlsplit(self.GOOGLE_REDIRECT_URI)
+            if parts.scheme and parts.netloc:
+                return f"{parts.scheme}://{parts.netloc}"
+        return "http://localhost:8000"
 
     @property
     def external_auth_enabled(self) -> bool:

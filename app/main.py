@@ -79,6 +79,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
+    # Brand assets for transactional emails (logo, social icons, sparkles).
+    app.mount(
+        "/static",
+        StaticFiles(directory="public"),
+        name="static",
+    )
 
     app.include_router(health.router)  # /health, /readiness at root
     app.include_router(api_router, prefix=settings.API_V1_PREFIX)
