@@ -90,4 +90,6 @@ class Booking(BaseModel):
     meeting_platform: Mapped[str | None] = mapped_column(String(100), nullable=True)
     meeting_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     meeting_passcode: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    meeting_join_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    meeting_start_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     meeting_recording_url: Mapped[str | None] = mapped_column(String(500), nullable=True)

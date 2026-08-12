@@ -124,6 +124,8 @@ class BookingRead(BaseModel):
     can_reschedule: bool = False
     can_cancel: bool = False
     cancellation_notice_hours: int = 24
+    meeting_join_url: str | None = None
+    meeting_start_url: str | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -177,6 +179,9 @@ class BookingMeetingRead(BaseModel):
     label: str
     time_range: str
     date: str
+    join_url: str | None = None
+    start_url: str | None = None
+    passcode: str | None = None
 
 
 class BookingAiSuggestionRead(BaseModel):

@@ -36,7 +36,12 @@ from app.schemas.payment import (
     TransactionAdvisorRead,
     TransactionFinanceRead,
 )
-from app.services import email_service, notification_service
+from app.services import (
+    booking_meeting_service,
+    email_service,
+    notification_service,
+    zoom_connection_service,
+)
 
 log = structlog.get_logger()
 
@@ -141,6 +146,7 @@ def _sync_connect_flags(profile: AdvisorProfile, account: object) -> None:
     profile.stripe_charges_enabled = bool(_stripe_get(account, "charges_enabled", False))
     profile.stripe_payouts_enabled = bool(_stripe_get(account, "payouts_enabled", False))
     profile.stripe_details_submitted = bool(_stripe_get(account, "details_submitted", False))
+    zoom_connection_service.sync_stripe_connect_flag(profile)
 
 
 async def create_checkout_session(
@@ -168,8 +174,13 @@ async def create_checkout_session(
     # transfers before a seeker can pay them — otherwise funds would land on the
     # platform with no destination for the delayed payout.
     advisor_profile = await _get_advisor_profile(session, booking.advisor_id)
-    if not (advisor_profile.stripe_account_id and advisor_profile.stripe_charges_enabled):
+    if advisor_profile.needs_stripe_connect:
         raise AppError("Advisor is not set up to receive payments yet", code="advisor_not_payable")
+    if settings.zoom_oauth_enabled and advisor_profile.needs_zoom_connect:
+        raise AppError(
+            "Advisor has not connected Zoom for video consultations yet",
+            code="advisor_zoom_not_connected",
+        )
 
     # Resume an existing open Checkout Session instead of hard-failing.
     existing = (
@@ -488,6 +499,7 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
             body=f"Your client paid ${txn.amount_usd:.2f} for {booking.service_type}",
             actor_id=booking.seeker_id,
         )
+        await booking_meeting_service.maybe_provision_meeting(session, booking, settings)
     await _log_event(session, txn.id, TransactionEventType.receipt_sent)
     await _log_event(session, txn.id, TransactionEventType.closed)
 

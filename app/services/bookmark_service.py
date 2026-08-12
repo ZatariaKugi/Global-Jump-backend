@@ -38,6 +38,8 @@ async def _require_approved_advisor(session: AsyncSession, advisor_id: uuid.UUID
         or advisor.verification_status != VerificationStatus.approved
     ):
         raise NotFoundError("Advisor not found")
+    if not await advisor_search_service.is_integrations_ready(session, advisor_id):
+        raise NotFoundError("Advisor not found")
     return advisor
 
 
@@ -143,6 +145,7 @@ def list_for_seeker_stmt(
         .where(AdvisorBookmark.seeker_id == seeker_id)
         .where(AdvisorBookmark.is_archived.is_(False))
     )
+    stmt = advisor_search_service.apply_integrations_ready_filter(stmt)
     if q:
         pattern = f"%{q.strip()}%"
         stmt = stmt.where(

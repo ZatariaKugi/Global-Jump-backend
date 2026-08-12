@@ -69,6 +69,7 @@ from app.models.transaction import Transaction
 from app.models.transaction_event import TransactionEvent
 from app.models.user import User
 from app.models.visa_type import VisaType
+from app.models.zoom_connection import ZoomConnection, ZoomConnectionStatus
 
 __all__ = [
     "AdminProfile",
@@ -130,4 +131,6 @@ __all__ = [
     "SupportTicket",
     "TicketMessage",
     "TicketMessageAttachment",
+    "ZoomConnection",
+    "ZoomConnectionStatus",
 ]

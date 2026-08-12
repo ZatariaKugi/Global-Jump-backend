@@ -400,7 +400,9 @@ async def get_booking_details(
     """View Booking Details drawer (customer, service, payment, attachments, meeting)."""
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
     seeker, _advisor = await _party_names(session, booking)
-    data = await booking_service.build_details(session, booking, seeker)
+    data = await booking_service.build_details(
+        session, booking, seeker, viewer_user_id=current_user.id
+    )
     return ResponseEnvelope[BookingDetailsRead](data=data, meta=Meta(request_id=request_id))
 
 
@@ -413,7 +415,7 @@ async def accept_booking(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
-    booking = await booking_service.accept(session, booking, current_user.id)
+    booking = await booking_service.accept(session, booking, current_user.id, settings)
     await _send_confirmations(session, booking, settings)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
@@ -572,7 +574,7 @@ async def reschedule_booking(
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
     booking = await booking_service.reschedule(
-        session, booking, current_user.id, data.scheduled_start
+        session, booking, current_user.id, data.scheduled_start, settings
     )
     await _send_reschedule_notifications(session, booking, settings)
     seeker, advisor = await _party_names(session, booking)

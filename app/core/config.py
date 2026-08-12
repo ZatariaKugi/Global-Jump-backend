@@ -73,6 +73,17 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: str | None = None
     GOOGLE_REDIRECT_URI: str | None = None
 
+    # Integrations — Zoom OAuth (user-managed / authorization-code flow) ----
+    # ZOOM_REDIRECT_URI must match the Zoom Marketplace Redirect URL
+    # byte-for-byte, including the /api/v1 prefix, e.g.
+    # http://127.0.0.1:8020/api/v1/integrations/zoom/callback
+    # (Zoom rejects "localhost"; use 127.0.0.1 for local HTTP testing)
+    ZOOM_CLIENT_ID: str | None = None
+    ZOOM_CLIENT_SECRET: str | None = None
+    ZOOM_REDIRECT_URI: str | None = None
+    # Where the Zoom callback redirects advisors after connect/disconnect errors.
+    ZOOM_FRONTEND_RETURN_PATH: str = "/advisor/profile"
+
     # Email ---------------------------------------------------------------
     SMTP_HOST: str | None = None
     SMTP_PORT: int = 587
@@ -162,6 +173,9 @@ class Settings(BaseSettings):
         "GOOGLE_CLIENT_ID",
         "GOOGLE_CLIENT_SECRET",
         "GOOGLE_REDIRECT_URI",
+        "ZOOM_CLIENT_ID",
+        "ZOOM_CLIENT_SECRET",
+        "ZOOM_REDIRECT_URI",
         "FIREBASE_CREDENTIALS_FILE",
         mode="before",
     )
@@ -202,6 +216,10 @@ class Settings(BaseSettings):
         return bool(
             self.GOOGLE_CLIENT_ID and self.GOOGLE_CLIENT_SECRET and self.GOOGLE_REDIRECT_URI
         )
+
+    @property
+    def zoom_oauth_enabled(self) -> bool:
+        return bool(self.ZOOM_CLIENT_ID and self.ZOOM_CLIENT_SECRET and self.ZOOM_REDIRECT_URI)
 
     @property
     def push_enabled(self) -> bool:

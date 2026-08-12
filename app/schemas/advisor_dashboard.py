@@ -83,3 +83,6 @@ class AdvisorDashboardRead(BaseModel):
     stats: DashboardStats
     regulatory_updates: list[RegulatoryUpdateRead]  # newest first, capped for the card
     client_inquiries: list[ClientInquiryRead]  # most-recent threads, capped for the card
+    # Persistent connect banners (NOT windowed by ``days``). FE shows while true.
+    needs_stripe_connect: bool
+    needs_zoom_connect: bool

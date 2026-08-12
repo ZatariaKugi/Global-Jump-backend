@@ -23,6 +23,7 @@ from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.assessment import AdvisorMatchRead
 from app.services import matching_weights_service, review_service
 from app.services.advisor_profile_service import starting_price_usd
+from app.services.advisor_search_service import apply_integrations_ready_filter
 from app.services.matching_weights_service import DEFAULT_CONFIG, MatchingWeightConfig
 
 DEFAULT_LIMIT = 5
@@ -137,6 +138,8 @@ async def match(
         .where(User.is_active.is_(True))
         .where(User.verification_status == VerificationStatus.approved)
     )
+    # Reuse discovery gate: Stripe ready (+ Zoom when configured).
+    stmt = apply_integrations_ready_filter(stmt)
     rows = (await session.execute(stmt)).all()
     advisor_ids = [user.id for user, _ in rows]
     ratings = await review_service.rating_summaries(session, advisor_ids)

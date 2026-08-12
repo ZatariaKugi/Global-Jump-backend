@@ -171,3 +171,11 @@ class AdvisorProfile(BaseModel):
     stripe_details_submitted: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False
     )
+
+    # Integration onboarding banners — synced when Stripe/Zoom state changes.
+    needs_stripe_connect: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", nullable=False
+    )
+    needs_zoom_connect: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", nullable=False
+    )

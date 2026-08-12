@@ -524,6 +524,75 @@ async def send_booking_confirmation_email(
         )
 
 
+async def send_booking_meeting_email(
+    to: str,
+    full_name: str,
+    other_party: str,
+    *,
+    service_type: str,
+    start_utc: datetime,
+    duration_minutes: int,
+    meeting_url: str,
+    passcode: str | None,
+    is_host: bool,
+    settings: Settings,
+) -> None:
+    """Send Zoom join (seeker) or start (advisor host) link after meeting is provisioned."""
+    ctx = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "other_party": other_party,
+        "service_type": service_type,
+        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "duration_minutes": duration_minutes,
+        "meeting_url": meeting_url,
+        "passcode": passcode,
+        "is_host": is_host,
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info(
+            "booking_meeting_issued [no smtp — logged]",
+            to=to,
+            is_host=is_host,
+            meeting_url=meeting_url,
+        )
+        return
+
+    subject = (
+        f"Host link for your consultation – {settings.EMAILS_FROM_NAME}"
+        if is_host
+        else f"Join your video consultation – {settings.EMAILS_FROM_NAME}"
+    )
+    message = _build_message(
+        subject=subject,
+        recipients=[to],
+        body=_render("booking_meeting.html", ctx),
+        subtype=MessageType.html,
+        alternative_body=_render("booking_meeting.txt", ctx),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
+        return
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("booking_meeting_sent", to=to, is_host=is_host)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "booking_meeting_failed_smtp_unavailable",
+            to=to,
+            is_host=is_host,
+            error=str(exc),
+        )
+
+
 async def send_new_consultation_request_email(
     to: str,
     full_name: str,

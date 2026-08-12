@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import re
 import secrets
+import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from sqlalchemy import ScalarSelect, Select, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.models.advisor_profile import (
     AdvisorCountryExpertise,
     AdvisorLanguage,
@@ -73,11 +75,50 @@ def _review_count_subquery() -> ScalarSelect[Any]:
     )
 
 
+def apply_integrations_ready_filter(
+    stmt: Select[Any],
+    *,
+    require_zoom: bool | None = None,
+) -> Select[Any]:
+    """Hide advisors missing Stripe Connect readiness (and Zoom when configured).
+
+    Requires ``User`` and ``AdvisorProfile`` in the statement's FROM/JOIN.
+    When Zoom OAuth is not configured, the Zoom gate is skipped so local/dev
+    environments without Zoom credentials still show the marketplace.
+    """
+    if require_zoom is None:
+        require_zoom = get_settings().zoom_oauth_enabled
+    stmt = stmt.where(AdvisorProfile.needs_stripe_connect.is_(False))
+    if require_zoom:
+        stmt = stmt.where(AdvisorProfile.needs_zoom_connect.is_(False))
+    return stmt
+
+
+async def is_integrations_ready(
+    session: AsyncSession,
+    advisor_user_id: uuid.UUID,
+    *,
+    require_zoom: bool | None = None,
+) -> bool:
+    """True when Stripe payouts are ready (and Zoom connected when configured)."""
+    if require_zoom is None:
+        require_zoom = get_settings().zoom_oauth_enabled
+    profile = (
+        await session.execute(
+            select(AdvisorProfile).where(AdvisorProfile.user_id == advisor_user_id)
+        )
+    ).scalar_one_or_none()
+    if profile is None or profile.needs_stripe_connect:
+        return False
+    return not (require_zoom and profile.needs_zoom_connect)
+
+
 def build_search_stmt(filters: AdvisorSearchFilters) -> Select[tuple[User]]:
     """Build a ``User`` select for approved advisors matching the given filters.
 
     All multi-valued filters run as ``EXISTS`` subqueries against the normalised
-    child tables (no JSON columns).
+    child tables (no JSON columns). Public discovery also requires Stripe, and
+    Zoom when Zoom OAuth is configured.
     """
     stmt = (
         select(User)
@@ -86,6 +127,7 @@ def build_search_stmt(filters: AdvisorSearchFilters) -> Select[tuple[User]]:
         .where(User.is_active.is_(True))
         .where(User.verification_status == VerificationStatus.approved)
     )
+    stmt = apply_integrations_ready_filter(stmt)
 
     if filters.q:
         pattern = f"%{filters.q.strip()}%"

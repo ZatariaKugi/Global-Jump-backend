@@ -16,6 +16,7 @@ from app.api.v1 import (
     conversations,
     countries,
     devices,
+    integrations_zoom,
     notifications,
     payments,
     reviews,
@@ -42,5 +43,7 @@ api_router.include_router(notifications.router)
 api_router.include_router(assessments.router)
 api_router.include_router(uploads.router)
 api_router.include_router(tickets.router)
+api_router.include_router(integrations_zoom.advisor_router)
+api_router.include_router(integrations_zoom.router)
 api_router.include_router(admin.router)
 api_router.include_router(admin_profile.router)

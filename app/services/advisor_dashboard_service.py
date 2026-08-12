@@ -194,6 +194,9 @@ async def get_dashboard(
         stats=stats,
         regulatory_updates=await _regulatory_updates(session, since, _REGULATORY_CARD_LIMIT),
         client_inquiries=await _client_inquiries(session, advisor, settings, _INQUIRIES_CARD_LIMIT),
+        needs_stripe_connect=profile.needs_stripe_connect,
+        # Hide Zoom banner when Zoom OAuth is not configured for this environment.
+        needs_zoom_connect=profile.needs_zoom_connect if settings.zoom_oauth_enabled else False,
     )
 
 

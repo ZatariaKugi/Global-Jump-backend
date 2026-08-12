@@ -334,6 +334,8 @@ async def get_advisor_by_slug(
         or user.verification_status != VerificationStatus.approved
     ):
         raise NotFoundError("Advisor not found")
+    if not await advisor_search_service.is_integrations_ready(session, user.id):
+        raise NotFoundError("Advisor not found")
     destination, match_visa = await _seeker_match_context(session, principal)
     avg, _count = await review_service.rating_summary(session, user.id)
     bookmarked = await _bookmarked_ids(session, principal, [user.id])
@@ -360,7 +362,14 @@ async def get_advisor_public_profile(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorProfilePublicRead]:
     user = await session.get(User, advisor_id)
-    if user is None or user.role != UserRole.advisor or not user.is_active:
+    if (
+        user is None
+        or user.role != UserRole.advisor
+        or not user.is_active
+        or user.verification_status != VerificationStatus.approved
+    ):
+        raise NotFoundError("Advisor not found")
+    if not await advisor_search_service.is_integrations_ready(session, user.id):
         raise NotFoundError("Advisor not found")
     result = await session.execute(
         select(AdvisorProfile).where(AdvisorProfile.user_id == advisor_id)
@@ -675,6 +684,10 @@ async def get_my_dashboard(
     Toolbar **Sort** (recommended/popular/recent) is not wired here — it belongs to
     the advisor discovery listing (``GET /advisors?sort=&recommended=``); the FE may
     hide it on this screen. **Export** → ``GET /advisors/me/dashboard/export``.
+
+    ``needs_stripe_connect`` / ``needs_zoom_connect`` are cached on ``advisor_profiles``
+    and synced when Stripe/Zoom state changes (not windowed by ``days``). CTA target:
+    ``/advisor/profile``.
     """
     profile = await advisor_profile_service.get_or_create(session, current_user.id)
     data = await advisor_dashboard_service.get_dashboard(

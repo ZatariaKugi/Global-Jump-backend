@@ -42,6 +42,7 @@ from app.schemas.booking import (
 from app.services import (
     availability_service,
     booking_document_service,
+    booking_meeting_service,
     booking_note_service,
     notification_service,
     payment_service,
@@ -223,6 +224,8 @@ def build_read(
         can_reschedule=can_reschedule,
         can_cancel=can_cancel,
         cancellation_notice_hours=cancellation_notice_hours,
+        meeting_join_url=booking.meeting_join_url if viewer_role == UserRole.seeker else None,
+        meeting_start_url=booking.meeting_start_url if viewer_role == UserRole.advisor else None,
     )
 
 
@@ -659,6 +662,7 @@ async def cancel(
     await payment_service.auto_refund_booking_if_paid(
         session, booking, actor_id, reason, settings
     )
+    await booking_meeting_service.remove_meeting(session, booking, settings)
     await _notify_booking(
         session,
         booking,
@@ -671,7 +675,11 @@ async def cancel(
 
 
 async def reschedule(
-    session: AsyncSession, booking: Booking, actor_id: uuid.UUID, new_start: datetime
+    session: AsyncSession,
+    booking: Booking,
+    actor_id: uuid.UUID,
+    new_start: datetime,
+    settings: Settings,
 ) -> Booking:
     _assert_active(booking)
     await _enforce_seeker_notice(session, booking, actor_id)
@@ -701,10 +709,16 @@ async def reschedule(
         type=NotificationType.booking_rescheduled,
         title="Booking rescheduled",
     )
+    await booking_meeting_service.sync_meeting_on_reschedule(session, booking, settings)
     return booking
 
 
-async def accept(session: AsyncSession, booking: Booking, actor_id: uuid.UUID) -> Booking:
+async def accept(
+    session: AsyncSession,
+    booking: Booking,
+    actor_id: uuid.UUID,
+    settings: Settings,
+) -> Booking:
     """Advisor accepts a pending request, confirming the appointment."""
     if actor_id != booking.advisor_id:
         raise PermissionDeniedError("Only the advisor can do this")
@@ -725,6 +739,7 @@ async def accept(session: AsyncSession, booking: Booking, actor_id: uuid.UUID) -
         type=NotificationType.booking_confirmed,
         title="Booking confirmed",
     )
+    await booking_meeting_service.maybe_provision_meeting(session, booking, settings)
     return booking
 
 
@@ -750,6 +765,7 @@ async def reject(
     await payment_service.auto_refund_booking_if_paid(
         session, booking, actor_id, reason, settings
     )
+    await booking_meeting_service.remove_meeting(session, booking, settings)
     await _notify_booking(
         session,
         booking,
@@ -808,6 +824,8 @@ async def expire_unaccepted_pending_bookings(
                 UNACCEPTED_BOOKING_EXPIRY_REASON,
                 settings,
             )
+
+        await booking_meeting_service.remove_meeting(session, booking, settings)
 
         await _notify_booking(
             session,
@@ -993,16 +1011,26 @@ def _file_format(file_name: str | None, content_type: str | None) -> str:
     return "FILE"
 
 
-def _meeting_read(booking: Booking) -> BookingMeetingRead:
+def _meeting_read(
+    booking: Booking,
+    *,
+    viewer_user_id: uuid.UUID | None = None,
+) -> BookingMeetingRead | None:
+    if not booking.meeting_join_url and not booking.meeting_start_url:
+        return None
     start = as_utc(booking.scheduled_start)
     end = as_utc(booking.scheduled_end)
     label = humanize_slug(booking.service_type) or "Consultation"
+    is_advisor = viewer_user_id is not None and viewer_user_id == booking.advisor_id
     return BookingMeetingRead(
         label=label,
         time_range=(
             f"{start.strftime('%I:%M %p').lstrip('0')} - {end.strftime('%I:%M %p').lstrip('0')} UTC"
         ),
         date=start.strftime("%d %b %Y"),
+        join_url=booking.meeting_join_url if not is_advisor else None,
+        start_url=booking.meeting_start_url if is_advisor else None,
+        passcode=booking.meeting_passcode,
     )
 
 
@@ -1010,6 +1038,8 @@ async def build_details(
     session: AsyncSession,
     booking: Booking,
     seeker: User | None,
+    *,
+    viewer_user_id: uuid.UUID | None = None,
 ) -> BookingDetailsRead:
     """View Booking Details drawer — payment, attachments, meeting, AI suggestions."""
     txn = (
@@ -1065,7 +1095,7 @@ async def build_details(
         amount_paid=amount_paid,
         description=description,
         attachments=attachments,
-        meeting=_meeting_read(booking),
+        meeting=_meeting_read(booking, viewer_user_id=viewer_user_id),
         ai_suggestions=ai_suggestions,
     )
 

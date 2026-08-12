@@ -671,7 +671,7 @@ async def reschedule_booking_admin(
     if booking is None:
         raise NotFoundError("Booking not found")
     booking = await booking_service.reschedule(
-        session, booking, admin_principal.id, data.scheduled_start
+        session, booking, admin_principal.id, data.scheduled_start, settings
     )
     await _send_reschedule_notifications(session, booking, settings)
     seeker, advisor = await _party_names(session, booking)
