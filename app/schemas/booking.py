@@ -133,6 +133,20 @@ class BookingRead(BaseModel):
         return self.review_id is not None
 
 
+class AdminBookingPickerRead(BaseModel):
+    """Lean booking row for the admin "related session" picker (support tickets)."""
+
+    id: uuid.UUID
+    appointment_id: str
+    seeker_id: uuid.UUID
+    advisor_id: uuid.UUID
+    seeker_name: str | None
+    advisor_name: str | None
+    scheduled_start: datetime
+    service_type: str
+    status: BookingStatus
+
+
 class BookingsListResponse(BaseModel):
     """Appointments list + dedicated banner booking (do not use ``data[0]`` for Chat Now)."""
 

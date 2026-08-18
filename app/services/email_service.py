@@ -3,13 +3,19 @@
 Falls back to structured logging when SMTP_HOST is not configured (local dev).
 All emails are sent as multipart/alternative (plain-text + HTML) which is the
 single most effective technique for avoiding spam filters.
+
+Call sites should use ``schedule_email(...)`` so SMTP work never blocks the
+HTTP response (or webhook / scheduler path).
 """
 
 from __future__ import annotations
 
+import asyncio
 import io
 import pathlib
+from collections.abc import Coroutine
 from datetime import UTC, datetime
+from typing import Any
 
 from aiosmtplib.errors import SMTPException
 from fastapi import UploadFile
@@ -23,6 +29,34 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Keep strong refs until background sends finish (asyncio only weak-refs tasks).
+_background_email_tasks: set[asyncio.Task[None]] = set()
+
+
+def schedule_email(coro: Coroutine[Any, Any, None]) -> None:
+    """Run an email coroutine after the current request work (fire-and-forget).
+
+    Failures are logged and never raised to the caller. Prefer this over
+    ``await send_*`` at API/service call sites.
+    """
+
+    async def _run() -> None:
+        try:
+            await coro
+        except Exception:  # noqa: BLE001 — never fail the request for mail
+            logger.exception("email_background_failed")
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning("email_schedule_skipped_no_event_loop")
+        coro.close()
+        return
+
+    task = loop.create_task(_run(), name="email_send")
+    _background_email_tasks.add(task)
+    task.add_done_callback(_background_email_tasks.discard)
 
 _TEMPLATES_DIR = pathlib.Path(__file__).parent.parent / "templates" / "email"
 _EMAIL_ASSETS_DIR = pathlib.Path(__file__).resolve().parents[2] / "public" / "email"
