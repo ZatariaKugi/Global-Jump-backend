@@ -415,28 +415,19 @@ def list_for_user_stmt(
 async def matched_advisor_counts(
     session: AsyncSession, assessments: list[Assessment]
 ) -> dict[uuid.UUID, int]:
-    """Live matcher totals — same as GET /assessments/{id}/matched-advisors.
+    """Persisted ``advisor_leads`` totals — same as GET /assessments/{id}/matched-advisors.
 
-    ``limit=0`` still runs the full rank (including AI blend) and returns only
-    ``total``, so History ``matched_advisors_count`` cannot drift from the panel.
+    History must not re-run the live matcher / OpenAI; counts come from rows
+    written once when the assessment completed.
     """
-    from app.services import advisor_matching_service
+    from app.services import advisor_lead_service
 
-    counts: dict[uuid.UUID, int] = {}
-    for assessment in assessments:
-        if assessment.status != AssessmentStatus.completed:
-            counts[assessment.id] = 0
-            continue
-        _items, total = await advisor_matching_service.match(
-            session,
-            assessment,
-            limit=0,
-            offset=0,
-            positive_only=True,
-            use_ai=True,
-        )
-        counts[assessment.id] = int(total)
-    return counts
+    completed_ids = [a.id for a in assessments if a.status == AssessmentStatus.completed]
+    stored = await advisor_lead_service.counts_for_assessments(session, completed_ids)
+    return {
+        a.id: (stored.get(a.id, 0) if a.status == AssessmentStatus.completed else 0)
+        for a in assessments
+    }
 
 
 def build_summary(

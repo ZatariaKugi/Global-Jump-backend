@@ -26,7 +26,8 @@ from app.schemas.assessment import (
     QuestionRead,
 )
 from app.schemas.response import Meta, ResponseEnvelope
-from app.services import advisor_matching_service, assessment_service
+from app.services import advisor_lead_service, assessment_service
+from app.services.advisor_matching_service import DEFAULT_LIMIT
 
 router = APIRouter(prefix="/assessments", tags=["assessments"])
 
@@ -39,7 +40,13 @@ def _require_seeker(user: User) -> None:
 async def _build_read(session: SessionDep, assessment: Assessment) -> AssessmentRead:
     matched: list[AdvisorMatchRead] = []
     if assessment.status == AssessmentStatus.completed:
-        matched, _total = await advisor_matching_service.match(session, assessment)
+        # Snapshot from advisor_leads (written once on complete). Never re-call OpenAI.
+        matched, _total = await advisor_lead_service.matches_for_assessment(
+            session,
+            assessment.id,
+            limit=DEFAULT_LIMIT,
+            offset=0,
+        )
     strengths: list[str] = []
     weaknesses: list[str] = []
     missing_requirements: list[str] = []
@@ -170,8 +177,8 @@ async def list_matched_advisors(
 ) -> ResponseEnvelope[list[AdvisorMatchRead]]:
     """Paginated AI-suggested advisors for a completed assessment.
 
-    Prefer this over the embedded ``matched_advisors`` preview on the assessment
-    payload when the list can grow beyond the default top-N.
+    Reads the ``advisor_leads`` snapshot written when the assessment completed.
+    Refreshing history or opening this panel does not call OpenAI.
     """
     _require_seeker(current_user)
     assessment = await assessment_service.get_for_user(session, assessment_id, current_user.id)
@@ -180,9 +187,9 @@ async def list_matched_advisors(
             "Matched advisors are available after the assessment is completed",
             code="assessment_incomplete",
         )
-    items, total = await advisor_matching_service.match(
+    items, total = await advisor_lead_service.matches_for_assessment(
         session,
-        assessment,
+        assessment.id,
         limit=params.limit,
         offset=params.offset,
     )
@@ -202,8 +209,9 @@ async def list_matched_advisors(
         "``status=completed``. ``visa_type`` is never defaulted from the latest "
         "assessment. ``q`` matches country code/name, visa slug/label, or score text. "
         "Default sort is newest completed (``completed_at`` desc). "
-        "``matched_advisors_count`` equals ``meta.pagination.total`` on "
-        "GET /assessments/{id}/matched-advisors (live matcher, not advisor_leads)."
+        "``matched_advisors_count`` is the persisted ``advisor_leads`` total "
+        "(same as GET /assessments/{id}/matched-advisors). History does not "
+        "re-run the live matcher or OpenAI."
     ),
 )
 async def list_my_assessments(
@@ -231,9 +239,7 @@ async def list_my_assessments(
     counts = await assessment_service.matched_advisor_counts(session, list(assessments))
     return ResponseEnvelope[list[AssessmentSummaryRead]](
         data=[
-            assessment_service.build_summary(
-                a, matched_advisors_count=counts.get(a.id, 0)
-            )
+            assessment_service.build_summary(a, matched_advisors_count=counts.get(a.id, 0))
             for a in assessments
         ],
         meta=page_meta(params, total, request_id),

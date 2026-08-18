@@ -193,7 +193,7 @@ async def match_context_for_seeker(
 
     Kept as an alias of ``match_context_from_profile`` so assessment country/visa
     never overrides Find Advisor, bookmarks, or the profile recommendation cache.
-    Assessment matches stay on ``advisor_leads`` + live ``match(assessment)``.
+    Assessment matches stay on ``advisor_leads`` (written once on complete).
     """
     return await match_context_from_profile(session, seeker_id)
 
