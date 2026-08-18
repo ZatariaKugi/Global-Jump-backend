@@ -50,6 +50,8 @@ from app.schemas.analytics import (
 from app.schemas.assessment import (
     AssessmentAnalyticsRead,
     QuestionAdminRead,
+    QuestionBulkStatusRead,
+    QuestionBulkStatusUpdate,
     QuestionCreate,
     QuestionOptionAdminRead,
     QuestionUpdate,
@@ -928,6 +930,23 @@ async def list_assessment_questions(
     return ResponseEnvelope[list[QuestionAdminRead]](
         data=[_question_admin_read(q) for q in questions],
         meta=page_meta(params, total, request_id),
+    )
+
+
+@router.post(
+    "/assessment-questions/bulk-status",
+    response_model=ResponseEnvelope[QuestionBulkStatusRead],
+)
+async def bulk_update_assessment_question_status(
+    body: QuestionBulkStatusUpdate,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[QuestionBulkStatusRead]:
+    updated = await assessment_service.bulk_set_active(session, body.is_active, principal.id)
+    return ResponseEnvelope[QuestionBulkStatusRead](
+        data=QuestionBulkStatusRead(updated=updated, is_active=body.is_active),
+        meta=Meta(request_id=request_id),
     )
 
 

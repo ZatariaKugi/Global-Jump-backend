@@ -142,6 +142,17 @@ class QuestionAdminRead(BaseModel):
     options: list[QuestionOptionAdminRead]
 
 
+class QuestionBulkStatusUpdate(BaseModel):
+    """Enable/disable every assessment question in one request."""
+
+    is_active: bool
+
+
+class QuestionBulkStatusRead(BaseModel):
+    updated: int
+    is_active: bool
+
+
 # ── Assessment sessions ──────────────────────────────────────────────────────
 
 

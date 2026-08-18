@@ -13,7 +13,7 @@ import uuid
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import Select, String, cast, func, or_, select
+from sqlalchemy import Select, String, cast, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -566,6 +566,21 @@ async def update_question(
 async def delete_question(session: AsyncSession, question: AssessmentQuestion) -> None:
     await session.delete(question)
     await session.flush()
+
+
+async def bulk_set_active(
+    session: AsyncSession, is_active: bool, admin_id: uuid.UUID
+) -> int:
+    """Set ``is_active`` on every assessment question in one UPDATE."""
+    result = await session.execute(
+        update(AssessmentQuestion).values(
+            is_active=is_active,
+            updated_by=admin_id,
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await session.flush()
+    return int(result.rowcount or 0)
 
 
 # ── Threshold settings (PRD §3.4 AI Engine Management) ───────────────────────

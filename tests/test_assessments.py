@@ -130,6 +130,51 @@ async def test_question_crud_requires_admin(client: AsyncClient) -> None:
     assert resp.status_code == 403
 
 
+async def test_bulk_status_updates_every_page(client: AsyncClient, admin_token: str) -> None:
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    options = [{"text": "A", "score": 100}, {"text": "B", "score": 0}]
+    for i in range(12):
+        resp = await client.post(
+            ADMIN_QUESTIONS,
+            json=_q(f"Bulk Q{i}?", "purpose", 1.0, options, is_active=(i % 2 == 0)),
+            headers=headers,
+        )
+        assert resp.status_code == 201, resp.text
+
+    resp = await client.post(
+        f"{ADMIN_QUESTIONS}/bulk-status", json={"is_active": False}, headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()["data"]
+    assert payload["is_active"] is False
+    assert payload["updated"] == 12
+
+    listed: list[dict] = []
+    for page in (1, 2):
+        resp = await client.get(
+            f"{ADMIN_QUESTIONS}?page={page}&page_size=10", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        listed.extend(body["data"])
+        assert body["meta"]["pagination"]["total"] == 12
+        assert all(row["is_active"] is False for row in body["data"])
+
+    assert len(listed) == 12
+    assert all(row["is_active"] is False for row in listed)
+
+    token = await _seeker_token(client)
+    resp = await client.post(
+        f"{ADMIN_QUESTIONS}/bulk-status",
+        json={"is_active": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403
+
+    resp = await client.post(f"{ADMIN_QUESTIONS}/bulk-status", json={}, headers=headers)
+    assert resp.status_code == 422
+
+
 async def test_seeker_lists_applicable_questions(client: AsyncClient, admin_token: str) -> None:
     await _seed_questions(client, admin_token)
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
