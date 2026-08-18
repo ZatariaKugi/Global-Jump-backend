@@ -1875,11 +1875,16 @@ async def list_country_rules(
     country_code: str | None = Query(default=None, min_length=2, max_length=2),
     visa_type: OptionalVisaType = None,
     status: RulePublishStatus | None = None,
+    sort: str | None = Query(
+        default=None,
+        description="Only ``newest`` is honored (created_at desc); omitted/unknown keep country/visa/version order",
+    ),
 ) -> ResponseEnvelope[list[CountryRuleRead]]:
     stmt = country_rule_service.list_rules_stmt(
         country_code=country_code,
         visa_type=visa_type.value if visa_type else None,
         status=status,
+        sort=sort,
     )
     rules, total = await paginate(session, stmt, params)
     return ResponseEnvelope[list[CountryRuleRead]](
