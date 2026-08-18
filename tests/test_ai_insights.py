@@ -1,6 +1,6 @@
 """AI narrative insight tests — OpenAI is always mocked; the real API is never hit
 (conftest force-blanks OPENAI_API_KEY, and key-present tests mutate the cached
-Settings singleton + patch the AsyncOpenAI client class)."""
+Settings singleton + patch the get_openai_client factory)."""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ async def test_insights_generated_and_persisted(
 ) -> None:
     monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "sk-test")
     with patch(
-        "app.services.ai_insight_service.AsyncOpenAI",
+        "app.services.ai_insight_service.get_openai_client",
         return_value=_mock_openai_client(json.dumps(PAYLOAD)),
     ):
         result = await _complete_assessment(client, admin_token)
@@ -107,7 +107,7 @@ async def test_openai_failure_never_blocks_completion(
     monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "sk-test")
     failing_client = MagicMock()
     failing_client.chat.completions.create = AsyncMock(side_effect=RuntimeError("boom"))
-    with patch("app.services.ai_insight_service.AsyncOpenAI", return_value=failing_client):
+    with patch("app.services.ai_insight_service.get_openai_client", return_value=failing_client):
         result = await _complete_assessment(client, admin_token)
 
     assert result["status"] == "completed"
@@ -119,11 +119,11 @@ async def test_openai_failure_never_blocks_completion(
 
 
 async def test_no_api_key_skips_openai_entirely(client: AsyncClient, admin_token: str) -> None:
-    # conftest blanks OPENAI_API_KEY — the client class must never be constructed.
-    with patch("app.services.ai_insight_service.AsyncOpenAI") as client_cls:
+    # conftest blanks OPENAI_API_KEY — the client factory must never be called.
+    with patch("app.services.ai_insight_service.get_openai_client") as factory_fn:
         result = await _complete_assessment(client, admin_token)
 
-    client_cls.assert_not_called()
+    factory_fn.assert_not_called()
     assert result["status"] == "completed"
     assert result["strengths"] == []
     assert result["ai_summary"] is None
@@ -154,7 +154,7 @@ async def test_malformed_response_falls_back(
 ) -> None:
     monkeypatch.setattr(get_settings(), "OPENAI_API_KEY", "sk-test")
     with patch(
-        "app.services.ai_insight_service.AsyncOpenAI",
+        "app.services.ai_insight_service.get_openai_client",
         return_value=_mock_openai_client("not json at all"),
     ):
         result = await _complete_assessment(client, admin_token)

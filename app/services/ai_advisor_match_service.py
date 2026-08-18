@@ -13,7 +13,6 @@ import uuid
 from dataclasses import dataclass
 
 import structlog
-from openai import AsyncOpenAI
 from openai.types.shared_params.response_format_json_schema import (
     JSONSchema,
     ResponseFormatJSONSchema,
@@ -22,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from app.core.config import Settings
 from app.core.countries import country_name
+from app.core.openai_client import get_openai_client
 from app.core.visa_types import visa_type_name
 from app.models.assessment import Assessment
 from app.schemas.assessment import AdvisorMatchRead
@@ -93,8 +93,8 @@ class _RawRerank(BaseModel):
 @dataclass(frozen=True)
 class AiRerankItem:
     advisor_id: uuid.UUID
-    ai_score: float
-    reason: str
+    ai_score: float | None = None
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -222,11 +222,9 @@ async def rerank_advisors(
     allowed_ids = {str(c.user_id) for c in pool}
 
     try:
-        client = AsyncOpenAI(
-            api_key=settings.OPENAI_API_KEY,
-            timeout=settings.OPENAI_TIMEOUT_SECONDS,
-            max_retries=1,
-        )
+        client = get_openai_client(settings)
+        if client is None:
+            return None
         response = await client.chat.completions.create(
             model=settings.OPENAI_MODEL,
             messages=[
@@ -264,6 +262,7 @@ async def rerank_advisors(
         )
 
     # Append any candidates the model omitted, preserving rule order.
+    # ai_score=None signals "not AI-evaluated" so blend logic keeps rule-only score.
     for c in pool:
         key = str(c.user_id)
         if key in seen:
@@ -271,7 +270,7 @@ async def rerank_advisors(
         items.append(
             AiRerankItem(
                 advisor_id=c.user_id,
-                ai_score=c.match_score,
+                ai_score=None,
                 reason="Ranked by rule score",
             )
         )

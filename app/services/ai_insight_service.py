@@ -16,7 +16,6 @@ import json
 import re
 
 import structlog
-from openai import AsyncOpenAI
 from openai.types.shared_params.response_format_json_schema import (
     JSONSchema,
     ResponseFormatJSONSchema,
@@ -24,6 +23,7 @@ from openai.types.shared_params.response_format_json_schema import (
 from pydantic import BaseModel
 
 from app.core.config import Settings
+from app.core.openai_client import get_openai_client
 from app.models.assessment import Assessment, AssessmentQuestion, AssessmentQuestionOption
 from app.schemas.seeker_profile import OnboardingSubmit
 
@@ -253,11 +253,9 @@ async def generate_insights(
         return None
 
     try:
-        client = AsyncOpenAI(
-            api_key=settings.OPENAI_API_KEY,
-            timeout=settings.OPENAI_TIMEOUT_SECONDS,
-            max_retries=1,
-        )
+        client = get_openai_client(settings)
+        if client is None:
+            return None
         response = await client.chat.completions.create(
             model=settings.OPENAI_MODEL,
             messages=[
@@ -365,11 +363,9 @@ async def generate_onboarding_suggestions(data: OnboardingSubmit, settings: Sett
         return []
 
     try:
-        client = AsyncOpenAI(
-            api_key=settings.OPENAI_API_KEY,
-            timeout=settings.OPENAI_TIMEOUT_SECONDS,
-            max_retries=1,
-        )
+        client = get_openai_client(settings)
+        if client is None:
+            return []
         response = await client.chat.completions.create(
             model=settings.OPENAI_MODEL,
             messages=[

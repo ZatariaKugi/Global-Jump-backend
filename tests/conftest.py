@@ -62,15 +62,28 @@ async def engine() -> AsyncIterator:
 def _block_real_openai() -> Iterator[None]:
     """Suite-wide guard: constructing a real OpenAI client in a test is always a bug.
 
-    Tests that need a client mock re-patch ``ai_insight_service.AsyncOpenAI``
+    Tests that need a client mock re-patch ``ai_insight_service.get_openai_client``
     themselves (see test_ai_insights.py); that inner patch takes precedence.
     If a test sets an API key but forgets to patch, construction raises and
     generate_insights degrades to None — the SDK can never dial api.openai.com.
     """
     with mock.patch(
-        "app.services.ai_insight_service.AsyncOpenAI",
+        "app.services.ai_insight_service.get_openai_client",
         side_effect=AssertionError(
-            "Test tried to construct a real AsyncOpenAI client — patch it with a mock."
+            "Test tried to construct a real AsyncOpenAI client — "
+            "patch get_openai_client with a mock."
+        ),
+    ), mock.patch(
+        "app.services.ai_advisor_match_service.get_openai_client",
+        side_effect=AssertionError(
+            "Test tried to construct a real AsyncOpenAI client — "
+            "patch get_openai_client with a mock."
+        ),
+    ), mock.patch(
+        "app.services.country_rule_ai_service.get_openai_client",
+        side_effect=AssertionError(
+            "Test tried to construct a real AsyncOpenAI client — "
+            "patch get_openai_client with a mock."
         ),
     ):
         yield

@@ -699,9 +699,15 @@ async def _drop_off_points(
     for a in abandoned:
         by_scope[(a.destination_country, a.visa_type)].append(a)
 
+    # Batch-load questions for all unique scopes to avoid N+1 queries.
+    questions_by_scope: dict[tuple[str, str], list[AssessmentQuestion]] = {}
+    for country, visa in by_scope:
+        if (country, visa) not in questions_by_scope:
+            questions_by_scope[(country, visa)] = await list_questions(session, country, visa)
+
     stage_counts: dict[str, int] = defaultdict(int)
     for (country, visa), group in by_scope.items():
-        questions = await list_questions(session, country, visa)
+        questions = questions_by_scope.get((country, visa), [])
         if not questions:
             stage_counts["Before Q1"] += len(group)
             continue

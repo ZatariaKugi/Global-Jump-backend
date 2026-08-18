@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.core.exceptions import AppError, ConflictError, PermissionDeniedError
 from app.core.file_storage import resolve_media_url
-from app.core.visa_types import parse_visa_type
+from app.core.visa_types import parse_visa_type, visa_type_name
 from app.models.advisor_credential import AdvisorCredential, DocumentType
 from app.models.advisor_profile import (
     AdvisorCountryExpertise,
@@ -75,6 +75,41 @@ def _visa_specializations(profile: AdvisorProfile) -> list[VisaType]:
         if parsed is not None:
             out.append(parsed)
     return out
+
+
+def build_match_reasons(
+    profile: AdvisorProfile,
+    destination: str,
+    visa_type: str,
+    average_rating: float | None,
+) -> str:
+    """Generate a human-readable match-reasons string for a candidate advisor.
+
+    Shared by ``seeker_recommendation_service`` and ``advisor_lead_service``
+    so that reason generation stays consistent in a single place.
+    """
+    reasons: list[str] = []
+    countries = {c.country_code.upper() for c in (profile.country_expertise or [])}
+    if destination.upper() in countries:
+        reasons.append(f"Specializes in {destination.upper()} immigration")
+
+    specializations = {
+        parsed
+        for s in (profile.visa_specializations or [])
+        if (parsed := parse_visa_type(s.specialization)) is not None
+    }
+    target = parse_visa_type(visa_type)
+    if target is not None and target in specializations:
+        label = visa_type_name(target) or target.value
+        reasons.append(f"Specializes in {label}")
+
+    if profile.years_of_experience:
+        reasons.append(f"{profile.years_of_experience} years of experience")
+
+    if average_rating is not None:
+        reasons.append(f"{average_rating:.1f}★ average rating")
+
+    return "; ".join(reasons) if reasons else "General profile match"
 
 
 async def get_by_user_id(session: AsyncSession, user_id: uuid.UUID) -> AdvisorProfile | None:

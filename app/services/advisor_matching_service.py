@@ -372,12 +372,13 @@ def _apply_ai_blend(
         if base is None:
             continue
         used.add(item.advisor_id)
+        ai_score = item.ai_score if item.ai_score is not None else base.match_score
         blended.append(
             base.model_copy(
                 update={
                     "rule_score": base.match_score,
-                    "ai_score": item.ai_score,
-                    "match_score": blend_scores(base.match_score, item.ai_score),
+                    "ai_score": ai_score,
+                    "match_score": blend_scores(base.match_score, ai_score),
                     "match_reasons": item.reason,
                 }
             )

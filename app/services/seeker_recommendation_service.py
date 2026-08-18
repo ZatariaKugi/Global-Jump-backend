@@ -15,46 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.file_storage import resolve_media_url
-from app.core.visa_types import parse_visa_type, visa_type_name
 from app.models.advisor_profile import AdvisorProfile
 from app.models.seeker_advisor_recommendation import SeekerAdvisorRecommendation
 from app.models.user import User
 from app.models.visa_type import VisaType
 from app.schemas.assessment import AdvisorMatchRead
 from app.services import advisor_matching_service, advisor_profile_service, review_service
+from app.services.advisor_profile_service import build_match_reasons
 from app.services.ai_advisor_match_service import SeekerMatchCase
 
 PROFILE_CONTEXT = "profile"
-
-
-def _build_reasons(
-    profile: AdvisorProfile,
-    destination: str,
-    visa_type: str,
-    average_rating: float | None,
-) -> str:
-    reasons: list[str] = []
-    countries = {c.country_code.upper() for c in (profile.country_expertise or [])}
-    if destination.upper() in countries:
-        reasons.append(f"Specializes in {destination.upper()} immigration")
-
-    specializations = {
-        parsed
-        for s in (profile.visa_specializations or [])
-        if (parsed := parse_visa_type(s.specialization)) is not None
-    }
-    target = parse_visa_type(visa_type)
-    if target is not None and target in specializations:
-        label = visa_type_name(target) or target.value
-        reasons.append(f"Specializes in {label}")
-
-    if profile.years_of_experience:
-        reasons.append(f"{profile.years_of_experience} years of experience")
-
-    if average_rating is not None:
-        reasons.append(f"{average_rating:.1f}★ average rating")
-
-    return "; ".join(reasons) if reasons else "General profile match"
 
 
 async def list_for_seeker(
@@ -111,17 +81,24 @@ async def replace_from_matches(
 
     await clear_for_seeker(session, case.seeker_id)
 
+    # Batch-load all advisor profiles to avoid N+1 queries.
+    advisor_ids = [item.user_id for item in matches]
+    profiles_by_id: dict[uuid.UUID, AdvisorProfile] = {}
+    if advisor_ids:
+        profile_rows = (
+            await session.execute(
+                select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
+            )
+        ).scalars().all()
+        profiles_by_id = {p.user_id: p for p in profile_rows}
+
     rows: list[SeekerAdvisorRecommendation] = []
     for rank, item in enumerate(matches, start=1):
         reasons = item.match_reasons
         if not reasons:
-            profile = (
-                await session.execute(
-                    select(AdvisorProfile).where(AdvisorProfile.user_id == item.user_id)
-                )
-            ).scalar_one_or_none()
+            profile = profiles_by_id.get(item.user_id)
             reasons = (
-                _build_reasons(
+                build_match_reasons(
                     profile,
                     case.destination_country,
                     case.visa_type,

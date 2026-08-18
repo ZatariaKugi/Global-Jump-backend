@@ -255,7 +255,9 @@ async def test_partial_answers_lower_confidence(client: AsyncClient, admin_token
     )
     result = resp.json()["data"]
     assert result["confidence"] == 0.67  # 2 of 3 applicable questions answered
-    assert result["score"] == 100.0
+    # Unanswered questions contribute 0 so skipping cannot inflate the score:
+    # (100×2 + 100×1 + 0×1) / 4 = 75.
+    assert result["score"] == 75.0
 
 
 async def test_adaptive_question_skipped_unless_triggered(
