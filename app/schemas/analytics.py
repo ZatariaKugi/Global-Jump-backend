@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 
 class MonthlyCountPoint(BaseModel):
-    month: str  # ISO "YYYY-MM"
+    month: str  # ISO "YYYY-MM" (monthly) or "YYYY-MM-DD" (daily, admin dashboard days=7)
     count: int
 
 

@@ -190,17 +190,19 @@ async def _send_meeting_notifications(
     settings: Settings,
 ) -> None:
     if seeker is not None and booking.meeting_join_url:
-        await email_service.send_booking_meeting_email(
-            seeker.email,
-            seeker.full_name or seeker.email,
-            other_party=advisor.full_name if advisor and advisor.full_name else "Advisor",
-            service_type=booking.service_type,
-            start_utc=as_utc(booking.scheduled_start),
-            duration_minutes=booking.duration_minutes,
-            meeting_url=booking.meeting_join_url,
-            passcode=booking.meeting_passcode,
-            is_host=False,
-            settings=settings,
+        email_service.schedule_email(
+            email_service.send_booking_meeting_email(
+                seeker.email,
+                seeker.full_name or seeker.email,
+                other_party=advisor.full_name if advisor and advisor.full_name else "Advisor",
+                service_type=booking.service_type,
+                start_utc=as_utc(booking.scheduled_start),
+                duration_minutes=booking.duration_minutes,
+                meeting_url=booking.meeting_join_url,
+                passcode=booking.meeting_passcode,
+                is_host=False,
+                settings=settings,
+            )
         )
         service_label = humanize_slug(booking.service_type) or "consultation"
         await notification_service.notify(
@@ -215,17 +217,19 @@ async def _send_meeting_notifications(
         )
 
     if advisor is not None and booking.meeting_start_url:
-        await email_service.send_booking_meeting_email(
-            advisor.email,
-            advisor.full_name or advisor.email,
-            other_party=seeker.full_name if seeker and seeker.full_name else "Client",
-            service_type=booking.service_type,
-            start_utc=as_utc(booking.scheduled_start),
-            duration_minutes=booking.duration_minutes,
-            meeting_url=booking.meeting_start_url,
-            passcode=booking.meeting_passcode,
-            is_host=True,
-            settings=settings,
+        email_service.schedule_email(
+            email_service.send_booking_meeting_email(
+                advisor.email,
+                advisor.full_name or advisor.email,
+                other_party=seeker.full_name if seeker and seeker.full_name else "Client",
+                service_type=booking.service_type,
+                start_utc=as_utc(booking.scheduled_start),
+                duration_minutes=booking.duration_minutes,
+                meeting_url=booking.meeting_start_url,
+                passcode=booking.meeting_passcode,
+                is_host=True,
+                settings=settings,
+            )
         )
         client_name = seeker.full_name if seeker else "client"
         await notification_service.notify(

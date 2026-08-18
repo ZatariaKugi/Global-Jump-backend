@@ -461,25 +461,29 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
         seeker = await session.get(User, booking.seeker_id)
         advisor = await session.get(User, booking.advisor_id)
         if seeker is not None:
-            await email_service.send_payment_receipt_email(
-                seeker.email,
-                seeker.full_name or seeker.email,
-                advisor.full_name if advisor and advisor.full_name else "Advisor",
-                service_type=booking.service_type,
-                amount_usd=txn.amount_usd,
-                invoice_number=f"{txn.invoice_number:08d}",
-                settings=settings,
+            email_service.schedule_email(
+                email_service.send_payment_receipt_email(
+                    seeker.email,
+                    seeker.full_name or seeker.email,
+                    advisor.full_name if advisor and advisor.full_name else "Advisor",
+                    service_type=booking.service_type,
+                    amount_usd=txn.amount_usd,
+                    invoice_number=f"{txn.invoice_number:08d}",
+                    settings=settings,
+                )
             )
         if advisor is not None:
-            await email_service.send_advisor_payment_notification_email(
-                advisor.email,
-                advisor.full_name or advisor.email,
-                seeker.full_name if seeker and seeker.full_name else "A client",
-                service_type=booking.service_type,
-                amount_usd=txn.amount_usd,
-                payout_usd=txn.advisor_payout_usd,
-                invoice_number=f"{txn.invoice_number:08d}",
-                settings=settings,
+            email_service.schedule_email(
+                email_service.send_advisor_payment_notification_email(
+                    advisor.email,
+                    advisor.full_name or advisor.email,
+                    seeker.full_name if seeker and seeker.full_name else "A client",
+                    service_type=booking.service_type,
+                    amount_usd=txn.amount_usd,
+                    payout_usd=txn.advisor_payout_usd,
+                    invoice_number=f"{txn.invoice_number:08d}",
+                    settings=settings,
+                )
             )
         await _notify_payment(
             session,
@@ -1578,14 +1582,16 @@ async def resend_receipt(session: AsyncSession, txn: Transaction, settings: Sett
     advisor = await session.get(User, booking.advisor_id)
     if seeker is None:
         raise NotFoundError("Seeker not found")
-    await email_service.send_payment_receipt_email(
-        seeker.email,
-        seeker.full_name or "",
-        (advisor.full_name if advisor and advisor.full_name else "Advisor"),
-        service_type=booking.service_type,
-        amount_usd=txn.amount_usd,
-        invoice_number=format_invoice_id(txn.invoice_number) or f"{txn.invoice_number:08d}",
-        settings=settings,
+    email_service.schedule_email(
+        email_service.send_payment_receipt_email(
+            seeker.email,
+            seeker.full_name or "",
+            (advisor.full_name if advisor and advisor.full_name else "Advisor"),
+            service_type=booking.service_type,
+            amount_usd=txn.amount_usd,
+            invoice_number=format_invoice_id(txn.invoice_number) or f"{txn.invoice_number:08d}",
+            settings=settings,
+        )
     )
 
 

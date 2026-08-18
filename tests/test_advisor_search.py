@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -31,6 +32,7 @@ async def _make_advisor(
             role=UserRole.advisor,
             is_active=True,
             verification_status=VerificationStatus.approved,
+            email_verified_at=datetime.now(UTC),
         )
         session.add(user)
         await session.commit()

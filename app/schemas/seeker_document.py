@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.visa_types import OptionalVisaType
 from app.models.booking import BookingStatus
 from app.models.seeker_document import DocumentCategory, SeekerDocumentStatus
 
 CustomerDocumentsRowStatus = Literal["pending", "completed", "rejected"]
-ChecklistItemStatus = Literal["approved", "under_review", "rejected", "missing"]
+ChecklistItemStatus = Literal["approved", "under_review", "rejected", "expired", "missing"]
 DocumentCommentAuthorRole = Literal["seeker", "advisor", "admin"]
+
+
+def _expires_at_after_today(value: date | None) -> date | None:
+    if value is not None and value <= date.today():
+        raise ValueError("expires_at must be after today")
+    return value
 
 
 class ClientSeekerBrief(BaseModel):
@@ -31,23 +37,50 @@ class SeekerDocumentCreate(BaseModel):
     (``category=seeker_document``)."""
 
     file_key: str = Field(min_length=1, max_length=500)
-    file_name: str = Field(min_length=1, max_length=255)
+    file_name: str = Field(min_length=1)
     file_size_bytes: int = Field(ge=1)
     content_type: str = Field(default="application/octet-stream", max_length=100)
     category: DocumentCategory
-    document_name: str = Field(min_length=1, max_length=255)
+    document_name: str = Field(min_length=1)
     expires_at: date | None = None
     visa_type: OptionalVisaType = None
 
+    @field_validator("expires_at")
+    @classmethod
+    def _future_expiry(cls, value: date | None) -> date | None:
+        return _expires_at_after_today(value)
+
 
 class SeekerDocumentUpdate(BaseModel):
-    """Patch expiry / visa scope / display name without re-uploading."""
+    """Patch metadata and/or replace the file (same document id).
 
-    document_name: str | None = Field(default=None, min_length=1, max_length=255)
+    File replace: ``POST /uploads`` (``category=seeker_document``) first, then
+    send ``file_key`` + ``file_name`` + ``file_size_bytes`` here. Status returns
+    to ``under_review``; comments on this id are kept.
+    """
+
+    document_name: str | None = Field(default=None, min_length=1)
     expires_at: date | None = None
     clear_expires_at: bool = False
     visa_type: OptionalVisaType = None
     clear_visa_type: bool = False
+    file_key: str | None = Field(default=None, min_length=1, max_length=500)
+    file_name: str | None = Field(default=None, min_length=1)
+    file_size_bytes: int | None = Field(default=None, ge=1)
+    content_type: str | None = Field(default=None, max_length=100)
+
+    @field_validator("expires_at")
+    @classmethod
+    def _future_expiry(cls, value: date | None) -> date | None:
+        return _expires_at_after_today(value)
+
+    @model_validator(mode="after")
+    def _replace_file_fields(self) -> Self:
+        if self.file_key is None:
+            return self
+        if self.file_name is None or self.file_size_bytes is None:
+            raise ValueError("file_name and file_size_bytes are required when replacing a file")
+        return self
 
 
 class SeekerDocumentStatusUpdate(BaseModel):
@@ -69,6 +102,7 @@ class SeekerDocumentRead(BaseModel):
     reviewed_by: uuid.UUID | None
     created_at: datetime
     comments_count: int = 0
+    has_unread_comments: bool = False
 
 
 class DocumentChecklistItem(BaseModel):

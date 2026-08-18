@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import get_settings
 from app.models.token import TokenPurpose, UserToken
+from app.models.user import AuthProvider, User
 from app.services import auth_service, user_service
 
 REGISTER = "/api/v1/auth/register"
@@ -16,13 +17,18 @@ LOGIN = "/api/v1/auth/login"
 ME = "/api/v1/users/me"
 VERIFY_EMAIL = "/api/v1/auth/verify-email"
 RESEND_VERIFICATION = "/api/v1/auth/resend-verification"
+FORGOT_PASSWORD = "/api/v1/auth/forgot-password"
+RESET_PASSWORD = "/api/v1/auth/reset-password"
 
-CREDS = {"email": "ada@example.com", "password": "supersecret", "full_name": "Ada"}
+CREDS = {"email": "ada@example.com", "password": "SuperSecret1!", "full_name": "Ada"}
 
 
-async def _register_and_login(client: AsyncClient) -> str:
+async def _register_and_login(client: AsyncClient, engine) -> str:
     resp = await client.post(REGISTER, json=CREDS)
     assert resp.status_code == 201, resp.text
+    _, raw_token = await _issue_verification_token(engine, CREDS["email"])
+    resp = await client.post(VERIFY_EMAIL, json={"token": raw_token})
+    assert resp.status_code == 200, resp.text
     resp = await client.post(
         LOGIN, data={"username": CREDS["email"], "password": CREDS["password"]}
     )
@@ -46,8 +52,8 @@ async def test_duplicate_registration_conflicts(client: AsyncClient) -> None:
     assert resp.json()["error"]["code"] == "conflict"
 
 
-async def test_login_and_me_happy_path(client: AsyncClient) -> None:
-    token = await _register_and_login(client)
+async def test_login_and_me_happy_path(client: AsyncClient, engine) -> None:
+    token = await _register_and_login(client, engine)
     resp = await client.get(ME, headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
     assert resp.json()["data"]["email"] == CREDS["email"]
@@ -90,7 +96,7 @@ async def _unused_verification_token_count(engine, user_id: str) -> int:
 
 
 async def test_verify_email_consumes_token(client: AsyncClient, engine) -> None:
-    creds = {"email": "verify1@test.com", "password": "supersecret", "full_name": "Verify One"}
+    creds = {"email": "verify1@test.com", "password": "SuperSecret1!", "full_name": "Verify One"}
     resp = await client.post(REGISTER, json=creds)
     assert resp.status_code == 201, resp.text
     assert resp.json()["data"]["is_email_verified"] is False
@@ -102,12 +108,12 @@ async def test_verify_email_consumes_token(client: AsyncClient, engine) -> None:
     assert resp.json()["data"]["is_email_verified"] is True
 
     resp = await client.post(VERIFY_EMAIL, json={"token": raw_token})
-    assert resp.status_code == 401
-    assert resp.json()["error"]["code"] == "unauthorized"
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "verify_token_expired"
 
 
 async def test_resend_revokes_previous_verification_token(client: AsyncClient, engine) -> None:
-    creds = {"email": "verify2@test.com", "password": "supersecret", "full_name": "Verify Two"}
+    creds = {"email": "verify2@test.com", "password": "SuperSecret1!", "full_name": "Verify Two"}
     resp = await client.post(REGISTER, json=creds)
     assert resp.status_code == 201, resp.text
     _, first_token = await _issue_verification_token(engine, creds["email"])
@@ -126,7 +132,8 @@ async def test_resend_revokes_previous_verification_token(client: AsyncClient, e
     second_token = captured["token"]
 
     resp = await client.post(VERIFY_EMAIL, json={"token": first_token})
-    assert resp.status_code == 401
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "verify_token_expired"
 
     resp = await client.post(VERIFY_EMAIL, json={"token": second_token})
     assert resp.status_code == 200, resp.text
@@ -134,7 +141,7 @@ async def test_resend_revokes_previous_verification_token(client: AsyncClient, e
 
 
 async def test_verify_email_rejects_already_verified_user(client: AsyncClient, engine) -> None:
-    creds = {"email": "verify3@test.com", "password": "supersecret", "full_name": "Verify Three"}
+    creds = {"email": "verify3@test.com", "password": "SuperSecret1!", "full_name": "Verify Three"}
     resp = await client.post(REGISTER, json=creds)
     assert resp.status_code == 201, resp.text
     _, raw_token = await _issue_verification_token(engine, creds["email"])
@@ -155,8 +162,14 @@ async def test_verify_email_rejects_already_verified_user(client: AsyncClient, e
     assert resp.json()["error"]["code"] == "already_verified"
 
 
-async def test_resend_verification_skips_verified_users(client: AsyncClient, engine) -> None:
-    creds = {"email": "verify4@test.com", "password": "supersecret", "full_name": "Verify Four"}
+async def test_resend_verification_rejects_already_verified_users(
+    client: AsyncClient, engine
+) -> None:
+    creds = {
+        "email": "verify4@test.com",
+        "password": "SuperSecret1!",
+        "full_name": "Verify Four",
+    }
     resp = await client.post(REGISTER, json=creds)
     assert resp.status_code == 201, resp.text
     user_id, raw_token = await _issue_verification_token(engine, creds["email"])
@@ -166,6 +179,128 @@ async def test_resend_verification_skips_verified_users(client: AsyncClient, eng
 
     before = await _unused_verification_token_count(engine, user_id)
     resp = await client.post(RESEND_VERIFICATION, json={"email": creds["email"]})
-    assert resp.status_code == 204
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "already_verified"
     after = await _unused_verification_token_count(engine, user_id)
     assert after == before
+
+
+async def test_forgot_password_does_not_enumerate_emails(client: AsyncClient, engine) -> None:
+    """Unknown, Google-only, and local accounts all return 204 (no mail for the first two)."""
+    resp = await client.post(FORGOT_PASSWORD, json={"email": "nobody@example.com"})
+    assert resp.status_code == 204, resp.text
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        session.add(
+            User(
+                email="google-user@example.com",
+                full_name="Google User",
+                hashed_password=None,
+                auth_provider=AuthProvider.google,
+                google_sub="google-sub-1",
+            )
+        )
+        await session.commit()
+
+    with patch(
+        "app.api.v1.auth.send_password_reset_email",
+        new=AsyncMock(),
+    ) as send_mail:
+        resp = await client.post(FORGOT_PASSWORD, json={"email": "google-user@example.com"})
+        assert resp.status_code == 204, resp.text
+        send_mail.assert_not_called()
+
+    creds = {"email": "local@example.com", "password": "SuperSecret1!", "full_name": "Local"}
+    resp = await client.post(REGISTER, json=creds)
+    assert resp.status_code == 201, resp.text
+    with patch(
+        "app.api.v1.auth.send_password_reset_email",
+        new=AsyncMock(),
+    ) as send_mail:
+        resp = await client.post(FORGOT_PASSWORD, json={"email": creds["email"]})
+        assert resp.status_code == 204, resp.text
+        send_mail.assert_called_once()
+
+
+async def test_verify_email_rejects_stale_token_after_version_bump(
+    client: AsyncClient, engine
+) -> None:
+    creds = {"email": "verify-tv@test.com", "password": "SuperSecret1!", "full_name": "TV"}
+    resp = await client.post(REGISTER, json=creds)
+    assert resp.status_code == 201, resp.text
+    _, raw_token = await _issue_verification_token(engine, creds["email"])
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = await user_service.get_by_email(session, creds["email"])
+        assert user is not None
+        user.token_version = user.token_version + 1
+        session.add(user)
+        await session.commit()
+
+    resp = await client.post(VERIFY_EMAIL, json={"token": raw_token})
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "verify_token_expired"
+
+
+async def test_reset_password_invalidates_existing_access_token(
+    client: AsyncClient, engine
+) -> None:
+    creds = {"email": "reset-jwt@test.com", "password": "SuperSecret1!", "full_name": "Reset JWT"}
+    resp = await client.post(REGISTER, json=creds)
+    assert resp.status_code == 201, resp.text
+    _, verify_token = await _issue_verification_token(engine, creds["email"])
+    resp = await client.post(VERIFY_EMAIL, json={"token": verify_token})
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.post(
+        LOGIN, data={"username": creds["email"], "password": creds["password"]}
+    )
+    assert resp.status_code == 200, resp.text
+    old_access = resp.json()["access_token"]
+
+    settings = get_settings()
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = await user_service.get_by_email(session, creds["email"])
+        assert user is not None
+        raw_reset = await auth_service.create_password_reset_token_for_user(session, user, settings)
+        await session.commit()
+
+    resp = await client.post(
+        RESET_PASSWORD, json={"token": raw_reset, "new_password": "BrandNew1!"}
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.get(ME, headers={"Authorization": f"Bearer {old_access}"})
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "unauthorized"
+
+
+async def test_in_app_password_change_invalidates_existing_access_token(
+    client: AsyncClient, engine
+) -> None:
+    creds = {"email": "patch-pw@test.com", "password": "SuperSecret1!", "full_name": "Patch PW"}
+    resp = await client.post(REGISTER, json=creds)
+    assert resp.status_code == 201, resp.text
+    _, verify_token = await _issue_verification_token(engine, creds["email"])
+    resp = await client.post(VERIFY_EMAIL, json={"token": verify_token})
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.post(
+        LOGIN, data={"username": creds["email"], "password": creds["password"]}
+    )
+    assert resp.status_code == 200, resp.text
+    old_access = resp.json()["access_token"]
+
+    resp = await client.patch(
+        ME,
+        json={"password": "BrandNew1!"},
+        headers={"Authorization": f"Bearer {old_access}"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.get(ME, headers={"Authorization": f"Bearer {old_access}"})
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "unauthorized"

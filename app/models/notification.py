@@ -41,6 +41,7 @@ class NotificationType(StrEnum):
     payout_rejected = "payout_rejected"
     user_registered = "user_registered"
     message_received = "message_received"
+    document_comment = "document_comment"
 
 
 class NotificationEntityType(StrEnum):
@@ -49,6 +50,7 @@ class NotificationEntityType(StrEnum):
     payout_request = "payout_request"
     user = "user"
     conversation = "conversation"
+    seeker_document = "seeker_document"
 
 
 class PushStatus(StrEnum):

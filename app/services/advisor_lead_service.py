@@ -1,12 +1,10 @@
 """AI-matched customer leads for advisors — the inverse of advisor_matching_service.
 
 Generated once, when a seeker's eligibility assessment completes
-(``assessment_service.submit_answers``): every approved+active advisor is scored
-against the assessment using the *same* weighted factors as
-``advisor_matching_service.score_advisor_for_assessment`` (country/visa/experience/
-rating), and a persisted ``AdvisorLead`` row is created for any advisor with a
-positive score. Advisors then work this list as a queue (new -> viewed -> contacted
-or dismissed) via ``GET/POST /advisors/me/leads...``.
+(``assessment_service.submit_answers``): uses the hybrid matcher
+(country gate + rule score + optional OpenAI re-rank blend) and persists
+``AdvisorLead`` rows for positive matches. Advisors then work this list as a
+queue (new -> viewed -> contacted or dismissed) via ``GET/POST /advisors/me/leads...``.
 """
 
 from __future__ import annotations
@@ -23,9 +21,8 @@ from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import Assessment
 from app.models.booking import Booking
-from app.models.user import User, UserRole, VerificationStatus
-from app.services import review_service
-from app.services.advisor_matching_service import score_advisor_for_assessment
+from app.models.user import User
+from app.services import advisor_matching_service
 
 
 def _build_reasons(
@@ -59,35 +56,44 @@ def _build_reasons(
 
 
 async def generate_for_assessment(
-    session: AsyncSession, assessment: Assessment
+    session: AsyncSession,
+    assessment: Assessment,
 ) -> list[AdvisorLead]:
-    """Score ``assessment`` against every approved advisor and persist leads."""
-    stmt = (
-        select(User, AdvisorProfile)
-        .join(AdvisorProfile, AdvisorProfile.user_id == User.id)
-        .where(User.role == UserRole.advisor)
-        .where(User.is_active.is_(True))
-        .where(User.verification_status == VerificationStatus.approved)
+    """Persist leads from the hybrid matcher (rule score + optional AI blend)."""
+    ranked, _total = await advisor_matching_service.match(
+        session,
+        assessment,
+        limit=500,
+        offset=0,
+        positive_only=True,
+        use_ai=True,
     )
-    rows = (await session.execute(stmt)).all()
-    ratings = await review_service.rating_summaries(session, [user.id for user, _ in rows])
 
     leads: list[AdvisorLead] = []
-    for user, profile in rows:
-        average_rating = ratings[user.id][0] if user.id in ratings else None
-        score = score_advisor_for_assessment(
-            profile, assessment.destination_country, assessment.visa_type, average_rating
-        )
-        if score <= 0:
-            continue
+    for item in ranked:
+        reasons = item.match_reasons
+        if not reasons:
+            profile = (
+                await session.execute(
+                    select(AdvisorProfile).where(AdvisorProfile.user_id == item.user_id)
+                )
+            ).scalar_one_or_none()
+            reasons = (
+                _build_reasons(
+                    profile,
+                    assessment.destination_country,
+                    assessment.visa_type,
+                    item.average_rating,
+                )
+                if profile is not None
+                else "Matched by recommendation engine"
+            )
         lead = AdvisorLead(
             seeker_id=assessment.user_id,
-            advisor_id=user.id,
+            advisor_id=item.user_id,
             assessment_id=assessment.id,
-            match_score=score,
-            match_reasons=_build_reasons(
-                profile, assessment.destination_country, assessment.visa_type, average_rating
-            ),
+            match_score=item.match_score,
+            match_reasons=reasons,
             status=AdvisorLeadStatus.new,
         )
         session.add(lead)

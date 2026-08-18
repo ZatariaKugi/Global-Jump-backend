@@ -56,6 +56,7 @@ from app.models.notification import (
 from app.models.payout_request import PayoutRequest
 from app.models.regulatory_update import RegulatoryUpdate
 from app.models.review import Review
+from app.models.seeker_advisor_recommendation import SeekerAdvisorRecommendation
 from app.models.seeker_document import SeekerDocument, SeekerDocumentComment
 from app.models.seeker_profile import (
     SeekerCountryVisited,
@@ -106,6 +107,7 @@ __all__ = [
     "BookingNote",
     "BookingNoteAttachment",
     "BookingDocumentRequest",
+    "SeekerAdvisorRecommendation",
     "SeekerDocument",
     "SeekerDocumentComment",
     "EligibilityRule",

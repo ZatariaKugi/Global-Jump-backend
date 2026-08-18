@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 import io
+import os
+from datetime import timedelta
+from pathlib import Path
 
 import pytest
+from fastapi import UploadFile
 from httpx import AsyncClient
+
+from app.core.config import get_settings
+from app.core.exceptions import AppError
+from app.core.file_storage import (
+    assert_safe_file_name,
+    save_upload,
+    sweep_unreferenced_uploads,
+)
 
 
 @pytest.fixture
@@ -104,3 +116,50 @@ async def test_advisor_can_also_upload(client: AsyncClient, advisor_token: str) 
     resp = await _upload(client, advisor_token, "credential")
     assert resp.status_code == 201
     assert resp.json()["data"]["category"] == "credential"
+
+
+async def test_save_upload_rejects_extension_spoofed_pdf() -> None:
+    settings = get_settings()
+    upload = UploadFile(filename="fake.pdf", file=io.BytesIO(b"not-a-pdf"))
+    with pytest.raises(AppError) as exc:
+        await save_upload(upload, "seeker_document/test", settings)
+    assert exc.value.code == "invalid_file"
+
+
+async def test_save_upload_rejects_control_character_filename() -> None:
+    settings = get_settings()
+    upload = UploadFile(filename="bad\x00name.pdf", file=io.BytesIO(b"%PDF-1.4 x"))
+    with pytest.raises(AppError) as exc:
+        await save_upload(upload, "seeker_document/test", settings)
+    assert exc.value.code == "invalid_file_name"
+
+
+def test_assert_safe_file_name_rejects_overlong() -> None:
+    with pytest.raises(AppError) as exc:
+        assert_safe_file_name("a" * 256)
+    assert exc.value.code == "invalid_file_name"
+
+
+def test_orphan_sweep_deletes_old_unreferenced_files(tmp_path: Path) -> None:
+    settings = get_settings().model_copy(update={"UPLOAD_DIR": str(tmp_path)})
+    folder = tmp_path / "seeker_document" / "uid"
+    folder.mkdir(parents=True)
+    old = folder / "old.pdf"
+    kept = folder / "kept.pdf"
+    fresh = folder / "fresh.pdf"
+    old.write_bytes(b"%PDF-1.4 old")
+    kept.write_bytes(b"%PDF-1.4 kept")
+    fresh.write_bytes(b"%PDF-1.4 fresh")
+    os.utime(old, (1, 1))
+    os.utime(kept, (1, 1))
+
+    deleted = sweep_unreferenced_uploads(
+        settings,
+        prefix="seeker_document/",
+        referenced_keys={"seeker_document/uid/kept.pdf"},
+        older_than=timedelta(hours=24),
+    )
+    assert deleted == 1
+    assert not old.exists()
+    assert kept.exists()
+    assert fresh.exists()

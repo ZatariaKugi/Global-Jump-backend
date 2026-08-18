@@ -118,6 +118,22 @@ async def _revoke_all_refresh_tokens(session: AsyncSession, user_id: uuid.UUID) 
     await session.flush()
 
 
+async def invalidate_sessions(session: AsyncSession, user: User) -> None:
+    """Kill every live session: bump ``token_version`` and revoke refresh tokens.
+
+    Outstanding email-verify / password-reset links snapshot ``token_version`` at
+    issue time and will fail on consume after this bump.
+    """
+    user.token_version = user.token_version + 1
+    session.add(user)
+    await _revoke_all_refresh_tokens(session, user.id)
+
+
+def _assert_bound_token_version(record: UserToken, user: User, *, message: str, code: str) -> None:
+    if record.token_version != user.token_version:
+        raise AppError(message, code=code)
+
+
 # ---------------------------------------------------------------------------
 # Email verification
 # ---------------------------------------------------------------------------
@@ -157,6 +173,7 @@ async def create_email_verification_token(
         token_hash=hash_token(raw),
         purpose=TokenPurpose.email_verification,
         expires_at=datetime.now(UTC) + timedelta(hours=settings.EMAIL_VERIFY_TOKEN_EXPIRE_HOURS),
+        token_version=user.token_version,
     )
     session.add(record)
     await session.flush()
@@ -176,20 +193,28 @@ async def verify_email(session: AsyncSession, raw_token: str) -> User:
     now = datetime.now(UTC)
     if record is None:
         raise AuthenticationError("Invalid or expired verification token")
-    if record.used_at is not None:
-        raise AppError(
-            "This verification link has already been used",
-            code="verify_token_used",
-        )
+    # Expiry first so links superseded by a newer resend (force-expired) and
+    # naturally timed-out links share a clear "expired" message (GJ-EV-061).
     if _as_utc(record.expires_at) <= now:
         raise AppError(
             "Verification link has expired",
             code="verify_token_expired",
         )
+    if record.used_at is not None:
+        raise AppError(
+            "This verification link has already been used",
+            code="verify_token_used",
+        )
 
     user = await session.get(User, record.user_id)
     if user is None:
         raise AuthenticationError("User not found")
+    _assert_bound_token_version(
+        record,
+        user,
+        message="Verification link has expired",
+        code="verify_token_expired",
+    )
 
     if user.is_email_verified:
         # Burn the token so a stale link cannot be replayed after verification.
@@ -246,6 +271,7 @@ async def _issue_password_reset_token(session: AsyncSession, user: User, setting
         token_hash=hash_token(raw),
         purpose=TokenPurpose.password_reset,
         expires_at=now + timedelta(minutes=settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES),
+        token_version=user.token_version,
     )
     session.add(record)
     await session.flush()
@@ -254,18 +280,22 @@ async def _issue_password_reset_token(session: AsyncSession, user: User, setting
 
 async def create_password_reset_token(
     session: AsyncSession, email: str, settings: Settings
-) -> str | None:
-    """Generate + store a password reset token.  Returns raw token, or None if email unknown.
+) -> tuple[User, str] | None:
+    """Issue a reset token for a local-password account, or ``None``.
 
-    Callers should always return HTTP 200 regardless of the return value to prevent
-    email enumeration.
+    Returns ``None`` for unknown emails *and* Google-only accounts so public
+    callers can always respond 204 without leaking whether the address is
+    registered or how the account signs in.
     """
     from app.services.user_service import get_by_email
 
     user = await get_by_email(session, email)
     if user is None:
         return None
-    return await _issue_password_reset_token(session, user, settings)
+    if user.auth_provider == AuthProvider.google or user.hashed_password is None:
+        return None
+    raw = await _issue_password_reset_token(session, user, settings)
+    return user, raw
 
 
 async def create_password_reset_token_for_user(
@@ -283,9 +313,7 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-async def _get_valid_password_reset_token(
-    session: AsyncSession, raw_token: str
-) -> UserToken:
+async def _get_valid_password_reset_token(session: AsyncSession, raw_token: str) -> UserToken:
     """Return an unused, unexpired password-reset token or raise AppError."""
     token_hash = hash_token(raw_token)
     result = await session.execute(
@@ -325,6 +353,12 @@ async def validate_password_reset_token(session: AsyncSession, raw_token: str) -
             "Link has expired or is no longer valid",
             code="reset_token_invalid",
         )
+    _assert_bound_token_version(
+        record,
+        user,
+        message="Reset link has expired",
+        code="reset_token_expired",
+    )
     assert_password_reset_allowed(user)
 
 
@@ -333,6 +367,8 @@ async def reset_password(
 ) -> User:
     """Validate token, hash the new password, and invalidate every active session.
 
+    Completing a reset proves email ownership, so ``email_verified_at`` is set when
+    still unset — the user can sign in immediately without a separate verify step.
     Refresh tokens are revoked and ``token_version`` is bumped so existing access
     JWTs fail auth on the next request (immediate logout everywhere). The reset
     token is marked used + expired so the same link cannot be reused.
@@ -343,21 +379,28 @@ async def reset_password(
     user = await session.get(User, record.user_id)
     if user is None:
         raise AuthenticationError("User not found")
+    _assert_bound_token_version(
+        record,
+        user,
+        message="Reset link has expired",
+        code="reset_token_expired",
+    )
     assert_password_reset_allowed(user)
 
     if user.hashed_password and verify_password(new_password, user.hashed_password):
-        raise ConflictError(
-            "New password must be different from your current password"
-        )
+        raise ConflictError("New password must be different from your current password")
 
     user.hashed_password = hash_password(new_password)
-    user.token_version = user.token_version + 1
+    if user.email_verified_at is None:
+        user.email_verified_at = now
+        # Drop any outstanding verify links — account is verified via reset.
+        await _revoke_unused_email_verification_tokens(session, user.id)
     # Single-use: mark consumed and force-expire so a second submit fails validation.
     record.used_at = now
     record.expires_at = now
     session.add(user)
     session.add(record)
-    await _revoke_all_refresh_tokens(session, user.id)
+    await invalidate_sessions(session, user)
     await session.flush()
     await session.refresh(user)
     return user

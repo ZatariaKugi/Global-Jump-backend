@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Query
 
@@ -14,6 +14,7 @@ from app.core.visa_types import RequiredVisaType
 from app.db.session import SessionDep
 from app.models.assessment import Assessment, AssessmentStatus, InsightKind
 from app.models.user import User, UserRole
+from app.models.visa_type import VisaType
 from app.schemas.assessment import (
     AdvisorMatchRead,
     AnswersSubmit,
@@ -129,7 +130,11 @@ async def submit_answers(
     _require_seeker(current_user)
     assessment = await assessment_service.get_for_user(session, assessment_id, current_user.id)
     assessment = await assessment_service.submit_answers(
-        session, assessment, data.answers, settings, complete=data.complete
+        session,
+        assessment,
+        data.answers,
+        settings,
+        complete=data.complete,
     )
     return ResponseEnvelope[AssessmentRead](
         data=await _build_read(session, assessment),
@@ -187,27 +192,47 @@ async def list_matched_advisors(
     )
 
 
-@router.get("", response_model=ResponseEnvelope[list[AssessmentSummaryRead]])
+@router.get(
+    "",
+    response_model=ResponseEnvelope[list[AssessmentSummaryRead]],
+    summary="List my assessments",
+    description=(
+        "Seeker-owned assessment history. Omitted ``status`` / ``visa_type`` / ``q`` "
+        "keep current unfiltered behaviour (all statuses, all visas). History sends "
+        "``status=completed``. ``visa_type`` is never defaulted from the latest "
+        "assessment. ``q`` matches country code/name, visa slug/label, or score text. "
+        "Default sort is newest completed (``completed_at`` desc). "
+        "``matched_advisors_count`` equals ``meta.pagination.total`` on "
+        "GET /assessments/{id}/matched-advisors (live matcher, not advisor_leads)."
+    ),
+)
 async def list_my_assessments(
     params: PaginationDep,
     current_user: CurrentUser,
     session: SessionDep,
     request_id: RequestIdDep,
+    status: Annotated[AssessmentStatus | None, Query()] = None,
+    visa_type: Annotated[VisaType | None, Query()] = None,
+    q: Annotated[str | None, Query()] = None,
+    sort: Annotated[
+        Literal["newest"] | None,
+        Query(description="Only ``newest`` is supported; omitted uses the same order"),
+    ] = None,
 ) -> ResponseEnvelope[list[AssessmentSummaryRead]]:
     _require_seeker(current_user)
-    stmt = assessment_service.list_for_user_stmt(current_user.id)
+    _ = sort
+    stmt = assessment_service.list_for_user_stmt(
+        current_user.id,
+        status=status,
+        visa_type=visa_type,
+        q=q,
+    )
     assessments, total = await paginate(session, stmt, params)
+    counts = await assessment_service.matched_advisor_counts(session, list(assessments))
     return ResponseEnvelope[list[AssessmentSummaryRead]](
         data=[
-            AssessmentSummaryRead(
-                id=a.id,
-                destination_country=a.destination_country,
-                visa_type=a.visa_type,
-                status=a.status,
-                score=a.score,
-                tier=a.tier,
-                created_at=a.created_at,
-                completed_at=a.completed_at,
+            assessment_service.build_summary(
+                a, matched_advisors_count=counts.get(a.id, 0)
             )
             for a in assessments
         ],

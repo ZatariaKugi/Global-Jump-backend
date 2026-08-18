@@ -113,18 +113,20 @@ async def _send_confirmations(session: SessionDep, booking: Booking, settings: S
     for recipient, other in ((seeker, advisor), (advisor, seeker)):
         if recipient is None:
             continue
-        await email_service.send_booking_confirmation_email(
-            recipient.email,
-            recipient.full_name or recipient.email,
-            (other.full_name or other.email) if other else "your counterpart",
-            booking_id=str(booking.id),
-            service_type=booking.service_type,
-            start_utc=as_utc(booking.scheduled_start),
-            end_utc=as_utc(booking.scheduled_end),
-            duration_minutes=booking.duration_minutes,
-            price_usd=booking.price_usd,
-            notice_hours=notice,
-            settings=settings,
+        email_service.schedule_email(
+            email_service.send_booking_confirmation_email(
+                recipient.email,
+                recipient.full_name or recipient.email,
+                (other.full_name or other.email) if other else "your counterpart",
+                booking_id=str(booking.id),
+                service_type=booking.service_type,
+                start_utc=as_utc(booking.scheduled_start),
+                end_utc=as_utc(booking.scheduled_end),
+                duration_minutes=booking.duration_minutes,
+                price_usd=booking.price_usd,
+                notice_hours=notice,
+                settings=settings,
+            )
         )
 
 
@@ -134,14 +136,16 @@ async def _send_new_request_notification(
     seeker, advisor = await _party_names(session, booking)
     if advisor is None:
         return
-    await email_service.send_new_consultation_request_email(
-        advisor.email,
-        advisor.full_name or advisor.email,
-        (seeker.full_name or seeker.email) if seeker else "a seeker",
-        booking_id=str(booking.id),
-        service_type=booking.service_type,
-        start_utc=as_utc(booking.scheduled_start),
-        settings=settings,
+    email_service.schedule_email(
+        email_service.send_new_consultation_request_email(
+            advisor.email,
+            advisor.full_name or advisor.email,
+            (seeker.full_name or seeker.email) if seeker else "a seeker",
+            booking_id=str(booking.id),
+            service_type=booking.service_type,
+            start_utc=as_utc(booking.scheduled_start),
+            settings=settings,
+        )
     )
 
 
@@ -153,18 +157,20 @@ async def _send_reschedule_notifications(
     for recipient, other in ((seeker, advisor), (advisor, seeker)):
         if recipient is None:
             continue
-        await email_service.send_booking_rescheduled_email(
-            recipient.email,
-            recipient.full_name or recipient.email,
-            (other.full_name or other.email) if other else "your counterpart",
-            booking_id=str(booking.id),
-            service_type=booking.service_type,
-            start_utc=as_utc(booking.scheduled_start),
-            end_utc=as_utc(booking.scheduled_end),
-            duration_minutes=booking.duration_minutes,
-            price_usd=booking.price_usd,
-            notice_hours=notice,
-            settings=settings,
+        email_service.schedule_email(
+            email_service.send_booking_rescheduled_email(
+                recipient.email,
+                recipient.full_name or recipient.email,
+                (other.full_name or other.email) if other else "your counterpart",
+                booking_id=str(booking.id),
+                service_type=booking.service_type,
+                start_utc=as_utc(booking.scheduled_start),
+                end_utc=as_utc(booking.scheduled_end),
+                duration_minutes=booking.duration_minutes,
+                price_usd=booking.price_usd,
+                notice_hours=notice,
+                settings=settings,
+            )
         )
 
 
@@ -179,16 +185,18 @@ async def _send_cancellation_notifications(
     for recipient, other in ((seeker, advisor), (advisor, seeker)):
         if recipient is None:
             continue
-        await email_service.send_booking_cancelled_email(
-            recipient.email,
-            recipient.full_name or recipient.email,
-            (other.full_name or other.email) if other else "your counterpart",
-            booking_id=str(booking.id),
-            service_type=booking.service_type,
-            start_utc=as_utc(booking.scheduled_start),
-            reason=booking.cancellation_reason,
-            cancelled_by=cancelled_by,
-            settings=settings,
+        email_service.schedule_email(
+            email_service.send_booking_cancelled_email(
+                recipient.email,
+                recipient.full_name or recipient.email,
+                (other.full_name or other.email) if other else "your counterpart",
+                booking_id=str(booking.id),
+                service_type=booking.service_type,
+                start_utc=as_utc(booking.scheduled_start),
+                reason=booking.cancellation_reason,
+                cancelled_by=cancelled_by,
+                settings=settings,
+            )
         )
 
 
@@ -198,15 +206,17 @@ async def _send_rejection_notification(
     seeker, advisor = await _party_names(session, booking)
     if seeker is None:
         return
-    await email_service.send_booking_rejected_email(
-        seeker.email,
-        seeker.full_name or seeker.email,
-        (advisor.full_name or advisor.email) if advisor else "the advisor",
-        booking_id=str(booking.id),
-        service_type=booking.service_type,
-        start_utc=as_utc(booking.scheduled_start),
-        reason=booking.cancellation_reason,
-        settings=settings,
+    email_service.schedule_email(
+        email_service.send_booking_rejected_email(
+            seeker.email,
+            seeker.full_name or seeker.email,
+            (advisor.full_name or advisor.email) if advisor else "the advisor",
+            booking_id=str(booking.id),
+            service_type=booking.service_type,
+            start_utc=as_utc(booking.scheduled_start),
+            reason=booking.cancellation_reason,
+            settings=settings,
+        )
     )
 
 
@@ -222,16 +232,18 @@ async def _send_note_added_notification(
     if recipient is None or recipient.id == author.id:
         return
     preview = note.body.strip()[:200] if note.body else None
-    await email_service.send_booking_note_added_email(
-        recipient.email,
-        recipient.full_name or recipient.email,
-        author.full_name or author.email,
-        recipient.full_name or recipient.email,
-        booking_id=str(booking.id),
-        service_type=booking.service_type,
-        preview=preview,
-        has_attachments=bool(note.attachments),
-        settings=settings,
+    email_service.schedule_email(
+        email_service.send_booking_note_added_email(
+            recipient.email,
+            recipient.full_name or recipient.email,
+            author.full_name or author.email,
+            recipient.full_name or recipient.email,
+            booking_id=str(booking.id),
+            service_type=booking.service_type,
+            preview=preview,
+            has_attachments=bool(note.attachments),
+            settings=settings,
+        )
     )
 
 

@@ -6,11 +6,12 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from httpx import AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.security import hash_password
 from app.models.assessment import Assessment, AssessmentStatus, EligibilityTier
-from app.models.booking import Booking, BookingStatus
+from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus
 from app.models.conversation import Conversation
 from app.models.message import Message
 from app.models.payout_request import PayoutMethod, PayoutRequest, PayoutStatus
@@ -21,17 +22,38 @@ from app.models.user import SignupSource, User, UserRole, VerificationStatus
 
 ANALYTICS = "/api/v1/admin/analytics"
 
+SEEKER_PASSWORD = "CustPass123!"
+
+
+async def _mark_email_verified(engine, email: str) -> None:
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = (await session.execute(select(User).where(User.email == email))).scalar_one()
+        user.email_verified_at = datetime.now(UTC)
+        session.add(user)
+        await session.commit()
+
 
 async def _seeker_token(client: AsyncClient, email: str = "seeker@test.com") -> str:
-    await client.post(
-        "/api/v1/auth/register",
-        json={"email": email, "password": "custpass123", "full_name": "Test Seeker"},
-    )
     resp = await client.post(
-        "/api/v1/auth/login", data={"username": email, "password": "custpass123"}
+        "/api/v1/auth/register",
+        json={"email": email, "password": SEEKER_PASSWORD, "full_name": "Test Seeker"},
+    )
+    assert resp.status_code == 201, resp.text
+    await _mark_email_verified(client._test_engine, email)  # type: ignore[attr-defined]
+    resp = await client.post(
+        "/api/v1/auth/login", data={"username": email, "password": SEEKER_PASSWORD}
     )
     assert resp.status_code == 200, resp.text
     return str(resp.json()["access_token"])
+
+
+async def _next_appointment_number(session: AsyncSession) -> int:
+    result = await session.execute(select(func.max(Booking.appointment_number)))
+    current = result.scalar_one_or_none()
+    if current is None:
+        return APPOINTMENT_NUMBER_START
+    return int(current) + 1
 
 
 async def _seed_user(
@@ -73,6 +95,7 @@ async def _seed_booking(
         booking = Booking(
             seeker_id=seeker_id,
             advisor_id=advisor_id,
+            appointment_number=await _next_appointment_number(session),
             service_type="consultation_60",
             duration_minutes=duration_minutes,
             price_usd=price_usd,

@@ -27,6 +27,8 @@ logger = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
+    # Re-apply after uvicorn installs its own handlers so console colors stick.
+    configure_logging(settings)
     logger.info("startup", environment=settings.ENVIRONMENT.value)
     init_tracing(app, settings, engine=engine)
     push_service.init_firebase(settings)
@@ -37,6 +39,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         sweep_seconds=settings.TRANSFER_SWEEP_SECONDS,
         booking_expiry_sweep_seconds=settings.BOOKING_EXPIRY_SWEEP_SECONDS,
         push_sweep_seconds=settings.NOTIFICATION_PUSH_SWEEP_SECONDS,
+        orphan_upload_sweep_seconds=settings.UPLOAD_ORPHAN_SWEEP_SECONDS,
         push_enabled=settings.push_enabled,
     )
     yield

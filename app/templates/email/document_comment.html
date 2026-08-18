@@ -1,0 +1,19 @@
+{% extends "_base.html" %}
+{% from "_macros.html" import headline, details_open, details_row, details_close, quote, cta %}
+
+{% block title %}New comment on your document — {{ app_name }}{% endblock %}
+
+{% block content %}
+  {{ headline("New comment on your document") }}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    Hi {{ full_name }}, {{ advisor_name }} commented on your document.
+  </p>
+  {{ details_open() }}
+  {{ details_row("Document", document_name) }}
+  {{ details_row("From", advisor_name) }}
+  {{ details_close() }}
+  {% if preview %}
+    {{ quote(preview) }}
+  {% endif %}
+  {{ cta(documents_url, "View comment") }}
+{% endblock %}

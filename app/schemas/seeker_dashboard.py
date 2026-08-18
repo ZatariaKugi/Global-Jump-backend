@@ -1,12 +1,17 @@
 """Seeker home dashboard aggregate schemas (FE ``/seeker/dashboard``).
 
 A single home-screen summary for a seeker — stat cards, the per-stage visa
-journey chart, the eligibility donut, and AI-matched advisors. An optional
-``days`` window (7/30/90) scopes the eligibility figures and matched advisors
-to the latest completed assessment *within the window*, and makes
-``documents_uploaded`` count only in-window uploads; journey stages, progress
-percents, and ``next_upcoming`` remain current-state. ``window_days`` echoes
-the applied window (null = all-time).
+journey chart, the eligibility donut, and AI-matched advisors.
+
+``visa_type`` is an explicit filter only (same as GET /users/me/documents):
+omitted = all visa types; a specific value scopes stats, journey, eligibility,
+matched advisors, and ``documents_uploaded`` (untagged docs included).
+``days`` (7 / 30 / 90 / 180 / 365; omitted = all-time) is independent and
+combines with visa when both are set — it windows eligibility to the latest
+completed assessment in-window (score 0 if none) and ``documents_uploaded``
+to in-window uploads. Journey stages, progress percents, ``next_upcoming``,
+and ``matched_advisors`` (profile-based ``seeker_advisor_recommendations``)
+remain current-state. ``window_days`` echoes the applied window (null = all-time).
 """
 
 from __future__ import annotations
@@ -20,16 +25,18 @@ from app.core.visa_types import OptionalVisaType
 from app.models.assessment import EligibilityTier
 from app.schemas.assessment import AdvisorMatchRead
 from app.schemas.booking import BookingRead
-from app.schemas.visa_journey import JourneyStepKey
+from app.schemas.visa_journey import JourneyStepKey, JourneyStepStatus
 
 
 class SeekerDashboardStats(BaseModel):
-    """Stat-card figures. ``eligibility_*`` come from the latest completed
-    assessment for the resolved visa/country scope (within the ``days`` window
-    when one is given) — null until one exists. ``documents_uploaded`` counts
-    only in-window uploads when ``days`` is set; all-time otherwise."""
+    """Stat-card figures. ``eligibility_score`` is 0 when no completed
+    assessment exists (including an empty ``days`` window). ``visa_type`` /
+    ``country`` echo the request filters (null when omitted — never inferred).
+    ``documents_uploaded`` matches GET /users/me/documents: all visas when
+    ``visa_type`` is omitted, that visa plus untagged docs when set;
+    in-window only when ``days`` is set."""
 
-    eligibility_score: float | None
+    eligibility_score: float
     eligibility_tier: EligibilityTier | None
     visa_type: OptionalVisaType
     visa_type_name: str | None
@@ -38,16 +45,20 @@ class SeekerDashboardStats(BaseModel):
     journey_progress_percent: int
     documents_uploaded: int
     documents_progress_percent: int
+    application_status: JourneyStepStatus
     application_status_percent: int
 
 
 class JourneyStageRead(BaseModel):
-    """One bar on the Visa Journey Timeline chart. ``progress_percent`` is
-    derived from step status (completed=100, in_progress=50, pending=0) except
-    documentation, which uses the real document-checklist percent."""
+    """One bar on the Visa Journey Timeline chart (Assessment → Advisor →
+    Documents → Submission). ``progress_percent`` is derived from step status
+    (completed=100, in_progress=50, pending=0) except documentation, which uses
+    the real document-checklist percent. Review is not exposed here.
+    """
 
     key: JourneyStepKey
     label: str
+    status: JourneyStepStatus
     progress_percent: int
     active: bool
 

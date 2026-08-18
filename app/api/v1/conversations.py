@@ -81,13 +81,15 @@ async def _send_new_message_email(
     recipient = await session.get(User, recipient_id)
     if recipient is None or recipient.id == sender.id:
         return
-    await email_service.send_new_message_email(
-        recipient.email,
-        recipient.full_name or recipient.email,
-        sender.full_name or sender.email,
-        conversation_id=str(conversation.id),
-        preview=conversation_service.message_preview(message) or "New message",
-        settings=settings,
+    email_service.schedule_email(
+        email_service.send_new_message_email(
+            recipient.email,
+            recipient.full_name or recipient.email,
+            sender.full_name or sender.email,
+            conversation_id=str(conversation.id),
+            preview=conversation_service.message_preview(message) or "New message",
+            settings=settings,
+        )
     )
 
 

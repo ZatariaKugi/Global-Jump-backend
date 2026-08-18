@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     ENVIRONMENT: Environment = Environment.local
     LOG_LEVEL: str = "INFO"
     LOG_JSON: bool = False
+    SCHEDULER_ENABLED: bool = True
 
     # API --------------------------------------------------------------------
     PROJECT_NAME: str = "GlobleJump API"
@@ -103,6 +104,10 @@ class Settings(BaseSettings):
     ENCRYPTION_KEY: str = ""  # base64url-encoded 32-byte key (AES-256)
     UPLOAD_DIR: str = "uploads"  # root directory for credential file uploads (local fallback)
     UPLOAD_MAX_MB: int = 10
+    # Orphan ``seeker_document/`` objects (uploaded but never attached to a
+    # portfolio row) are deleted after this many hours.
+    UPLOAD_ORPHAN_TTL_HOURS: int = 24
+    UPLOAD_ORPHAN_SWEEP_SECONDS: int = 3600
 
     # File storage — S3 (used when AWS_ACCESS_KEY_ID/S3_BUCKET_NAME are set; otherwise
     # falls back to local disk storage under UPLOAD_DIR)

@@ -1,8 +1,10 @@
 """Eligibility assessment engine — questionnaire selection and weighted scoring.
 
-Deterministic rule engine (PRD §3.4): each answered option contributes its score
-(0–100) weighted by the question's weight. The overall score maps to a tier
-(§3.4.2) and low-scoring answers surface their improvement tips.
+Deterministic rule engine (PRD §3.4): each applicable question contributes its
+weight to the denominator. Answered options contribute ``option.score × weight``
+(0–100); unanswered applicable questions contribute ``0`` so incomplete
+submissions cannot inflate to 100%. The overall score maps to a tier (§3.4.2);
+low-scoring answers and skipped questions surface tips / missing requirements.
 """
 
 from __future__ import annotations
@@ -11,13 +13,14 @@ import uuid
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import Select, or_, select
+from sqlalchemy import Select, String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.config import Settings
-from app.core.countries import country_name
+from app.core.countries import COUNTRY_NAMES, country_name
 from app.core.exceptions import AppError, NotFoundError
-from app.core.visa_types import visa_type_name
+from app.core.visa_types import VISA_TYPE_LABELS, visa_type_name
 from app.models.assessment import (
     Assessment,
     AssessmentAnswer,
@@ -31,11 +34,13 @@ from app.models.assessment import (
     InsightKind,
 )
 from app.models.assessment_threshold import AssessmentThreshold
+from app.models.visa_type import VisaType
 from app.schemas.assessment import (
     AnswerInput,
     AssessmentAnalyticsRead,
     AssessmentCreate,
     AssessmentDropOffPoint,
+    AssessmentSummaryRead,
     AssessmentVolumePoint,
     QuestionCreate,
     QuestionOptionInput,
@@ -125,7 +130,11 @@ async def list_questions(
     return list(result.scalars().all())
 
 
-async def start(session: AsyncSession, user_id: uuid.UUID, data: AssessmentCreate) -> Assessment:
+async def start(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    data: AssessmentCreate,
+) -> Assessment:
     country = data.destination_country.upper()
     visa = data.visa_type.lower()
     variant = await ab_variant_service.pick_for_scope(session, country, visa)
@@ -232,10 +241,17 @@ async def submit_answers(
     tips: list[str] = []
     answer_rows: list[AssessmentAnswer] = []
     answered_pairs: list[tuple[AssessmentQuestion, AssessmentQuestionOption]] = []
+    unanswered: list[AssessmentQuestion] = []
 
     for question in applicable:
+        # Every applicable question counts in the denominator. Unanswered ones
+        # contribute 0 so skipping cannot produce an inflated Highly Eligible score.
+        weight_total += question.weight
         submitted = answer_by_question.get(question.id)
         if submitted is None:
+            unanswered.append(question)
+            tip = f"Answer this question to complete your assessment: {question.text}"
+            tips.append(tip[:500])
             continue
         option = next((o for o in question.options if o.id == submitted.option_id), None)
         if option is None:
@@ -243,7 +259,6 @@ async def submit_answers(
 
         answered += 1
         weighted_sum += option.score * question.weight
-        weight_total += question.weight
         if question.category is not None:
             category_totals[question.category.value].append(option.score)
         if option.score < TIP_SCORE_THRESHOLD and option.improvement_tip:
@@ -259,12 +274,14 @@ async def submit_answers(
 
     if answered == 0:
         raise AppError("No valid answers submitted", code="invalid_answer")
+    if weight_total <= 0:
+        raise AppError("No questionnaire configured", code="no_questions")
 
     assessment.score = round(weighted_sum / weight_total, 2)
     assessment.tier = await resolve_tier(
         session, assessment.score, assessment.destination_country, assessment.visa_type
     )
-    assessment.confidence = round(answered / len(applicable), 2)
+    assessment.confidence = round(answered / len(applicable), 2) if applicable else 0.0
     assessment.status = AssessmentStatus.completed
     assessment.completed_at = datetime.now(UTC)
     assessment.updated_by = assessment.user_id
@@ -297,14 +314,14 @@ async def submit_answers(
             process_notes=[n.text for n in published.process_notes],
         )
 
-    # Best-effort AI narrative — None (unconfigured/failed) leaves insights
-    # empty and ai_summary NULL; the frontend falls back to improvement_tips.
+    # Best-effort AI narrative — None (unconfigured/failed) leaves AI fields
+    # empty; unanswered questions still become deterministic missing requirements.
     payload = await ai_insight_service.generate_insights(
         assessment, answered_pairs, settings, policy_ref
     )
+    insight_rows: list[AssessmentInsight] = []
     if payload is not None:
         assessment.ai_summary = payload.summary
-        insight_rows: list[AssessmentInsight] = []
         for kind, texts in (
             (InsightKind.strength, payload.strengths),
             (InsightKind.weakness, payload.weaknesses),
@@ -319,24 +336,124 @@ async def submit_answers(
                         display_order=order,
                     )
                 )
-        assessment.insights = insight_rows
+
+    # Always surface skipped applicable questions as missing requirements so the
+    # result cannot look "complete" when the seeker left questions unanswered.
+    missing_start = len(insight_rows)
+    for offset, question in enumerate(unanswered):
+        text = f"Unanswered assessment question: {question.text}"[:500]
+        insight_rows.append(
+            AssessmentInsight(
+                assessment_id=assessment.id,
+                kind=InsightKind.missing_requirement,
+                text=text,
+                display_order=missing_start + offset,
+            )
+        )
+    assessment.insights = insight_rows
 
     session.add(assessment)
     await session.flush()
     await session.refresh(assessment)
 
-    from app.services import advisor_lead_service  # local import avoids a cycle at import time
+    from app.services import advisor_lead_service
 
+    # Assessment matches go to advisor_leads only. Never refresh or clear
+    # seeker_advisor_recommendations, and never copy country/visa onto profile intent.
     await advisor_lead_service.generate_for_assessment(session, assessment)
 
     return assessment
 
 
-def list_for_user_stmt(user_id: uuid.UUID) -> Select[tuple[Assessment]]:
-    return (
-        select(Assessment)
-        .where(Assessment.user_id == user_id)
-        .order_by(Assessment.created_at.desc())
+def _search_clause(q: str) -> ColumnElement[bool]:
+    """Case-insensitive match on country code/name, visa slug/label, or score text."""
+    term = q.strip().casefold()
+    pattern = f"%{term}%"
+    country_codes = [
+        code
+        for code, name in COUNTRY_NAMES.items()
+        if term in code.casefold() or term in name.casefold()
+    ]
+    visa_slugs = [
+        visa.value
+        for visa, label in VISA_TYPE_LABELS.items()
+        if term in visa.value or term in label.casefold()
+    ]
+    clauses: list[ColumnElement[bool]] = [
+        func.lower(Assessment.destination_country).like(pattern),
+        func.lower(Assessment.visa_type).like(pattern),
+        cast(Assessment.score, String).like(pattern),
+    ]
+    if country_codes:
+        clauses.append(Assessment.destination_country.in_(country_codes))
+    if visa_slugs:
+        clauses.append(Assessment.visa_type.in_(visa_slugs))
+    return or_(*clauses)
+
+
+def list_for_user_stmt(
+    user_id: uuid.UUID,
+    *,
+    status: AssessmentStatus | None = None,
+    visa_type: VisaType | None = None,
+    q: str | None = None,
+) -> Select[tuple[Assessment]]:
+    """Seeker-owned assessments. Omitted visa/status/q = unfiltered (all visas)."""
+    stmt = select(Assessment).where(Assessment.user_id == user_id)
+    if status is not None:
+        stmt = stmt.where(Assessment.status == status)
+    if visa_type is not None:
+        stmt = stmt.where(Assessment.visa_type == visa_type.value)
+    if q is not None and q.strip():
+        stmt = stmt.where(_search_clause(q))
+    return stmt.order_by(
+        Assessment.completed_at.desc().nulls_last(),
+        Assessment.created_at.desc(),
+    )
+
+
+async def matched_advisor_counts(
+    session: AsyncSession, assessments: list[Assessment]
+) -> dict[uuid.UUID, int]:
+    """Live matcher totals — same as GET /assessments/{id}/matched-advisors.
+
+    ``limit=0`` still runs the full rank (including AI blend) and returns only
+    ``total``, so History ``matched_advisors_count`` cannot drift from the panel.
+    """
+    from app.services import advisor_matching_service
+
+    counts: dict[uuid.UUID, int] = {}
+    for assessment in assessments:
+        if assessment.status != AssessmentStatus.completed:
+            counts[assessment.id] = 0
+            continue
+        _items, total = await advisor_matching_service.match(
+            session,
+            assessment,
+            limit=0,
+            offset=0,
+            positive_only=True,
+            use_ai=True,
+        )
+        counts[assessment.id] = int(total)
+    return counts
+
+
+def build_summary(
+    assessment: Assessment, *, matched_advisors_count: int = 0
+) -> AssessmentSummaryRead:
+    return AssessmentSummaryRead(
+        id=assessment.id,
+        destination_country=assessment.destination_country,
+        destination_country_name=country_name(assessment.destination_country),
+        visa_type=assessment.visa_type,
+        visa_type_name=visa_type_name(assessment.visa_type),
+        status=assessment.status,
+        score=assessment.score,
+        tier=assessment.tier,
+        created_at=assessment.created_at,
+        completed_at=assessment.completed_at,
+        matched_advisors_count=matched_advisors_count,
     )
 
 

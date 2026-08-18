@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -37,6 +38,7 @@ from app.schemas.advisor_admin import (
     VerificationQueueRead,
 )
 from app.schemas.advisor_credential import AdvisorCredentialRead, CredentialStatusUpdate
+from app.schemas.advisor_dashboard import DashboardWindow
 from app.schemas.advisor_profile import AdvisorProfileRead
 from app.schemas.analytics import (
     AdvisorAnalyticsRead,
@@ -54,6 +56,7 @@ from app.schemas.assessment import (
 )
 from app.schemas.assessment_threshold import AssessmentThresholdRead, AssessmentThresholdUpsert
 from app.schemas.booking import (
+    AdminBookingPickerRead,
     BookingDetailsRead,
     BookingRead,
     BookingReschedule,
@@ -168,6 +171,7 @@ async def update_advisor_verification(
     from app.core.exceptions import NotFoundError
     from app.services import advisor_credential_service
     from app.services.email_service import (
+        schedule_email,
         send_advisor_pending_email,
         send_advisor_rejected_email,
         send_advisor_welcome_email,
@@ -216,28 +220,34 @@ async def update_advisor_verification(
         body.status == VerificationStatus.approved
         and previous_status != VerificationStatus.approved
     ):
-        await send_advisor_welcome_email(
-            advisor.email,
-            advisor.full_name or "",
-            settings,
+        schedule_email(
+            send_advisor_welcome_email(
+                advisor.email,
+                advisor.full_name or "",
+                settings,
+            )
         )
     elif (
         body.status == VerificationStatus.rejected
         and previous_status != VerificationStatus.rejected
     ):
-        await send_advisor_rejected_email(
-            advisor.email,
-            advisor.full_name or "",
-            settings,
-            reason=body.reason,
+        schedule_email(
+            send_advisor_rejected_email(
+                advisor.email,
+                advisor.full_name or "",
+                settings,
+                reason=body.reason,
+            )
         )
     elif (
         body.status == VerificationStatus.pending and previous_status != VerificationStatus.pending
     ):
-        await send_advisor_pending_email(
-            advisor.email,
-            advisor.full_name or "",
-            settings,
+        schedule_email(
+            send_advisor_pending_email(
+                advisor.email,
+                advisor.full_name or "",
+                settings,
+            )
         )
 
     return ResponseEnvelope[AdvisorRead](
@@ -486,14 +496,37 @@ async def list_advisor_sessions(
     ``search`` matches appointment number, service type, and the seeker's
     full name / email (ilike).
     """
-    stmt = booking_service.list_for_user_stmt(
-        advisor_id, UserRole.advisor, status=status, q=search
-    )
+    stmt = booking_service.list_for_user_stmt(advisor_id, UserRole.advisor, status=status, q=search)
     bookings, total = await paginate(session, stmt, params)
     data = await advisor_admin_service.build_session_reads(
         session, bookings, settings, viewer_role=UserRole.admin
     )
     return ResponseEnvelope[list[AdvisorSessionRead]](
+        data=data, meta=page_meta(params, total, request_id)
+    )
+
+
+@router.get(
+    "/users/{user_id}/bookings",
+    response_model=ResponseEnvelope[list[AdminBookingPickerRead]],
+)
+async def list_user_bookings(
+    user_id: uuid.UUID,
+    params: PaginationDep,
+    session: SessionDep,
+    request_id: RequestIdDep,
+    status: BookingStatus | None = None,
+    q: str | None = None,
+) -> ResponseEnvelope[list[AdminBookingPickerRead]]:
+    """Bookings where the user is the seeker or the advisor.
+
+    Powers the support "related session" picker when an admin creates a
+    booking ticket for a user. ``q`` matches appointment number / service type.
+    """
+    stmt = booking_service.list_by_user_stmt(user_id, status=status, q=q)
+    bookings, total = await paginate(session, stmt, params)
+    data = await booking_service.build_picker_reads(session, bookings)
+    return ResponseEnvelope[list[AdminBookingPickerRead]](
         data=data, meta=page_meta(params, total, request_id)
     )
 
@@ -1521,6 +1554,7 @@ async def list_seeker_documents_admin(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[SeekerDocumentRead]]:
+    await seeker_document_service.refresh_expired_statuses(session, seeker_id)
     stmt = seeker_document_service.list_by_seeker_stmt(seeker_id)
     documents, total = await paginate(session, stmt, params)
     return ResponseEnvelope[list[SeekerDocumentRead]](
@@ -1699,6 +1733,7 @@ async def send_support_ticket_message(
     from app.core.exceptions import NotFoundError, PermissionDeniedError
 
     ticket = await support_ticket_service.get_by_id(session, ticket_id)
+    support_ticket_service.assert_repliable(ticket)
     admin_user = await session.get(User, principal.id)
     if admin_user is None:
         raise NotFoundError("User not found")
@@ -1775,7 +1810,12 @@ async def get_engagement_analytics(
 
 @router.get("/dashboard", response_model=ResponseEnvelope[DashboardSummaryRead])
 async def get_dashboard(
-    session: SessionDep, request_id: RequestIdDep, days: int = 180
+    session: SessionDep,
+    request_id: RequestIdDep,
+    days: Annotated[
+        DashboardWindow | None,
+        Query(description="Window: 7, 30, 90, 180, or 365 days; omitted = all-time"),
+    ] = None,
 ) -> ResponseEnvelope[DashboardSummaryRead]:
     data = await dashboard_service.get_dashboard_summary(session, days)
     return ResponseEnvelope[DashboardSummaryRead](data=data, meta=Meta(request_id=request_id))
@@ -1783,7 +1823,13 @@ async def get_dashboard(
 
 @router.get("/activities", response_model=ResponseEnvelope[list[ActivityFeedItemRead]])
 async def list_activities(
-    session: SessionDep, request_id: RequestIdDep, params: PaginationDep, days: int = 180
+    session: SessionDep,
+    request_id: RequestIdDep,
+    params: PaginationDep,
+    days: Annotated[
+        DashboardWindow | None,
+        Query(description="Window: 7, 30, 90, 180, or 365 days; omitted = all-time"),
+    ] = None,
 ) -> ResponseEnvelope[list[ActivityFeedItemRead]]:
     items, total = await dashboard_service.list_recent_activities_page(session, days, params)
     return ResponseEnvelope[list[ActivityFeedItemRead]](

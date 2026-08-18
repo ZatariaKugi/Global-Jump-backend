@@ -13,3 +13,5 @@ Open the conversation to reply:
 {{ app_name }}
 © {{ year }} {{ app_name }}. All rights reserved.
 Need help? {{ support_email }}
+How it works: {{ how_it_works_url }}
+FAQs: {{ faq_url }}

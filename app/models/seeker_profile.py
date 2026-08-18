@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 
-from sqlalchemy import Date, ForeignKey, Integer, String
+from sqlalchemy import Date, DateTime, ForeignKey, Integer, String
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -86,6 +86,10 @@ class SeekerProfile(BaseModel):
     # Onboarding intent — captured during the post-registration onboarding wizard
     intended_visa_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     intended_destination: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    # Set by POST /users/me/visa-journey/submit once Review is complete.
+    application_submitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Passport — stored AES-256-GCM encrypted; plaintext never persisted
     passport_number_encrypted: Mapped[str | None] = mapped_column(String(500), nullable=True)

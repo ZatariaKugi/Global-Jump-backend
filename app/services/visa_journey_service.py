@@ -13,14 +13,17 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.countries import country_name
+from app.core.exceptions import ConflictError
 from app.core.file_storage import resolve_media_url
 from app.core.visa_types import parse_visa_type, visa_type_name
+from app.models.advisor_bookmark import AdvisorBookmark
 from app.models.assessment import Assessment, AssessmentStatus
 from app.models.booking import Booking, BookingStatus, PaymentStatus
 from app.models.booking_document_request import BookingDocumentRequest, DocumentRequestStatus
@@ -36,7 +39,12 @@ from app.schemas.visa_journey import (
     VisaJourneyRead,
     VisaJourneyStep,
 )
-from app.services import booking_service, conversation_service, seeker_document_service
+from app.services import (
+    booking_service,
+    conversation_service,
+    seeker_document_service,
+    seeker_profile_service,
+)
 from app.services.conversation_service import PUBLIC_STATUSES
 
 _STEP_COPY: tuple[tuple[JourneyStepKey, str, str], ...] = (
@@ -75,8 +83,8 @@ _ACTIVE_BOOKING = (
 
 STEP_KEYS: tuple[JourneyStepKey, ...] = tuple(key for key, _, _ in _STEP_COPY)
 
-# application_preparation is computed but hidden from the visa-journey stepper;
-# progress/completed counts are defined over the visible steps only.
+# Journey Cover / dashboard timeline use four seeker-facing keys. Review
+# (application_preparation) remains in STEP_KEYS for unlock/submit gating only.
 VISIBLE_STEP_KEYS: tuple[JourneyStepKey, ...] = tuple(
     key for key in STEP_KEYS if key != JourneyStepKey.application_preparation
 )
@@ -198,14 +206,17 @@ def _assessment_status(assessment: Assessment | None) -> JourneyStepStatus:
     return JourneyStepStatus.in_progress
 
 
-def _advisor_status(bookings: list[Booking], unlocked: bool) -> JourneyStepStatus:
+def _advisor_status(
+    bookings: list[Booking], unlocked: bool, *, selected: bool
+) -> JourneyStepStatus:
+    """Paid booking completes the stage; chat/bookmark/unpaid booking = selected."""
     if not unlocked:
-        return JourneyStepStatus.pending
-    if not bookings:
         return JourneyStepStatus.pending
     if any(b.payment_status == PaymentStatus.paid for b in bookings):
         return JourneyStepStatus.completed
-    return JourneyStepStatus.in_progress
+    if bookings or selected:
+        return JourneyStepStatus.in_progress
+    return JourneyStepStatus.pending
 
 
 def _documentation_status(
@@ -238,13 +249,25 @@ def _submission_status(unlocked: bool, *, done: bool) -> JourneyStepStatus:
     return JourneyStepStatus.in_progress
 
 
-def overall_progress(statuses: dict[JourneyStepKey, JourneyStepStatus], doc_progress: int) -> int:
-    """Weighted 0–100 progress over the visible steps only."""
-    total = len(VISIBLE_STEP_KEYS)
+def documentation_progress(summary: DocumentPortfolioSummary) -> int:
+    """0–100 mix of category uploads and approvals (in-progress Documents bar)."""
+    upload = max(0, min(summary.progress_percent, 100))
+    required = len(summary.checklist) or 1
+    approve = int(round(100 * summary.approved / required))
+    return max(0, min(100, int(round((upload + approve) / 2))))
+
+
+def weighted_progress(
+    statuses: dict[JourneyStepKey, JourneyStepStatus],
+    doc_progress: int,
+    keys: tuple[JourneyStepKey, ...],
+) -> int:
+    """Equal weight per key: completed=1, in_progress=0.5 (docs use real %)."""
+    total = len(keys)
     if total == 0:
         return 0
     score = 0.0
-    for key in VISIBLE_STEP_KEYS:
+    for key in keys:
         status = statuses[key]
         if status == JourneyStepStatus.completed:
             score += 1.0
@@ -254,6 +277,31 @@ def overall_progress(statuses: dict[JourneyStepKey, JourneyStepStatus], doc_prog
             else:
                 score += 0.5
     return int(round(100 * score / total))
+
+
+def overall_progress(statuses: dict[JourneyStepKey, JourneyStepStatus], doc_progress: int) -> int:
+    """Journey Cover — 4 visible stepper keys."""
+    return weighted_progress(statuses, doc_progress, VISIBLE_STEP_KEYS)
+
+
+def application_status_percent(
+    statuses: dict[JourneyStepKey, JourneyStepStatus], doc_progress: int
+) -> int:
+    """Application Status — same four timeline stages as the dashboard chart."""
+    return weighted_progress(statuses, doc_progress, VISIBLE_STEP_KEYS)
+
+
+def application_status_state(
+    statuses: dict[JourneyStepKey, JourneyStepStatus],
+) -> JourneyStepStatus:
+    if all(statuses[k] == JourneyStepStatus.completed for k in STEP_KEYS):
+        return JourneyStepStatus.completed
+    if any(
+        statuses[k] in (JourneyStepStatus.completed, JourneyStepStatus.in_progress)
+        for k in STEP_KEYS
+    ):
+        return JourneyStepStatus.in_progress
+    return JourneyStepStatus.pending
 
 
 async def _build_suggestion(
@@ -320,6 +368,36 @@ async def _build_suggestion(
     return None
 
 
+async def _advisor_selected(session: AsyncSession, seeker_id: uuid.UUID) -> bool:
+    """True when the seeker has chatted with or bookmarked an advisor."""
+    has_chat = bool(
+        (
+            await session.execute(
+                select(Conversation.id)
+                .where(
+                    Conversation.seeker_id == seeker_id,
+                    Conversation.is_archived.is_(False),
+                )
+                .limit(1)
+            )
+        ).first()
+    )
+    if has_chat:
+        return True
+    return bool(
+        (
+            await session.execute(
+                select(AdvisorBookmark.id)
+                .where(
+                    AdvisorBookmark.seeker_id == seeker_id,
+                    AdvisorBookmark.is_archived.is_(False),
+                )
+                .limit(1)
+            )
+        ).first()
+    )
+
+
 async def compute_state(
     session: AsyncSession,
     seeker_id: uuid.UUID,
@@ -334,10 +412,14 @@ async def compute_state(
     summary = await seeker_document_service.portfolio_summary(
         session, seeker_id, visa_type=visa_type
     )
+    profile = await seeker_profile_service.get_or_create(session, seeker_id)
+    submitted = profile.application_submitted_at is not None
 
     assessment_st = _assessment_status(assessment)
     advisor_unlocked = assessment_st == JourneyStepStatus.completed
-    advisor_st = _advisor_status(bookings, advisor_unlocked)
+    advisor_st = _advisor_status(
+        bookings, advisor_unlocked, selected=await _advisor_selected(session, seeker_id)
+    )
 
     docs_unlocked = advisor_st in (
         JourneyStepStatus.completed,
@@ -350,19 +432,20 @@ async def compute_state(
 
     prep_unlocked = docs_st == JourneyStepStatus.completed
     prep_done = False
-    if prep_unlocked and bookings:
-        candidates = [b for b in bookings if b.payment_status == PaymentStatus.paid] or bookings
-        for booking in candidates:
-            if await _all_requests_fulfilled(session, booking.id):
-                prep_done = True
-                break
+    if prep_unlocked:
+        if bookings:
+            candidates = [b for b in bookings if b.payment_status == PaymentStatus.paid] or bookings
+            for booking in candidates:
+                if await _all_requests_fulfilled(session, booking.id):
+                    prep_done = True
+                    break
+        else:
+            # No advisor requests outstanding — Review completes with the docs.
+            prep_done = True
     prep_st = _app_prep_status(prep_unlocked, prep_done)
 
-    # Documentation completing (all docs advisor-approved) also completes submission.
-    submission_unlocked = docs_st == JourneyStepStatus.completed
-    submission_st = _submission_status(
-        submission_unlocked, done=docs_st == JourneyStepStatus.completed
-    )
+    submission_unlocked = prep_st == JourneyStepStatus.completed
+    submission_st = _submission_status(submission_unlocked, done=submitted)
 
     statuses = {
         JourneyStepKey.assessment: assessment_st,
@@ -377,6 +460,27 @@ async def compute_state(
         summary=summary,
         statuses=statuses,
     )
+
+
+async def submit_application(
+    session: AsyncSession,
+    seeker_id: uuid.UUID,
+    actor_id: uuid.UUID,
+    *,
+    visa_type: VisaType | None,
+    country: str | None,
+) -> JourneyState:
+    """Mark the visa application submitted. Idempotent. Requires Review complete."""
+    state = await compute_state(session, seeker_id, visa_type=visa_type, country=country)
+    if state.statuses[JourneyStepKey.application_preparation] != JourneyStepStatus.completed:
+        raise ConflictError("Complete the review stage before submitting your application")
+    profile = await seeker_profile_service.get_or_create(session, seeker_id)
+    if profile.application_submitted_at is None:
+        profile.application_submitted_at = datetime.now(UTC)
+        profile.updated_by = actor_id
+        session.add(profile)
+        await session.flush()
+    return await compute_state(session, seeker_id, visa_type=visa_type, country=country)
 
 
 async def get_journey(
@@ -402,6 +506,9 @@ async def get_journey(
         if key == JourneyStepKey.documentation and status == JourneyStepStatus.in_progress:
             action = "go_to_documents"
             action_label = "Go to documents"
+        if key == JourneyStepKey.submission and status == JourneyStepStatus.in_progress:
+            action = "submit_application"
+            action_label = "Submit application"
         steps.append(
             VisaJourneyStep(
                 key=key,
@@ -444,7 +551,7 @@ async def get_journey(
         current_status_label=status_label,
         completed_steps=completed_steps,
         total_steps=len(steps),
-        progress_percent=overall_progress(statuses, summary.progress_percent),
+        progress_percent=overall_progress(statuses, documentation_progress(summary)),
         steps=steps,
         advisor_suggestion=suggestion,
         assessment_id=assessment.id if assessment else None,

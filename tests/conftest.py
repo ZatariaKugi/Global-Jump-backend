@@ -95,6 +95,9 @@ async def client(engine) -> AsyncIterator[AsyncClient]:
     async with LifespanManager(app):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            # Helpers like `_seeker` login after register; they need the test
+            # engine to stamp `email_verified_at` (seeker/advisor login requires it).
+            ac._test_engine = engine  # type: ignore[attr-defined]
             yield ac
 
 

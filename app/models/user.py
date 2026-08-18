@@ -97,8 +97,9 @@ class User(BaseModel):
     google_sub: Mapped[str | None] = mapped_column(
         String(255), unique=True, index=True, nullable=True, sort_order=108
     )
-    # Bumped on password reset (and similar) so existing access JWTs fail auth
-    # immediately — refresh-token revoke alone cannot kill live access tokens.
+    # Bumped on password reset and in-app password change so existing access
+    # JWTs fail auth immediately — refresh-token revoke alone cannot kill live
+    # access tokens. One-time verify/reset tokens snapshot this value at issue.
     token_version: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False, sort_order=109
     )
