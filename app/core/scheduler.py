@@ -13,7 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.db.session import async_session_factory
-from app.services import booking_service, payment_service, push_service
+from app.services import booking_service, payment_service, push_service, upload_cleanup_service
 
 logger = get_logger(__name__)
 
@@ -59,6 +59,19 @@ async def _sweep_due_pushes(settings: Settings) -> None:
             logger.exception("push_sweep_failed")
 
 
+async def _sweep_orphan_uploads(settings: Settings) -> None:
+    """Delete seeker-document files that never became a portfolio row."""
+    async with async_session_factory() as session:
+        try:
+            count = await upload_cleanup_service.sweep_orphan_seeker_uploads(session, settings)
+            await session.commit()
+            if count:
+                logger.info("orphan_upload_sweep_completed", deleted=count)
+        except Exception:  # noqa: BLE001 — a sweep failure must not kill the scheduler
+            await session.rollback()
+            logger.exception("orphan_upload_sweep_failed")
+
+
 def create_scheduler(settings: Settings) -> AsyncIOScheduler:
     """Build the scheduler with the transfer-sweep job registered."""
     scheduler = AsyncIOScheduler()
@@ -93,5 +106,15 @@ def create_scheduler(settings: Settings) -> AsyncIOScheduler:
         coalesce=True,
         max_instances=1,
         misfire_grace_time=settings.NOTIFICATION_PUSH_SWEEP_SECONDS,
+    )
+    scheduler.add_job(
+        _sweep_orphan_uploads,
+        trigger="interval",
+        seconds=settings.UPLOAD_ORPHAN_SWEEP_SECONDS,
+        args=[settings],
+        id="orphan_upload_sweep",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=settings.UPLOAD_ORPHAN_SWEEP_SECONDS,
     )
     return scheduler

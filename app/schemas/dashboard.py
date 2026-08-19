@@ -25,7 +25,7 @@ class ActivityEventType(StrEnum):
 
 
 class RevenueBreakdownSliceRead(BaseModel):
-    label: str  # "Consultant" | "Document Review" | "Others"
+    label: str  # "Advisor" | "Document Review" | "Platform"
     amount_usd: float
     pct: float  # 0-100, 2dp; slices sum to ~100 modulo rounding
 
@@ -38,12 +38,15 @@ class ActivityFeedItemRead(BaseModel):
 
 
 class DashboardSummaryRead(BaseModel):
-    window_days: int
-    total_users: int  # all-time, NOT windowed
-    total_advisors: int  # all-time
-    active_advisors: int  # all-time
+    window_days: int | None  # null = all-time (``days`` omitted)
+    total_users: int  # scoped by ``days`` when set; all-time when omitted
+    total_seekers: int  # role=seeker; same window as total_users
+    verified_seekers: int  # seekers with email_verified_at set; same window
+    total_advisors: int  # same window
+    verified_advisors: int  # verification_status=approved; same window
+    active_advisors: int  # approved + is_active; same window
     revenue_today_usd: float  # today's UTC calendar date only, unaffected by window_days
-    user_registration_trend: list[MonthlyCountPoint]  # all users, monthly
-    ai_assessment_volume: list[MonthlyCountPoint]  # all assessments, monthly
+    user_registration_trend: list[MonthlyCountPoint]  # YYYY-MM; YYYY-MM-DD when days=7
+    ai_assessment_volume: list[MonthlyCountPoint]  # same bucket rules as user_registration_trend
     revenue_breakdown: list[RevenueBreakdownSliceRead]  # empty buckets omitted
     recent_activities: list[ActivityFeedItemRead]  # capped at 6

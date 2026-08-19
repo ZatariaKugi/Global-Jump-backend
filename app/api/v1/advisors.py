@@ -80,10 +80,12 @@ from app.services import (
     booking_service,
     bookmark_service,
     conversation_service,
+    email_service,
     payment_service,
     payout_service,
     review_service,
     seeker_document_service,
+    seeker_recommendation_service,
 )
 from app.services.advisor_search_service import AdvisorSearchFilters, SortOption
 
@@ -95,10 +97,10 @@ VerifiedAdvisorDep = Annotated[Principal, Depends(require_verified_advisor)]
 async def _seeker_match_context(
     session: SessionDep, principal: Principal
 ) -> tuple[str | None, str | None]:
-    """Destination/visa for match % — only when the caller is a local seeker."""
+    """Profile intent for Find Advisor match % — never AI Assessment."""
     if principal.role != UserRole.seeker.value:
         return None, None
-    return await advisor_matching_service.match_context_for_seeker(session, principal.id)
+    return await advisor_matching_service.match_context_from_profile(session, principal.id)
 
 
 async def _bookmarked_ids(
@@ -203,8 +205,10 @@ async def list_advisors(
         bool,
         Query(
             description=(
-                "When true, AI-suggested advisors (highest match for the seeker's "
-                "destination/visa) sort first; falls back to featured when no match context"
+                "When true for a seeker, return profile-based AI suggestions "
+                "(onboarding destination/visa). AI Assessment matches are not used. "
+                "Country expertise required; visa-only excluded. Falls back to featured "
+                "when no profile match context."
             )
         ),
     ] = False,
@@ -223,9 +227,30 @@ async def list_advisors(
     )
     stmt = advisor_search_service.build_search_stmt(filters)
     destination, match_visa = await _seeker_match_context(session, principal)
+    blended_pct: dict[uuid.UUID, int] = {}
 
-    if recommended and destination and match_visa:
-        # Score the full filtered set so AI matches lead every page, not only featured.
+    if recommended and destination and match_visa and principal.role == UserRole.seeker.value:
+        # Prefer persisted AI suggestions; compute+save once when cache is empty/stale.
+        recs = await seeker_recommendation_service.ensure_for_seeker(
+            session,
+            principal.id,
+            destination=destination,
+            visa_type=match_visa,
+            settings=settings,
+        )
+        score_by_id = {r.advisor_id: int(round(r.match_score)) for r in recs}
+        ordered_ids = [r.advisor_id for r in recs]
+        all_users = list((await session.execute(stmt)).scalars().all())
+        by_id = {u.id: u for u in all_users}
+        # Keep directory filters (q/language/price/…) while preserving saved rank order.
+        recommended_users = [by_id[aid] for aid in ordered_ids if aid in by_id]
+        total = len(recommended_users)
+        users = recommended_users[params.offset : params.offset + params.limit]
+        blended_pct = {u.id: score_by_id[u.id] for u in users if u.id in score_by_id}
+        profiles_by_user = await _profiles_by_user(session, users)
+        ratings = await review_service.rating_summaries(session, [u.id for u in users])
+    elif recommended and destination and match_visa:
+        # Non-seeker (or external) callers: rule-only ranking with country hard gate.
         all_users = list((await session.execute(stmt)).scalars().all())
         profiles_by_user = await _profiles_by_user(session, all_users)
         ratings = await review_service.rating_summaries(session, [u.id for u in all_users])
@@ -241,9 +266,10 @@ async def list_advisors(
                 or 0
             )
 
-        all_users.sort(key=lambda u: (_match_pct(u), u.created_at), reverse=True)
-        total = len(all_users)
-        users = all_users[params.offset : params.offset + params.limit]
+        recommended_users = [u for u in all_users if _match_pct(u) > 0]
+        recommended_users.sort(key=lambda u: (_match_pct(u), u.created_at), reverse=True)
+        total = len(recommended_users)
+        users = recommended_users[params.offset : params.offset + params.limit]
     else:
         users, total = await paginate(session, stmt, params)
         profiles_by_user = await _profiles_by_user(session, users)
@@ -259,11 +285,15 @@ async def list_advisors(
                 profiles_by_user.get(u.id),
                 settings,
                 ratings.get(u.id),
-                match_percentage=advisor_matching_service.match_percentage(
-                    profiles_by_user.get(u.id),
-                    destination,
-                    match_visa,
-                    (ratings.get(u.id) or (None, 0))[0],
+                match_percentage=(
+                    blended_pct.get(u.id)
+                    if u.id in blended_pct
+                    else advisor_matching_service.match_percentage(
+                        profiles_by_user.get(u.id),
+                        destination,
+                        match_visa,
+                        (ratings.get(u.id) or (None, 0))[0],
+                    )
                 ),
                 is_bookmarked=u.id in bookmarked,
                 conversation_id=conversations.get(u.id),
@@ -669,17 +699,24 @@ async def get_my_dashboard(
     settings: SettingsDep,
     request_id: RequestIdDep,
     days: Annotated[
-        DashboardWindow,
-        Query(description="Stats window: 7, 30, or 90 days (drives every stats.* figure)"),
-    ] = 30,
+        DashboardWindow | None,
+        Query(
+            description=(
+                "Stats window: 7, 30, 90, 180, or 365 days; omitted = all-time "
+                "(drives windowed stats.* figures and the regulatory card)"
+            ),
+        ),
+    ] = None,
 ) -> ResponseEnvelope[AdvisorDashboardRead]:
     """Single home-screen summary for ``/advisor/dashboard``.
 
-    ``days`` (7/30/90) scopes ``stats.new_leads_count`` and ``stats.total_earned_usd``.
-    ``stats.pending_reviews_count`` (reviews with no ``advisor_response``) and
-    ``stats.profile_completion_percent`` are point-in-time and unaffected by the window.
-    ``regulatory_updates`` and ``client_inquiries`` are capped previews — the card's
-    "See all" uses ``GET /advisors/me/regulatory-updates`` and ``GET /conversations``.
+    ``days`` (7/30/90/180/365, optional) scopes ``stats.new_leads_count``,
+    ``stats.total_earned_usd``, and the regulatory-updates card. Omitted ``days``
+    is all-time (``window_days`` is null). ``stats.pending_reviews_count``
+    (reviews with no ``advisor_response``) and ``stats.profile_completion_percent``
+    are point-in-time and unaffected by the window. ``regulatory_updates`` and
+    ``client_inquiries`` are capped previews — the card's "See all" uses
+    ``GET /advisors/me/regulatory-updates`` and ``GET /conversations``.
 
     Toolbar **Sort** (recommended/popular/recent) is not wired here — it belongs to
     the advisor discovery listing (``GET /advisors?sort=&recommended=``); the FE may
@@ -704,7 +741,10 @@ async def export_my_dashboard(
     current_user: CurrentUser,
     session: SessionDep,
     settings: SettingsDep,
-    days: Annotated[DashboardWindow, Query(description="Stats window: 7, 30, or 90 days")] = 30,
+    days: Annotated[
+        DashboardWindow | None,
+        Query(description="Stats window: 7, 30, 90, 180, or 365 days; omitted = all-time"),
+    ] = None,
 ) -> Response:
     """Download the windowed dashboard stats + next appointment as CSV."""
     profile = await advisor_profile_service.get_or_create(session, current_user.id)
@@ -712,7 +752,8 @@ async def export_my_dashboard(
         session, current_user, profile, settings, days
     )
     stamp = datetime.now(UTC).strftime("%Y%m%d")
-    filename = f"dashboard-{days}d-{stamp}.csv"
+    window_label = f"{days}d" if days is not None else "all"
+    filename = f"dashboard-{window_label}-{stamp}.csv"
     return Response(
         content=csv_body,
         media_type="text/csv; charset=utf-8",
@@ -731,8 +772,13 @@ async def list_my_regulatory_updates(
     session: SessionDep,
     request_id: RequestIdDep,
     days: Annotated[
-        int | None,
-        Query(ge=1, le=365, description="Only updates published within the last N days"),
+        DashboardWindow | None,
+        Query(
+            description=(
+                "Only updates published within the last N days "
+                "(7, 30, 90, 180, or 365); omitted = all-time"
+            ),
+        ),
     ] = None,
 ) -> ResponseEnvelope[list[RegulatoryUpdateRead]]:
     """Regulatory-updates "See all" list — newest first, optionally windowed by ``days``."""
@@ -1071,6 +1117,7 @@ async def list_client_documents(
 ) -> ResponseEnvelope[list[SeekerDocumentRead]]:
     """Document rows for one client, plus ``meta.seeker`` for the detail header."""
     await _assert_advisor_client_relationship(session, current_user.id, seeker_id)
+    await seeker_document_service.refresh_expired_statuses(session, seeker_id)
     stmt = seeker_document_service.list_by_seeker_stmt(seeker_id)
     documents, total = await paginate(session, stmt, params)
     seeker = await seeker_document_service.build_client_seeker_brief(session, seeker_id, settings)
@@ -1150,6 +1197,7 @@ async def add_client_document_comment(
     data: DocumentCommentCreate,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[DocumentCommentRead]:
     await _assert_advisor_client_relationship(session, current_user.id, seeker_id)
@@ -1157,6 +1205,22 @@ async def add_client_document_comment(
     comment = await seeker_document_service.add_comment(
         session, document, current_user.id, data.body
     )
+    await seeker_document_service.notify_seeker_of_advisor_comment(
+        session, document, current_user, data.body
+    )
+    seeker = await session.get(User, seeker_id)
+    if seeker is not None:
+        email_service.schedule_email(
+            email_service.send_document_comment_email(
+                seeker.email,
+                seeker.full_name or seeker.email,
+                current_user.full_name or current_user.email,
+                document.document_name,
+                comment_preview=data.body,
+                document_id=str(document.id),
+                settings=settings,
+            )
+        )
     return ResponseEnvelope[DocumentCommentRead](
         data=seeker_document_service.build_comment_read(comment, current_user),
         meta=Meta(request_id=request_id),

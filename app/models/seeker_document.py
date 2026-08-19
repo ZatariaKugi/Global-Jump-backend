@@ -25,6 +25,7 @@ class SeekerDocumentStatus(StrEnum):
     under_review = "under_review"
     approved = "approved"
     rejected = "rejected"
+    expired = "expired"
 
 
 class SeekerDocument(BaseModel):
@@ -50,6 +51,10 @@ class SeekerDocument(BaseModel):
     visa_type: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reviewed_by: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    # Seeker's last visit to this document's comments sheet. Null = never read.
+    comments_last_read_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class SeekerDocumentComment(BaseModel):

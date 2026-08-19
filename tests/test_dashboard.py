@@ -6,30 +6,52 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from httpx import AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.advisor_credential import AdvisorCredential, CredentialStatus, DocumentType
-from app.models.booking import Booking, BookingStatus
+from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus
 from app.models.review import ModerationStatus, Review
 from app.models.seeker_document import DocumentCategory, SeekerDocument, SeekerDocumentStatus
 from app.models.seeker_profile import SeekerProfile
-from app.models.user import UserRole, VerificationStatus
+from app.models.user import User, UserRole, VerificationStatus
 from tests.test_analytics import _seed_booking, _seed_transaction, _seed_user
 
 DASHBOARD = "/api/v1/admin/dashboard"
 ACTIVITIES = "/api/v1/admin/activities"
 
+SEEKER_PASSWORD = "CustPass123!"
+
+
+async def _mark_email_verified(engine, email: str) -> None:
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = (await session.execute(select(User).where(User.email == email))).scalar_one()
+        user.email_verified_at = datetime.now(UTC)
+        session.add(user)
+        await session.commit()
+
 
 async def _seeker_token(client: AsyncClient, email: str = "seeker@test.com") -> str:
-    await client.post(
-        "/api/v1/auth/register",
-        json={"email": email, "password": "custpass123", "full_name": "Test Seeker"},
-    )
     resp = await client.post(
-        "/api/v1/auth/login", data={"username": email, "password": "custpass123"}
+        "/api/v1/auth/register",
+        json={"email": email, "password": SEEKER_PASSWORD, "full_name": "Test Seeker"},
+    )
+    assert resp.status_code == 201, resp.text
+    await _mark_email_verified(client._test_engine, email)  # type: ignore[attr-defined]
+    resp = await client.post(
+        "/api/v1/auth/login", data={"username": email, "password": SEEKER_PASSWORD}
     )
     assert resp.status_code == 200, resp.text
     return str(resp.json()["access_token"])
+
+
+async def _next_appointment_number(session: AsyncSession) -> int:
+    result = await session.execute(select(func.max(Booking.appointment_number)))
+    current = result.scalar_one_or_none()
+    if current is None:
+        return APPOINTMENT_NUMBER_START
+    return int(current) + 1
 
 
 async def _seed_seeker_document(engine, seeker_id: uuid.UUID, created_at: datetime) -> None:
@@ -77,6 +99,7 @@ async def _seed_completed_booking(
         booking = Booking(
             seeker_id=seeker_id,
             advisor_id=advisor_id,
+            appointment_number=await _next_appointment_number(session),
             service_type="consultation_60",
             duration_minutes=60,
             price_usd=100.0,
@@ -132,7 +155,7 @@ async def test_dashboard_shape_on_empty_data(client: AsyncClient, admin_token: s
     resp = await client.get(DASHBOARD, headers=admin_headers)
     assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
-    assert data["window_days"] == 180
+    assert data["window_days"] is None  # omitted days = all-time
     assert data["total_users"] == 1  # the admin fixture itself
     assert data["total_advisors"] == 0
     assert data["active_advisors"] == 0
@@ -238,10 +261,12 @@ async def test_revenue_breakdown_bucketing(client: AsyncClient, admin_token: str
 
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
+        first_number = await _next_appointment_number(session)
         consult_booking = Booking(
             seeker_id=seeker_id,
             advisor_id=advisor_id,
-            service_type="immigration_specialist",
+            appointment_number=first_number,
+            service_type="consultation_60",
             duration_minutes=30,
             price_usd=100.0,
             scheduled_start=now,
@@ -251,6 +276,7 @@ async def test_revenue_breakdown_bucketing(client: AsyncClient, admin_token: str
         review_booking = Booking(
             seeker_id=seeker_id,
             advisor_id=advisor_id,
+            appointment_number=first_number + 1,
             service_type="document_review",
             duration_minutes=30,
             price_usd=50.0,
@@ -270,9 +296,9 @@ async def test_revenue_breakdown_bucketing(client: AsyncClient, admin_token: str
     resp = await client.get(DASHBOARD, headers=admin_headers)
     assert resp.status_code == 200, resp.text
     breakdown = {s["label"]: s for s in resp.json()["data"]["revenue_breakdown"]}
-    assert "Others" not in breakdown
-    assert breakdown["Consultant"]["amount_usd"] == 100.0
-    assert breakdown["Consultant"]["pct"] == 66.67
+    assert "Platform" not in breakdown
+    assert breakdown["Advisor"]["amount_usd"] == 100.0
+    assert breakdown["Advisor"]["pct"] == 66.67
     assert breakdown["Document Review"]["amount_usd"] == 50.0
     assert breakdown["Document Review"]["pct"] == 33.33
 
@@ -291,7 +317,7 @@ async def test_activity_feed_merge_and_sort(client: AsyncClient, admin_token: st
     t_advisor_application = now - timedelta(days=2)
     t_new_user = now - timedelta(days=1)
 
-    # Registered well outside the default 180-day activities window so these
+    # Registered well outside the 180-day activities window so these
     # helper accounts' own signup/application events don't pollute the feed.
     outside_window = now - timedelta(days=200)
     seeker_id = await _seed_user(
@@ -349,7 +375,7 @@ async def test_activity_feed_merge_and_sort(client: AsyncClient, admin_token: st
         engine, "new-seeker@test.com", "New Seeker", UserRole.seeker, created_at=t_new_user
     )
 
-    resp = await client.get(f"{ACTIVITIES}?page_size=20", headers=admin_headers)
+    resp = await client.get(f"{ACTIVITIES}?days=180&page_size=20", headers=admin_headers)
     assert resp.status_code == 200, resp.text
     items = resp.json()["data"]
 

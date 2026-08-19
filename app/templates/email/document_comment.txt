@@ -1,0 +1,17 @@
+Hi {{ full_name }},
+
+{{ advisor_name }} commented on your document "{{ document_name }}".
+{% if preview %}
+  "{{ preview }}"
+{% endif %}
+View the comment:
+{{ documents_url }}
+
+— The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}
+How it works: {{ how_it_works_url }}
+FAQs: {{ faq_url }}

@@ -262,7 +262,7 @@ async def test_send_attachment_only_message(client: AsyncClient, engine) -> None
     upload = await client.post(
         "/api/v1/uploads",
         headers=cust_headers,
-        files={"file": ("photo.jpg", io.BytesIO(b"fake jpg bytes"), "image/jpeg")},
+        files={"file": ("photo.jpg", io.BytesIO(b"\xff\xd8\xff fake jpg"), "image/jpeg")},
         data={"category": "message_attachment"},
     )
     assert upload.status_code == 201, upload.text

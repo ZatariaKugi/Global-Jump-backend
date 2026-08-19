@@ -3,20 +3,40 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, patch
 
 from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
+from app.models.user import User, UserRole
 
 ASSESSMENTS = "/api/v1/assessments"
 ADMIN_QUESTIONS = "/api/v1/admin/assessment-questions"
 LOGIN = "/api/v1/auth/login"
 REGISTER = "/api/v1/auth/register"
+SEEKER_PASSWORD = "CustPass123!"
+
+
+async def _mark_email_verified(engine, email: str) -> None:
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = (await session.execute(select(User).where(User.email == email))).scalar_one()
+        user.email_verified_at = datetime.now(UTC)
+        session.add(user)
+        await session.commit()
 
 
 async def _seeker_token(client: AsyncClient, email: str = "cust@test.com") -> str:
-    await client.post(
-        REGISTER, json={"email": email, "password": "custpass123", "full_name": "Cust"}
+    resp = await client.post(
+        REGISTER, json={"email": email, "password": SEEKER_PASSWORD, "full_name": "Cust"}
     )
-    resp = await client.post(LOGIN, data={"username": email, "password": "custpass123"})
+    assert resp.status_code == 201, resp.text
+    await _mark_email_verified(client._test_engine, email)  # type: ignore[attr-defined]
+    resp = await client.post(LOGIN, data={"username": email, "password": SEEKER_PASSWORD})
+    assert resp.status_code == 200, resp.text
     return str(resp.json()["access_token"])
 
 
@@ -108,6 +128,51 @@ async def test_question_crud_requires_admin(client: AsyncClient) -> None:
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 403
+
+
+async def test_bulk_status_updates_every_page(client: AsyncClient, admin_token: str) -> None:
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    options = [{"text": "A", "score": 100}, {"text": "B", "score": 0}]
+    for i in range(12):
+        resp = await client.post(
+            ADMIN_QUESTIONS,
+            json=_q(f"Bulk Q{i}?", "purpose", 1.0, options, is_active=(i % 2 == 0)),
+            headers=headers,
+        )
+        assert resp.status_code == 201, resp.text
+
+    resp = await client.post(
+        f"{ADMIN_QUESTIONS}/bulk-status", json={"is_active": False}, headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()["data"]
+    assert payload["is_active"] is False
+    assert payload["updated"] == 12
+
+    listed: list[dict] = []
+    for page in (1, 2):
+        resp = await client.get(
+            f"{ADMIN_QUESTIONS}?page={page}&page_size=10", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        listed.extend(body["data"])
+        assert body["meta"]["pagination"]["total"] == 12
+        assert all(row["is_active"] is False for row in body["data"])
+
+    assert len(listed) == 12
+    assert all(row["is_active"] is False for row in listed)
+
+    token = await _seeker_token(client)
+    resp = await client.post(
+        f"{ADMIN_QUESTIONS}/bulk-status",
+        json={"is_active": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403
+
+    resp = await client.post(f"{ADMIN_QUESTIONS}/bulk-status", json={}, headers=headers)
+    assert resp.status_code == 422
 
 
 async def test_seeker_lists_applicable_questions(client: AsyncClient, admin_token: str) -> None:
@@ -235,7 +300,9 @@ async def test_partial_answers_lower_confidence(client: AsyncClient, admin_token
     )
     result = resp.json()["data"]
     assert result["confidence"] == 0.67  # 2 of 3 applicable questions answered
-    assert result["score"] == 100.0
+    # Unanswered questions contribute 0 so skipping cannot inflate the score:
+    # (100×2 + 100×1 + 0×1) / 4 = 75.
+    assert result["score"] == 75.0
 
 
 async def test_adaptive_question_skipped_unless_triggered(
@@ -322,6 +389,89 @@ async def test_matched_advisors_on_result(client: AsyncClient, engine, admin_tok
     assert matches, "expected at least one matched advisor"
     assert matches[0]["user_id"] == gb_id
     assert matches[0]["match_score"] == 77.5  # 40 country + 30 visa + 7.5 experience (no rating)
+
+
+async def test_history_reads_persisted_leads_not_live_matcher(
+    client: AsyncClient, engine, admin_token: str
+) -> None:
+    """Refreshing history / opening matches must not call OpenAI or the live matcher."""
+    await _seed_questions(client, admin_token)
+    token = await _seeker_token(client, "history-seeker@test.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.post(
+        ASSESSMENTS, json={"destination_country": "GB", "visa_type": "work"}, headers=headers
+    )
+    assert resp.status_code == 201, resp.text
+    assessment_id = uuid.UUID(resp.json()["data"]["id"])
+
+    questions = await client.get(
+        f"{ASSESSMENTS}/questions?country=GB&visa_type=work", headers=headers
+    )
+    q0 = questions.json()["data"][0]
+    opt0 = q0["options"][0]["id"]
+    resp = await client.post(
+        f"{ASSESSMENTS}/{assessment_id}/answers",
+        json={"answers": [{"question_id": q0["id"], "option_id": opt0}]},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        seeker = (
+            await session.execute(select(User).where(User.email == "history-seeker@test.com"))
+        ).scalar_one()
+        advisor = User(
+            email="history-advisor@test.com",
+            full_name="History Advisor",
+            hashed_password="x",
+            role=UserRole.advisor,
+            is_active=True,
+        )
+        session.add(advisor)
+        await session.flush()
+        session.add(
+            AdvisorLead(
+                seeker_id=seeker.id,
+                advisor_id=advisor.id,
+                assessment_id=assessment_id,
+                match_score=88.0,
+                match_reasons="Persisted snapshot",
+                status=AdvisorLeadStatus.new,
+            )
+        )
+        await session.commit()
+        advisor_id = advisor.id
+
+    with patch(
+        "app.services.advisor_matching_service.match",
+        new_callable=AsyncMock,
+        side_effect=AssertionError("history must not re-run the matcher"),
+    ):
+        hist = await client.get(
+            f"{ASSESSMENTS}?page=1&page_size=10&status=completed&sort=newest",
+            headers=headers,
+        )
+        assert hist.status_code == 200, hist.text
+        rows = hist.json()["data"]
+        assert len(rows) == 1
+        assert rows[0]["matched_advisors_count"] >= 1
+
+        panel = await client.get(
+            f"{ASSESSMENTS}/{assessment_id}/matched-advisors?page=1&page_size=10",
+            headers=headers,
+        )
+        assert panel.status_code == 200, panel.text
+        by_id = {row["user_id"]: row for row in panel.json()["data"]}
+        assert str(advisor_id) in by_id
+        assert by_id[str(advisor_id)]["match_score"] == 88.0
+        assert by_id[str(advisor_id)]["match_reasons"] == "Persisted snapshot"
+        assert panel.json()["meta"]["pagination"]["total"] == rows[0]["matched_advisors_count"]
+
+        detail = await client.get(f"{ASSESSMENTS}/{assessment_id}", headers=headers)
+        assert detail.status_code == 200, detail.text
+        detail_ids = {row["user_id"] for row in detail.json()["data"]["matched_advisors"]}
+        assert str(advisor_id) in detail_ids
 
 
 async def test_assessment_history(client: AsyncClient, admin_token: str) -> None:

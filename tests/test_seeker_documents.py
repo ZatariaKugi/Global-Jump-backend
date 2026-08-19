@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import io
 import uuid
+from datetime import date, timedelta
 
+import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import get_settings
+from app.core.exceptions import NotFoundError
+from app.models.notification import Notification, NotificationEntityType, NotificationType
 from app.models.seeker_document import DocumentCategory, SeekerDocument, SeekerDocumentStatus
 from app.models.user import User, UserRole
 from app.services import seeker_document_service
@@ -76,6 +81,7 @@ async def _seed_document(
     category: DocumentCategory,
     status: SeekerDocumentStatus = SeekerDocumentStatus.under_review,
     document_name: str = "doc.pdf",
+    expires_at: date | None = None,
 ) -> uuid.UUID:
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
@@ -86,6 +92,7 @@ async def _seed_document(
             file_url=f"/uploads/seeker_document/{seeker_id}/{document_name}",
             content_type="application/pdf",
             status=status,
+            expires_at=expires_at,
             created_by=seeker_id,
         )
         session.add(doc)
@@ -173,7 +180,14 @@ async def test_portfolio_summary_includes_other_category_as_missing(engine) -> N
     assert other.status == "missing"
     assert other.document_id is None
     assert summary.missing == 4
-    assert summary.progress_percent == 0
+    assert summary.progress_percent == 20
+    assert [item.category for item in summary.checklist] == [
+        DocumentCategory.passport,
+        DocumentCategory.educational,
+        DocumentCategory.finance,
+        DocumentCategory.supporting,
+        DocumentCategory.other,
+    ]
 
 
 async def test_portfolio_summary_other_under_review(engine) -> None:
@@ -225,7 +239,7 @@ async def test_portfolio_summary_progress_percent_counts_five_categories(engine)
     )
 
     summary = await _portfolio_summary(engine, seeker_id)
-    assert summary.progress_percent == 0
+    assert summary.progress_percent == 20
 
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
@@ -242,6 +256,129 @@ async def test_portfolio_summary_progress_percent_counts_five_categories(engine)
 
     summary = await _portfolio_summary(engine, seeker_id)
     assert summary.progress_percent == 20
+
+    for category in (
+        DocumentCategory.educational,
+        DocumentCategory.finance,
+        DocumentCategory.supporting,
+        DocumentCategory.other,
+    ):
+        await _seed_document(engine, seeker_id, category=category)
+
+    summary = await _portfolio_summary(engine, seeker_id)
+    assert summary.progress_percent == 100
+    assert summary.missing == 0
+
+
+async def test_expired_status_skips_rejected_and_excludes_past_from_upcoming(
+    engine,
+) -> None:
+    seeker_id = await _seed_user(engine, "expiry@test.com", "Seeker", UserRole.seeker)
+    past = date.today() - timedelta(days=1)
+    future = date.today() + timedelta(days=30)
+    expired_id = await _seed_document(
+        engine,
+        seeker_id,
+        category=DocumentCategory.passport,
+        expires_at=past,
+        document_name="old-passport.pdf",
+    )
+    rejected_id = await _seed_document(
+        engine,
+        seeker_id,
+        category=DocumentCategory.finance,
+        status=SeekerDocumentStatus.rejected,
+        expires_at=past,
+        document_name="old-bank.pdf",
+    )
+    upcoming_id = await _seed_document(
+        engine,
+        seeker_id,
+        category=DocumentCategory.educational,
+        expires_at=future,
+        document_name="degree.pdf",
+    )
+
+    summary = await _portfolio_summary(engine, seeker_id)
+    passport = _checklist_item(summary, DocumentCategory.passport)
+    finance = _checklist_item(summary, DocumentCategory.finance)
+    assert passport.status == "expired"
+    assert passport.document_id == expired_id
+    assert finance.status == "rejected"
+    assert finance.document_id == rejected_id
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        upcoming = list(
+            (
+                await session.execute(
+                    seeker_document_service.list_by_seeker_stmt(seeker_id, expiring_within_days=365)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [d.id for d in upcoming] == [upcoming_id]
+
+
+async def test_replace_keeps_document_id_and_resets_review(engine) -> None:
+    from datetime import UTC, datetime
+
+    from app.schemas.seeker_document import SeekerDocumentUpdate
+
+    seeker_id = await _seed_user(engine, "replace-doc@test.com", "Seeker", UserRole.seeker)
+    doc_id = await _seed_document(engine, seeker_id, category=DocumentCategory.passport)
+    settings = get_settings()
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        document = await session.get(SeekerDocument, doc_id)
+        assert document is not None
+        document.status = SeekerDocumentStatus.rejected
+        document.reviewed_at = datetime.now(UTC)
+        document.reviewed_by = seeker_id
+        session.add(document)
+        await session.flush()
+        updated = await seeker_document_service.update_document(
+            session,
+            document,
+            SeekerDocumentUpdate(
+                file_key=f"seeker_document/{seeker_id}/new.pdf",
+                file_name="passport-v2.pdf",
+                file_size_bytes=12,
+                content_type="application/pdf",
+                document_name="Passport Copy v2",
+                expires_at=date.today() + timedelta(days=365),
+            ),
+            seeker_id,
+            file_url=f"/uploads/seeker_document/{seeker_id}/new.pdf",
+            settings=settings,
+        )
+        await session.commit()
+
+    assert updated.id == doc_id
+    assert updated.status == SeekerDocumentStatus.under_review
+    assert updated.document_name == "Passport Copy v2"
+    assert updated.reviewed_at is None
+    assert updated.reviewed_by is None
+    assert updated.file_url.endswith("/new.pdf")
+
+
+async def test_create_rejects_expires_at_on_or_before_today() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from app.schemas.seeker_document import SeekerDocumentCreate
+
+    with pytest.raises(ValidationError):
+        SeekerDocumentCreate(
+            file_key="seeker_document/x/doc.pdf",
+            file_name="doc.pdf",
+            file_size_bytes=10,
+            content_type="application/pdf",
+            category=DocumentCategory.passport,
+            document_name="Passport",
+            expires_at=date.today(),
+        )
 
 
 # ── Comment metadata ──────────────────────────────────────────────────────────
@@ -470,3 +607,115 @@ async def test_admin_can_review_any_seeker_document(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"]["status"] == "rejected"
+
+
+# ── Unread comments + advisor notify ──────────────────────────────────────────
+
+
+async def test_advisor_comment_sets_unread_and_creates_notification(engine) -> None:
+    settings = get_settings()
+    seeker_id = await _seed_user(engine, "unread-seeker@test.com", "Seeker", UserRole.seeker)
+    advisor_id = await _seed_user(
+        engine, "unread-advisor@test.com", "Ada Advisor", UserRole.advisor
+    )
+    doc_id = await _seed_document(engine, seeker_id, category=DocumentCategory.passport)
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        document = await session.get(SeekerDocument, doc_id)
+        advisor = await session.get(User, advisor_id)
+        assert document is not None and advisor is not None
+        await seeker_document_service.add_comment(session, document, advisor_id, "Please rescan.")
+        await seeker_document_service.notify_seeker_of_advisor_comment(
+            session, document, advisor, "Please rescan."
+        )
+        await session.commit()
+        read = await seeker_document_service.build_read_enriched(
+            session, document, settings, include_unread=True
+        )
+        note = (
+            await session.execute(select(Notification).where(Notification.user_id == seeker_id))
+        ).scalar_one()
+
+    assert read.has_unread_comments is True
+    assert note.type == NotificationType.document_comment
+    assert note.entity_type == NotificationEntityType.seeker_document
+    assert note.entity_id == doc_id
+    assert note.actor_id == advisor_id
+
+    from app.services.push_service import _build_message
+
+    payload = _build_message(note, ["tok"]).data
+    assert payload["type"] == "document_comment"
+    assert payload["entity_type"] == "seeker_document"
+    assert payload["entity_id"] == str(doc_id)
+
+
+async def test_seeker_comment_does_not_set_unread(engine) -> None:
+    settings = get_settings()
+    seeker_id = await _seed_user(engine, "own-comment@test.com", "Seeker", UserRole.seeker)
+    doc_id = await _seed_document(engine, seeker_id, category=DocumentCategory.passport)
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        document = await session.get(SeekerDocument, doc_id)
+        assert document is not None
+        await seeker_document_service.add_comment(session, document, seeker_id, "Uploaded again.")
+        await session.commit()
+        read = await seeker_document_service.build_read_enriched(
+            session, document, settings, include_unread=True
+        )
+        notes = (
+            (await session.execute(select(Notification).where(Notification.user_id == seeker_id)))
+            .scalars()
+            .all()
+        )
+
+    assert read.has_unread_comments is False
+    assert notes == []
+
+
+async def test_mark_comments_read_clears_unread_and_is_idempotent(engine) -> None:
+    settings = get_settings()
+    seeker_id = await _seed_user(engine, "mark-read@test.com", "Seeker", UserRole.seeker)
+    advisor_id = await _seed_user(engine, "mark-read-adv@test.com", "Advisor", UserRole.advisor)
+    other_id = await _seed_user(engine, "mark-read-other@test.com", "Other", UserRole.seeker)
+    doc_id = await _seed_document(engine, seeker_id, category=DocumentCategory.passport)
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        document = await session.get(SeekerDocument, doc_id)
+        assert document is not None
+        await seeker_document_service.add_comment(session, document, advisor_id, "Needs stamp.")
+        await session.commit()
+        await session.refresh(document)
+        before = await seeker_document_service.build_read_enriched(
+            session, document, settings, include_unread=True
+        )
+        await seeker_document_service.mark_comments_read(session, document, seeker_id)
+        await seeker_document_service.mark_comments_read(session, document, seeker_id)
+        await session.commit()
+        await session.refresh(document)
+        after = await seeker_document_service.build_read_enriched(
+            session, document, settings, include_unread=True
+        )
+
+        with pytest.raises(NotFoundError):
+            await seeker_document_service.get_for_seeker(session, doc_id, other_id)
+
+    assert before.has_unread_comments is True
+    assert after.has_unread_comments is False
+
+
+async def test_document_comment_email_skips_without_smtp() -> None:
+    from app.services.email_service import send_document_comment_email
+
+    await send_document_comment_email(
+        "seeker@test.com",
+        "Seeker",
+        "Ada Advisor",
+        "Passport Copy",
+        comment_preview="Please rescan the photo page.",
+        document_id=str(uuid.uuid4()),
+        settings=get_settings(),
+    )

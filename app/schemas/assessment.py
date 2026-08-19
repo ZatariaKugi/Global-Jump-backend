@@ -142,6 +142,17 @@ class QuestionAdminRead(BaseModel):
     options: list[QuestionOptionAdminRead]
 
 
+class QuestionBulkStatusUpdate(BaseModel):
+    """Enable/disable every assessment question in one request."""
+
+    is_active: bool
+
+
+class QuestionBulkStatusRead(BaseModel):
+    updated: int
+    is_active: bool
+
+
 # ── Assessment sessions ──────────────────────────────────────────────────────
 
 
@@ -177,6 +188,12 @@ class AdvisorMatchRead(BaseModel):
     starting_price_usd: float | None = None
     match_score: float
     public_profile_slug: str | None
+    # Optional AI explanation; null when OpenAI is skipped/unavailable.
+    match_reasons: str | None = None
+    # Rule-engine score before AI blend; useful for debugging / admin.
+    rule_score: float | None = None
+    # AI-only score when re-rank ran; null if OpenAI skipped.
+    ai_score: float | None = None
 
 
 class AssessmentRead(BaseModel):
@@ -203,12 +220,15 @@ class AssessmentSummaryRead(BaseModel):
 
     id: uuid.UUID
     destination_country: str
+    destination_country_name: str | None = None
     visa_type: RequiredVisaType
+    visa_type_name: str | None = None
     status: AssessmentStatus
     score: float | None
     tier: EligibilityTier | None
     created_at: datetime
     completed_at: datetime | None
+    matched_advisors_count: int = 0
 
 
 # ── AI Analytics (PRD §3.4 AI Engine Management) ────────────────────────────

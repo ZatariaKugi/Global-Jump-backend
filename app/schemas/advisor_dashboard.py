@@ -1,9 +1,10 @@
 """Advisor dashboard aggregate schemas (FE ``/advisor/dashboard``).
 
 A single home-screen summary for an advisor — next appointment, windowed stat
-tiles, the regulatory-updates card, and a client-inquiries preview. The window
-(``days`` = 7 / 30 / 90) drives every ``stats.*`` figure; identity/profile-level
-figures like ``profile_completion_percent`` are not windowed.
+tiles, the regulatory-updates card, and a client-inquiries preview. The optional
+``days`` window (7 / 30 / 90 / 180 / 365; omitted = all-time) drives windowed
+``stats.*`` figures and the regulatory card; identity/profile-level figures like
+``profile_completion_percent`` are not windowed.
 """
 
 from __future__ import annotations
@@ -27,9 +28,9 @@ def _coerce_window(value: object) -> object:
     return value
 
 
-# Toolbar "Last 7 / 30 / 90 days" control. Query params arrive as strings, so
-# coerce to int before validating against the literal set.
-DashboardWindow = Annotated[Literal[7, 30, 90], BeforeValidator(_coerce_window)]
+# Overview toolbar windows shared by admin / seeker / advisor. Query params
+# arrive as strings, so coerce to int before validating against the literal set.
+DashboardWindow = Annotated[Literal[7, 30, 90, 180, 365], BeforeValidator(_coerce_window)]
 
 # Derived from the last message on the thread:
 #   new       — no message from either side yet (thread opened, awaiting first msg)
@@ -78,7 +79,7 @@ class ClientInquiryRead(ConversationRead):
 
 
 class AdvisorDashboardRead(BaseModel):
-    window_days: int
+    window_days: int | None  # null = all-time (``days`` omitted)
     next_upcoming: NextUpcomingRead | None
     stats: DashboardStats
     regulatory_updates: list[RegulatoryUpdateRead]  # newest first, capped for the card

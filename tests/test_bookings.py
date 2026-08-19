@@ -8,10 +8,12 @@ from datetime import UTC, date, datetime, time, timedelta
 from unittest.mock import AsyncMock, patch
 
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.booking import Booking, PaymentStatus
 from app.models.transaction import Transaction, TransactionStatus
+from app.models.user import User
 from tests.test_advisor_search import _make_advisor
 
 BOOKINGS = "/api/v1/bookings"
@@ -26,14 +28,30 @@ def _next_weekday(weekday: int) -> date:
     return today + timedelta(days=days_ahead)
 
 
+SEEKER_PASSWORD = "CustPass123!"
+
+
+async def _mark_email_verified(engine, email: str) -> None:
+    """Seekers/advisors cannot log in until `email_verified_at` is set."""
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        user = (await session.execute(select(User).where(User.email == email))).scalar_one()
+        user.email_verified_at = datetime.now(UTC)
+        session.add(user)
+        await session.commit()
+
+
 async def _seeker(client: AsyncClient, email: str = "cust@test.com") -> tuple[str, dict]:
-    await client.post(
+    resp = await client.post(
         "/api/v1/auth/register",
-        json={"email": email, "password": "custpass123", "full_name": "Seeker"},
+        json={"email": email, "password": SEEKER_PASSWORD, "full_name": "Seeker"},
     )
+    assert resp.status_code == 201, resp.text
+    await _mark_email_verified(client._test_engine, email)  # type: ignore[attr-defined]
     login = await client.post(
-        "/api/v1/auth/login", data={"username": email, "password": "custpass123"}
+        "/api/v1/auth/login", data={"username": email, "password": SEEKER_PASSWORD}
     )
+    assert login.status_code == 200, login.text
     token = str(login.json()["access_token"])
     return token, {"Authorization": f"Bearer {token}"}
 
@@ -393,9 +411,7 @@ async def _pending_booking(
     return resp.json()["data"]["id"], advisor_headers, cust_headers, day
 
 
-async def _succeeded_transaction_for_booking(
-    engine, booking_id: str, amount_usd: float
-) -> None:
+async def _succeeded_transaction_for_booking(engine, booking_id: str, amount_usd: float) -> None:
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
         commission_usd = round(amount_usd * 0.15, 2)
@@ -481,12 +497,16 @@ async def test_reject_paid_booking_auto_refunds(client: AsyncClient, engine) -> 
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with session_factory() as session:
         txn = (
-            await session.execute(
-                Transaction.__table__.select().where(
-                    Transaction.booking_id == uuid.UUID(booking_id)
+            (
+                await session.execute(
+                    Transaction.__table__.select().where(
+                        Transaction.booking_id == uuid.UUID(booking_id)
+                    )
                 )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         assert txn["status"] == TransactionStatus.refunded
 
 

@@ -18,7 +18,7 @@ from app.models.seeker_profile import SeekerProfile
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.user_admin import AccountStatus, UserDetailRead, UserListRead
 from app.services import auth_service
-from app.services.email_service import send_password_reset_email
+from app.services.email_service import schedule_email, send_password_reset_email
 
 # Advisors register with is_active=False until admin approves — that is
 # onboarding, not a soft-suspend. Mirror the login gate in user_service.
@@ -262,4 +262,6 @@ async def trigger_password_reset(
     if user is None:
         raise NotFoundError("User not found")
     raw_token = await auth_service.create_password_reset_token_for_user(session, user, settings)
-    await send_password_reset_email(user.email, user.full_name or "", raw_token, settings)
+    schedule_email(
+        send_password_reset_email(user.email, user.full_name or "", raw_token, settings)
+    )

@@ -18,7 +18,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 
 from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
-from app.core.exceptions import AppError, NotFoundError
+from app.core.exceptions import AppError, ConflictError, NotFoundError
 from app.core.rate_limit import enforce_cooldown
 from app.db.session import SessionDep
 from app.models.user import UserRole
@@ -42,7 +42,11 @@ from app.services import (
     google_oauth_service,
     user_service,
 )
-from app.services.email_service import send_password_reset_email, send_verification_email
+from app.services.email_service import (
+    schedule_email,
+    send_password_reset_email,
+    send_verification_email,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -71,7 +75,9 @@ async def register(
     """Seeker self-registration. Role is always ``seeker``."""
     user = await user_service.create_user(session, data)
     raw_token = await auth_service.create_email_verification_token(session, user, settings)
-    await send_verification_email(user.email, user.full_name or "", raw_token, settings)
+    schedule_email(
+        send_verification_email(user.email, user.full_name or "", raw_token, settings)
+    )
     return ResponseEnvelope[UserRead](
         data=UserRead.model_validate(user), meta=Meta(request_id=request_id)
     )
@@ -91,7 +97,9 @@ async def register_advisor(
     """Advisor self-registration. Account is inactive until admin approves."""
     user = await user_service.create_advisor(session, data)
     raw_token = await auth_service.create_email_verification_token(session, user, settings)
-    await send_verification_email(user.email, user.full_name or "", raw_token, settings)
+    schedule_email(
+        send_verification_email(user.email, user.full_name or "", raw_token, settings)
+    )
     return ResponseEnvelope[AdvisorRead](
         data=AdvisorRead.model_validate(user), meta=Meta(request_id=request_id)
     )
@@ -327,17 +335,23 @@ async def resend_verification(
     session: SessionDep,
     settings: SettingsDep,
 ) -> None:
-    """Resend the email verification token. Always 204 to prevent email enumeration.
+    """Resend the email verification token.
 
-    Only unverified accounts receive a new email. Issuing a new token revokes any
-    previous unused verification links for that user.
+    Unknown emails return 204 to prevent enumeration. Already-verified accounts
+    return 409 so the frontend can show a recovery message instead of a false
+    "email sent" success state (GJ-EV-052). Only unverified accounts receive a
+    new email; issuing a new token revokes any previous unused verification links.
     """
-    enforce_cooldown(f"resend-verification:{body.email}", cooldown_seconds=60)
     user = await user_service.get_by_email(session, body.email)
-    if user is None or user.is_email_verified:
+    if user is None:
         return
+    if user.is_email_verified:
+        raise ConflictError("Email is already verified", code="already_verified")
+    enforce_cooldown(f"resend-verification:{body.email}", cooldown_seconds=60)
     raw_token = await auth_service.create_email_verification_token(session, user, settings)
-    await send_verification_email(user.email, user.full_name or "", raw_token, settings)
+    schedule_email(
+        send_verification_email(user.email, user.full_name or "", raw_token, settings)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -351,14 +365,18 @@ async def forgot_password(
     session: SessionDep,
     settings: SettingsDep,
 ) -> None:
-    """Request a password reset email."""
+    """Request a password reset email.
+
+    Always 204 — unknown emails and Google-only accounts get the same response
+    (and no mail) so this endpoint cannot be used to enumerate accounts.
+    """
     enforce_cooldown(f"forgot-password:{body.email}", cooldown_seconds=60)
-    user = await user_service.get_by_email(session, body.email)
-    if user is None:
-        raise NotFoundError("No account found with this email")
-    raw_token = await auth_service.create_password_reset_token_for_user(session, user, settings)
-    await send_password_reset_email(
-        body.email, user.full_name or "", raw_token, settings
+    issued = await auth_service.create_password_reset_token(session, body.email, settings)
+    if issued is None:
+        return
+    user, raw_token = issued
+    schedule_email(
+        send_password_reset_email(body.email, user.full_name or "", raw_token, settings)
     )
 
 

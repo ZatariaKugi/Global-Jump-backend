@@ -14,6 +14,7 @@ from app.core.file_storage import (
     normalize_file_key,
     resolve_url,
     save_upload,
+    seeker_document_extensions,
 )
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.upload import UploadCategory, UploadResult
@@ -82,9 +83,11 @@ async def upload_file(
     - ``general`` — anything else that does not fit the categories above.
 
     **Accepted formats:** pdf, jpg, jpeg, png, docx.
+    ``seeker_document`` accepts pdf / jpg / jpeg / png only.
     """
     subdir = f"{category.value}/{current_user.id}"
-    url_path, size = await save_upload(file, subdir, settings)
+    allowed = seeker_document_extensions() if category == UploadCategory.seeker_document else None
+    url_path, size = await save_upload(file, subdir, settings, allowed_extensions=allowed)
     file_key = url_path.removeprefix("/uploads/")
     return ResponseEnvelope[UploadResult](
         data=UploadResult(

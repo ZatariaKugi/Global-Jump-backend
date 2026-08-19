@@ -9,8 +9,12 @@ know which backend is active.
 from __future__ import annotations
 
 import contextlib
+import io
 import os
+import re
 import uuid
+import zipfile
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -25,6 +29,17 @@ from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError
 
 _ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".docx"}
+# Seeker portfolio uploads are images + PDF only (no Word).
+_SEEKER_DOCUMENT_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
+_MAX_FILE_NAME_LEN = 255
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_PNG_MAGIC = b"\x89PNG"  # 89 50 4E 47
+_JPEG_MAGIC = b"\xff\xd8\xff"
+_ZIP_MAGIC = b"PK\x03\x04"
+
+
+def seeker_document_extensions() -> set[str]:
+    return set(_SEEKER_DOCUMENT_EXTENSIONS)
 
 
 @lru_cache
@@ -56,16 +71,63 @@ def _client(settings: Settings) -> Any:
     )
 
 
-async def save_upload(file: UploadFile, subdir: str, settings: Settings) -> tuple[str, int]:
+def assert_safe_file_name(name: str, *, field: str = "File name") -> None:
+    """Reject names over 255 chars or containing control characters."""
+    if len(name) > _MAX_FILE_NAME_LEN or _CONTROL_CHARS.search(name) is not None:
+        raise AppError(
+            f"{field} must be at most {_MAX_FILE_NAME_LEN} characters and contain "
+            "no control characters",
+            code="invalid_file_name",
+        )
+
+
+def _docx_has_content_types(content: bytes) -> bool:
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            return "[Content_Types].xml" in archive.namelist()
+    except zipfile.BadZipFile:
+        return False
+
+
+def assert_file_magic(suffix: str, content: bytes) -> None:
+    """Require content to match the declared extension (don't trust the name)."""
+    if suffix == ".pdf":
+        ok = content.startswith(b"%PDF")
+    elif suffix == ".png":
+        ok = content.startswith(_PNG_MAGIC)
+    elif suffix in {".jpg", ".jpeg"}:
+        ok = content.startswith(_JPEG_MAGIC)
+    elif suffix == ".docx":
+        ok = content.startswith(_ZIP_MAGIC) and _docx_has_content_types(content)
+    else:
+        ok = False
+    if not ok:
+        raise AppError(
+            "File content does not match the declared type. The file may be corrupt or fake.",
+            code="invalid_file",
+        )
+
+
+async def save_upload(
+    file: UploadFile,
+    subdir: str,
+    settings: Settings,
+    *,
+    allowed_extensions: set[str] | None = None,
+) -> tuple[str, int]:
     """Persist *file* and return ``(url_path, size_bytes)``.
 
     The returned URL path is relative to the server root, e.g.
     ``/uploads/credentials/<user_id>/<uuid>.pdf``.
     """
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in _ALLOWED_EXTENSIONS:
+    original_name = file.filename or ""
+    if original_name:
+        assert_safe_file_name(original_name)
+    suffix = Path(original_name).suffix.lower()
+    accepted = allowed_extensions if allowed_extensions is not None else _ALLOWED_EXTENSIONS
+    if suffix not in accepted:
         raise AppError(
-            f"File type not allowed. Accepted: {', '.join(sorted(_ALLOWED_EXTENSIONS))}",
+            f"File type not allowed. Accepted: {', '.join(sorted(accepted))}",
             code="invalid_file_type",
         )
 
@@ -78,6 +140,7 @@ async def save_upload(file: UploadFile, subdir: str, settings: Settings) -> tupl
         )
     if size == 0:
         raise AppError("Uploaded file is empty", code="empty_file")
+    assert_file_magic(suffix, content)
 
     filename = f"{uuid.uuid4().hex}{suffix}"
     key = f"{subdir}/{filename}"
@@ -204,3 +267,65 @@ def delete_file(url_path: str, settings: Settings) -> None:
     full_path = Path(settings.UPLOAD_DIR) / key
     with contextlib.suppress(FileNotFoundError):
         os.remove(full_path)
+
+
+def stored_url_to_key(file_url: str) -> str | None:
+    """Best-effort extract of a storage key from a persisted ``file_url``."""
+    trimmed = file_url.strip().split("?", 1)[0]
+    marker = "seeker_document/"
+    if marker in trimmed:
+        return marker + trimmed.split(marker, 1)[1].lstrip("/")
+    if trimmed.startswith("/uploads/"):
+        return trimmed.removeprefix("/uploads/")
+    return None
+
+
+def sweep_unreferenced_uploads(
+    settings: Settings,
+    *,
+    prefix: str,
+    referenced_keys: set[str],
+    older_than: timedelta,
+) -> int:
+    """Delete objects under ``prefix`` older than ``older_than`` and not referenced.
+
+    Used to clean uploads that never became a document row (client died between
+    ``POST /uploads`` and ``POST /users/me/documents``).
+    """
+    cutoff = datetime.now(UTC) - older_than
+    deleted = 0
+    if _s3_enabled(settings):
+        client = _client(settings)
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix):
+            for obj in page.get("Contents") or []:
+                key = str(obj["Key"])
+                last_modified = obj.get("LastModified")
+                if last_modified is None:
+                    continue
+                if last_modified.tzinfo is None:
+                    last_modified = last_modified.replace(tzinfo=UTC)
+                if last_modified >= cutoff:
+                    continue
+                if key in referenced_keys:
+                    continue
+                with contextlib.suppress(ClientError):
+                    client.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+                    deleted += 1
+        return deleted
+
+    root = Path(settings.UPLOAD_DIR) / prefix.rstrip("/")
+    if not root.is_dir():
+        return 0
+    upload_root = Path(settings.UPLOAD_DIR)
+    cutoff_ts = cutoff.timestamp()
+    for path in root.rglob("*"):
+        if not path.is_file() or path.stat().st_mtime >= cutoff_ts:
+            continue
+        key = path.relative_to(upload_root).as_posix()
+        if key in referenced_keys:
+            continue
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+            deleted += 1
+    return deleted

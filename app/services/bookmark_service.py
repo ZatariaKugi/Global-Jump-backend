@@ -204,7 +204,7 @@ async def build_list_reads(
         .all()
     }
     ratings = await review_service.rating_summaries(session, advisor_ids)
-    destination, visa_type = await advisor_matching_service.match_context_for_seeker(
+    destination, visa_type = await advisor_matching_service.match_context_from_profile(
         session, seeker_id
     )
     conversations = await conversation_service.conversation_ids_for_seeker(

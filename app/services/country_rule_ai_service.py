@@ -21,12 +21,12 @@ from __future__ import annotations
 import json
 
 import structlog
-from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 from app.core.config import Settings
 from app.core.countries import country_name
 from app.core.official_sources import OfficialSource, is_expected_domain, official_source
+from app.core.openai_client import get_openai_client
 from app.core.visa_types import visa_type_name
 
 log = structlog.get_logger()
@@ -107,16 +107,56 @@ def _clamp_list(items: list[str]) -> list[str]:
 
 
 def _extract_json(text: str) -> dict[str, object]:
-    """Best-effort: parse the first JSON object in the model output."""
+    """Best-effort: parse the first JSON object in the model output.
+
+    Handles markdown code fences (```json ... ```), leading/trailing prose,
+    and nested braces by tracking brace depth to find the correct closing ``}``.
+    """
     text = text.strip()
+    # Strip markdown code fences
     if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
+        # Remove opening fence line
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline + 1 :]
+        # Remove closing fence
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
     start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end < start:
+    if start == -1:
         raise ValueError("no JSON object in model output")
+
+    # Track brace depth to find the matching closing brace
+    depth = 0
+    in_string = False
+    escape = False
+    end = -1
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+
+    if end == -1:
+        raise ValueError("no matching closing brace in model output")
+
     parsed = json.loads(text[start : end + 1])
     if not isinstance(parsed, dict):
         raise ValueError("model output is not a JSON object")
@@ -145,11 +185,11 @@ async def draft_policy(
 
     model = settings.OPENAI_WEBSEARCH_MODEL
     try:
-        client = AsyncOpenAI(
-            api_key=settings.OPENAI_API_KEY,
-            timeout=settings.OPENAI_WEBSEARCH_TIMEOUT_SECONDS,
-            max_retries=1,
+        client = get_openai_client(
+            settings, timeout=settings.OPENAI_WEBSEARCH_TIMEOUT_SECONDS
         )
+        if client is None:
+            return None
       
         response = await client.responses.create(
             model=model,

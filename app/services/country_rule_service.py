@@ -159,6 +159,7 @@ def list_rules_stmt(
     country_code: str | None = None,
     visa_type: str | None = None,
     status: RulePublishStatus | None = None,
+    sort: str | None = None,
 ) -> Select[tuple[CountryRule]]:
     stmt = select(CountryRule).where(CountryRule.is_archived.is_(False))
     if country_code:
@@ -168,6 +169,8 @@ def list_rules_stmt(
         stmt = stmt.where(CountryRule.visa_type == (parsed.value if parsed else visa_type))
     if status is not None:
         stmt = stmt.where(CountryRule.status == status)
+    if sort == "newest":
+        return stmt.order_by(CountryRule.created_at.desc(), CountryRule.id.desc())
     return stmt.order_by(
         CountryRule.country_code,
         CountryRule.visa_type,

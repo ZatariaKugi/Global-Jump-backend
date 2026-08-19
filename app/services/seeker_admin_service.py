@@ -23,7 +23,7 @@ from app.models.visa_type import VisaType
 from app.schemas.seeker_admin import SeekerCreate, SeekerDetailRead, SeekerListRead
 from app.schemas.user_admin import AccountStatus
 from app.services import auth_service, seeker_profile_service, user_admin_service, user_service
-from app.services.email_service import send_password_reset_email
+from app.services.email_service import schedule_email, send_password_reset_email
 
 
 def list_seekers_stmt(
@@ -192,5 +192,7 @@ async def create_seeker(
         await session.flush()
     await session.refresh(user)
     raw_token = await auth_service.create_password_reset_token_for_user(session, user, settings)
-    await send_password_reset_email(user.email, user.full_name or "", raw_token, settings)
+    schedule_email(
+        send_password_reset_email(user.email, user.full_name or "", raw_token, settings)
+    )
     return await get_seeker_detail(session, user.id)

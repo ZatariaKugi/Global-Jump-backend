@@ -11,9 +11,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.exceptions import ConflictError, NotFoundError
-from app.core.file_storage import resolve_media_url, resolve_url
+from app.core.file_storage import (
+    assert_safe_file_name,
+    delete_file,
+    resolve_media_url,
+    resolve_url,
+)
 from app.core.visa_types import parse_visa_type
 from app.models.booking import Booking
+from app.models.notification import NotificationEntityType, NotificationType
 from app.models.seeker_document import (
     DocumentCategory,
     SeekerDocument,
@@ -37,22 +43,31 @@ from app.schemas.seeker_document import (
     SeekerDocumentStatusUpdate,
     SeekerDocumentUpdate,
 )
-from app.services import booking_service
+from app.services import booking_service, notification_service
 from app.services.availability_service import as_utc
 
-# Required portfolio categories for the seeker Documents checklist / Missing card.
+# Required portfolio categories — left-to-right tab order on the Documents page.
 REQUIRED_CHECKLIST: tuple[DocumentCategory, ...] = (
     DocumentCategory.passport,
+    DocumentCategory.educational,
     DocumentCategory.finance,
     DocumentCategory.supporting,
-    DocumentCategory.educational,
     DocumentCategory.other,
 )
+CHECKLIST_LABELS: dict[DocumentCategory, str] = {
+    DocumentCategory.passport: "Passport",
+    DocumentCategory.educational: "Educational",
+    DocumentCategory.finance: "Finance",
+    DocumentCategory.supporting: "Supporting",
+    DocumentCategory.other: "Other",
+}
 
 
 async def create(
     session: AsyncSession, seeker_id: uuid.UUID, data: SeekerDocumentCreate, file_url: str
 ) -> SeekerDocument:
+    assert_safe_file_name(data.file_name)
+    assert_safe_file_name(data.document_name, field="Document name")
     document = SeekerDocument(
         seeker_id=seeker_id,
         category=data.category,
@@ -75,8 +90,15 @@ async def update_document(
     document: SeekerDocument,
     data: SeekerDocumentUpdate,
     actor_id: uuid.UUID,
+    *,
+    file_url: str | None = None,
+    settings: Settings | None = None,
 ) -> SeekerDocument:
+    old_file_url = document.file_url
+    if data.file_name is not None:
+        assert_safe_file_name(data.file_name)
     if data.document_name is not None:
+        assert_safe_file_name(data.document_name, field="Document name")
         document.document_name = data.document_name
     if data.clear_expires_at:
         document.expires_at = None
@@ -86,10 +108,26 @@ async def update_document(
         document.visa_type = None
     elif data.visa_type is not None:
         document.visa_type = data.visa_type.value
+    if file_url is not None:
+        document.file_url = file_url
+        document.file_size_bytes = data.file_size_bytes or 0
+        document.content_type = data.content_type or "application/octet-stream"
+        # Same id, new file — send it back to review; keep the comment thread.
+        document.status = SeekerDocumentStatus.under_review
+        document.reviewed_at = None
+        document.reviewed_by = None
     document.updated_by = actor_id
     session.add(document)
     await session.flush()
     await session.refresh(document)
+    if (
+        file_url is not None
+        and settings is not None
+        and old_file_url
+        and old_file_url != document.file_url
+        and old_file_url.startswith("/uploads/")
+    ):
+        delete_file(old_file_url, settings)
     return document
 
 
@@ -128,9 +166,14 @@ def list_by_seeker_stmt(
             )
         )
     if expiring_within_days is not None:
-        cutoff = date.today() + timedelta(days=expiring_within_days)
-        stmt = stmt.where(SeekerDocument.expires_at.is_not(None)).where(
-            SeekerDocument.expires_at <= cutoff
+        today = date.today()
+        cutoff = today + timedelta(days=expiring_within_days)
+        # Upcoming Expires: future-only (today through today+N). Past dates are
+        # ``expired``, not upcoming.
+        stmt = (
+            stmt.where(SeekerDocument.expires_at.is_not(None))
+            .where(SeekerDocument.expires_at >= today)
+            .where(SeekerDocument.expires_at <= cutoff)
         )
     if expires_before is not None:
         stmt = stmt.where(SeekerDocument.expires_at.is_not(None)).where(
@@ -139,9 +182,37 @@ def list_by_seeker_stmt(
     return stmt.order_by(SeekerDocument.created_at.desc())
 
 
+async def refresh_expired_statuses(session: AsyncSession, seeker_id: uuid.UUID) -> None:
+    """Persist ``expired`` when ``expires_at`` is in the past.
+
+    Rejected always wins — a rejected file that has also lapsed stays rejected
+    so Replace/review still target the rejection.
+    """
+    today = date.today()
+    result = await session.execute(
+        select(SeekerDocument).where(
+            SeekerDocument.seeker_id == seeker_id,
+            SeekerDocument.is_archived.is_(False),
+            SeekerDocument.expires_at.is_not(None),
+            SeekerDocument.expires_at < today,
+            SeekerDocument.status.notin_(
+                (SeekerDocumentStatus.rejected, SeekerDocumentStatus.expired)
+            ),
+        )
+    )
+    changed = False
+    for doc in result.scalars():
+        doc.status = SeekerDocumentStatus.expired
+        session.add(doc)
+        changed = True
+    if changed:
+        await session.flush()
+
+
 async def get_for_seeker(
     session: AsyncSession, document_id: uuid.UUID, seeker_id: uuid.UUID
 ) -> SeekerDocument:
+    await refresh_expired_statuses(session, seeker_id)
     document = await session.get(SeekerDocument, document_id)
     if document is None or document.seeker_id != seeker_id or document.is_archived:
         raise NotFoundError("Document not found")
@@ -152,6 +223,8 @@ async def get_by_id(session: AsyncSession, document_id: uuid.UUID) -> SeekerDocu
     document = await session.get(SeekerDocument, document_id)
     if document is None or document.is_archived:
         raise NotFoundError("Document not found")
+    await refresh_expired_statuses(session, document.seeker_id)
+    await session.refresh(document)
     return document
 
 
@@ -209,8 +282,13 @@ def _checklist_status_for_docs(
     reviewing = next((d for d in docs if d.status == SeekerDocumentStatus.under_review), None)
     if reviewing is not None:
         return "under_review", reviewing.id
-    rejected = docs[0]
-    return "rejected", rejected.id
+    rejected = next((d for d in docs if d.status == SeekerDocumentStatus.rejected), None)
+    if rejected is not None:
+        return "rejected", rejected.id
+    expired = next((d for d in docs if d.status == SeekerDocumentStatus.expired), None)
+    if expired is not None:
+        return "expired", expired.id
+    return "under_review", docs[0].id
 
 
 async def portfolio_summary(
@@ -218,7 +296,12 @@ async def portfolio_summary(
     seeker_id: uuid.UUID,
     visa_type: VisaType | None = None,
 ) -> DocumentPortfolioSummary:
-    """Overview tallies + required-category checklist for the Documents page."""
+    """Overview tallies + required-category checklist for the Documents page.
+
+    Default (no ``visa_type``) is portfolio-wide. Progress is share of required
+    categories that have ≥1 active file (any status except missing).
+    """
+    await refresh_expired_statuses(session, seeker_id)
     stmt = list_by_seeker_stmt(seeker_id, visa_type=visa_type)
     docs = list((await session.execute(stmt)).scalars().all())
 
@@ -233,24 +316,24 @@ async def portfolio_summary(
 
     checklist: list[DocumentChecklistItem] = []
     missing = 0
-    required_approved = 0
+    filled = 0
     for category in REQUIRED_CHECKLIST:
         status, document_id = _checklist_status_for_docs(by_category.get(category, []))
         if status == "missing":
             missing += 1
-        elif status == "approved":
-            required_approved += 1
+        else:
+            filled += 1
         checklist.append(
             DocumentChecklistItem(
                 category=category,
-                label=category.value.capitalize(),
+                label=CHECKLIST_LABELS[category],
                 status=status,
                 document_id=document_id,
             )
         )
 
     required_n = len(REQUIRED_CHECKLIST)
-    progress_percent = int(round(100 * required_approved / required_n)) if required_n else 0
+    progress_percent = int(round(100 * filled / required_n)) if required_n else 0
 
     return DocumentPortfolioSummary(
         total=total,
@@ -276,6 +359,44 @@ async def add_comment(
     await session.flush()
     await session.refresh(comment)
     return comment
+
+
+async def mark_comments_read(
+    session: AsyncSession, document: SeekerDocument, actor_id: uuid.UUID
+) -> None:
+    """Idempotent: seeker opened the comments sheet."""
+    document.comments_last_read_at = datetime.now(UTC)
+    document.updated_by = actor_id
+    session.add(document)
+    await session.flush()
+
+
+async def notify_seeker_of_advisor_comment(
+    session: AsyncSession,
+    document: SeekerDocument,
+    advisor: User,
+    comment_body: str,
+) -> None:
+    """In-app + FCM outbox for an advisor comment. Caller sends email separately."""
+    advisor_name = advisor.full_name or "Your advisor"
+    preview = " ".join(comment_body.split())
+    if len(preview) > 120:
+        preview = preview[:117] + "..."
+    body = f'{advisor_name} commented on "{document.document_name}"'
+    if preview:
+        body = f"{body}: {preview}"
+    if len(body) > 1000:
+        body = body[:997] + "..."
+    await notification_service.notify(
+        session,
+        user_id=document.seeker_id,
+        type=NotificationType.document_comment,
+        title="New comment on your document",
+        body=body,
+        entity_type=NotificationEntityType.seeker_document,
+        entity_id=document.id,
+        actor_id=advisor.id,
+    )
 
 
 def list_comments_stmt(document_id: uuid.UUID) -> Select[tuple[SeekerDocumentComment]]:
@@ -308,8 +429,42 @@ async def comment_counts_for_documents(
     return {doc_id: int(n) for doc_id, n in rows}
 
 
+async def unread_comment_flags(
+    session: AsyncSession, documents: list[SeekerDocument]
+) -> dict[uuid.UUID, bool]:
+    """True when an advisor/admin comment is newer than the seeker's last read."""
+    if not documents:
+        return {}
+    ids = [d.id for d in documents]
+    unread_ids = set(
+        (
+            await session.execute(
+                select(SeekerDocumentComment.document_id)
+                .join(SeekerDocument, SeekerDocument.id == SeekerDocumentComment.document_id)
+                .where(
+                    SeekerDocumentComment.document_id.in_(ids),
+                    SeekerDocumentComment.is_archived.is_(False),
+                    SeekerDocumentComment.author_id != SeekerDocument.seeker_id,
+                    or_(
+                        SeekerDocument.comments_last_read_at.is_(None),
+                        SeekerDocumentComment.created_at > SeekerDocument.comments_last_read_at,
+                    ),
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {doc_id: doc_id in unread_ids for doc_id in ids}
+
+
 def build_read(
-    document: SeekerDocument, settings: Settings, *, comments_count: int = 0
+    document: SeekerDocument,
+    settings: Settings,
+    *,
+    comments_count: int = 0,
+    has_unread_comments: bool = False,
 ) -> SeekerDocumentRead:
     return SeekerDocumentRead(
         id=document.id,
@@ -326,21 +481,52 @@ def build_read(
         reviewed_by=document.reviewed_by,
         created_at=document.created_at,
         comments_count=comments_count,
+        has_unread_comments=has_unread_comments,
     )
 
 
 async def build_reads(
-    session: AsyncSession, documents: list[SeekerDocument], settings: Settings
+    session: AsyncSession,
+    documents: list[SeekerDocument],
+    settings: Settings,
+    *,
+    include_unread: bool = False,
 ) -> list[SeekerDocumentRead]:
     counts = await comment_counts_for_documents(session, [d.id for d in documents])
-    return [build_read(d, settings, comments_count=counts.get(d.id, 0)) for d in documents]
+    unread = (
+        await unread_comment_flags(session, documents)
+        if include_unread
+        else {d.id: False for d in documents}
+    )
+    return [
+        build_read(
+            d,
+            settings,
+            comments_count=counts.get(d.id, 0),
+            has_unread_comments=unread.get(d.id, False),
+        )
+        for d in documents
+    ]
 
 
 async def build_read_enriched(
-    session: AsyncSession, document: SeekerDocument, settings: Settings
+    session: AsyncSession,
+    document: SeekerDocument,
+    settings: Settings,
+    *,
+    include_unread: bool = False,
 ) -> SeekerDocumentRead:
     counts = await comment_counts_for_documents(session, [document.id])
-    return build_read(document, settings, comments_count=counts.get(document.id, 0))
+    unread = False
+    if include_unread:
+        flags = await unread_comment_flags(session, [document])
+        unread = flags.get(document.id, False)
+    return build_read(
+        document,
+        settings,
+        comments_count=counts.get(document.id, 0),
+        has_unread_comments=unread,
+    )
 
 
 async def build_client_seeker_brief(
@@ -405,7 +591,11 @@ def _portfolio_completed_clause() -> ColumnElement[bool]:
             SeekerDocument.seeker_id == Booking.seeker_id,
             SeekerDocument.is_archived.is_(False),
             SeekerDocument.status.in_(
-                (SeekerDocumentStatus.under_review, SeekerDocumentStatus.rejected)
+                (
+                    SeekerDocumentStatus.under_review,
+                    SeekerDocumentStatus.rejected,
+                    SeekerDocumentStatus.expired,
+                )
             ),
         )
     )

@@ -281,7 +281,13 @@ async def update_user(session: AsyncSession, user: User, data: UserUpdate) -> Us
     if data.full_name is not None:
         user.full_name = data.full_name
     if data.password is not None:
+        if user.hashed_password and verify_password(data.password, user.hashed_password):
+            raise ConflictError("New password must be different from your current password")
         user.hashed_password = hash_password(data.password)
+        # Same session-kill as password reset: bump token_version + revoke refresh.
+        from app.services import auth_service
+
+        await auth_service.invalidate_sessions(session, user)
     user.updated_by = user.id
     session.add(user)
     await session.flush()

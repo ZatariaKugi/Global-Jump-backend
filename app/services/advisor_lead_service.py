@@ -1,93 +1,82 @@
 """AI-matched customer leads for advisors — the inverse of advisor_matching_service.
 
 Generated once, when a seeker's eligibility assessment completes
-(``assessment_service.submit_answers``): every approved+active advisor is scored
-against the assessment using the *same* weighted factors as
-``advisor_matching_service.score_advisor_for_assessment`` (country/visa/experience/
-rating), and a persisted ``AdvisorLead`` row is created for any advisor with a
-positive score. Advisors then work this list as a queue (new -> viewed -> contacted
-or dismissed) via ``GET/POST /advisors/me/leads...``.
+(``assessment_service.submit_answers``): uses the hybrid matcher
+(country gate + rule score + optional OpenAI re-rank blend) and persists
+``AdvisorLead`` rows for positive matches. Seekers read that snapshot on
+history / ``GET /assessments/{id}/matched-advisors`` (no OpenAI). Advisors
+then work this list as a queue (new -> viewed -> contacted or dismissed)
+via ``GET/POST /advisors/me/leads...``.
 """
 
 from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Select, or_, select
+from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from app.core.config import Settings, get_settings
 from app.core.exceptions import NotFoundError
-from app.core.visa_types import parse_visa_type, visa_type_name
+from app.core.file_storage import resolve_media_url
 from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import Assessment
 from app.models.booking import Booking
-from app.models.user import User, UserRole, VerificationStatus
-from app.services import review_service
-from app.services.advisor_matching_service import score_advisor_for_assessment
-
-
-def _build_reasons(
-    profile: AdvisorProfile,
-    destination: str,
-    visa_type: str,
-    average_rating: float | None,
-) -> str:
-    reasons: list[str] = []
-    countries = {c.country_code.upper() for c in (profile.country_expertise or [])}
-    if destination.upper() in countries:
-        reasons.append(f"Specializes in {destination.upper()} immigration")
-
-    specializations = {
-        parsed
-        for s in (profile.visa_specializations or [])
-        if (parsed := parse_visa_type(s.specialization)) is not None
-    }
-    target = parse_visa_type(visa_type)
-    if target is not None and target in specializations:
-        label = visa_type_name(target) or target.value
-        reasons.append(f"Specializes in {label}")
-
-    if profile.years_of_experience:
-        reasons.append(f"{profile.years_of_experience} years of experience")
-
-    if average_rating is not None:
-        reasons.append(f"{average_rating:.1f}★ average rating")
-
-    return "; ".join(reasons) if reasons else "General profile match"
+from app.models.user import User
+from app.schemas.assessment import AdvisorMatchRead
+from app.services import advisor_matching_service, advisor_profile_service, review_service
+from app.services.advisor_profile_service import build_match_reasons
 
 
 async def generate_for_assessment(
-    session: AsyncSession, assessment: Assessment
+    session: AsyncSession,
+    assessment: Assessment,
 ) -> list[AdvisorLead]:
-    """Score ``assessment`` against every approved advisor and persist leads."""
-    stmt = (
-        select(User, AdvisorProfile)
-        .join(AdvisorProfile, AdvisorProfile.user_id == User.id)
-        .where(User.role == UserRole.advisor)
-        .where(User.is_active.is_(True))
-        .where(User.verification_status == VerificationStatus.approved)
+    """Persist leads from the hybrid matcher (rule score + optional AI blend)."""
+    ranked, _total = await advisor_matching_service.match(
+        session,
+        assessment,
+        limit=500,
+        offset=0,
+        positive_only=True,
+        use_ai=True,
     )
-    rows = (await session.execute(stmt)).all()
-    ratings = await review_service.rating_summaries(session, [user.id for user, _ in rows])
 
     leads: list[AdvisorLead] = []
-    for user, profile in rows:
-        average_rating = ratings[user.id][0] if user.id in ratings else None
-        score = score_advisor_for_assessment(
-            profile, assessment.destination_country, assessment.visa_type, average_rating
-        )
-        if score <= 0:
-            continue
+
+    # Batch-load advisor profiles to avoid N+1 queries.
+    advisor_ids = [item.user_id for item in ranked]
+    profiles_by_id: dict[uuid.UUID, AdvisorProfile] = {}
+    if advisor_ids:
+        profile_rows = (
+            await session.execute(
+                select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
+            )
+        ).scalars().all()
+        profiles_by_id = {p.user_id: p for p in profile_rows}
+
+    for item in ranked:
+        reasons = item.match_reasons
+        if not reasons:
+            profile = profiles_by_id.get(item.user_id)
+            reasons = (
+                build_match_reasons(
+                    profile,
+                    assessment.destination_country,
+                    assessment.visa_type,
+                    item.average_rating,
+                )
+                if profile is not None
+                else "Matched by recommendation engine"
+            )
         lead = AdvisorLead(
             seeker_id=assessment.user_id,
-            advisor_id=user.id,
+            advisor_id=item.user_id,
             assessment_id=assessment.id,
-            match_score=score,
-            match_reasons=_build_reasons(
-                profile, assessment.destination_country, assessment.visa_type, average_rating
-            ),
+            match_score=item.match_score,
+            match_reasons=reasons,
             status=AdvisorLeadStatus.new,
         )
         session.add(lead)
@@ -98,6 +87,116 @@ async def generate_for_assessment(
         for lead in leads:
             await session.refresh(lead)
     return leads
+
+
+def list_for_assessment_stmt(assessment_id: uuid.UUID) -> Select[tuple[AdvisorLead]]:
+    """Persisted assessment matches for the seeker history / match panel."""
+    return (
+        select(AdvisorLead)
+        .where(
+            AdvisorLead.assessment_id == assessment_id,
+            AdvisorLead.is_archived.is_(False),
+        )
+        .order_by(AdvisorLead.match_score.desc(), AdvisorLead.created_at.desc())
+    )
+
+
+async def counts_for_assessments(
+    session: AsyncSession, assessment_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, int]:
+    """Per-assessment lead counts — no live matcher / OpenAI."""
+    if not assessment_ids:
+        return {}
+    stmt = (
+        select(AdvisorLead.assessment_id, func.count())
+        .where(
+            AdvisorLead.assessment_id.in_(assessment_ids),
+            AdvisorLead.is_archived.is_(False),
+        )
+        .group_by(AdvisorLead.assessment_id)
+    )
+    return {
+        assessment_id: int(count) for assessment_id, count in (await session.execute(stmt)).all()
+    }
+
+
+async def as_match_reads(
+    session: AsyncSession,
+    leads: list[AdvisorLead],
+    settings: Settings | None = None,
+) -> list[AdvisorMatchRead]:
+    """Hydrate saved leads into the seeker match-card shape."""
+    if not leads:
+        return []
+    cfg = settings or get_settings()
+    advisor_ids = [lead.advisor_id for lead in leads]
+    users = {
+        user.id: user
+        for user in (await session.execute(select(User).where(User.id.in_(advisor_ids))))
+        .scalars()
+        .all()
+    }
+    profiles = {
+        profile.user_id: profile
+        for profile in (
+            await session.execute(
+                select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
+            )
+        )
+        .scalars()
+        .all()
+    }
+    ratings = await review_service.rating_summaries(session, advisor_ids)
+    reads: list[AdvisorMatchRead] = []
+    for lead in leads:
+        user = users.get(lead.advisor_id)
+        if user is None:
+            continue
+        profile = profiles.get(lead.advisor_id)
+        avg, _count = ratings.get(lead.advisor_id, (None, 0))
+        reads.append(
+            AdvisorMatchRead(
+                user_id=user.id,
+                full_name=user.full_name,
+                email=user.email,
+                title=profile.title if profile is not None else None,
+                profile_photo_url=(
+                    resolve_media_url(profile.profile_photo_url, cfg)
+                    if profile is not None
+                    else None
+                ),
+                years_of_experience=(profile.years_of_experience if profile is not None else None),
+                average_rating=avg,
+                starting_price_usd=advisor_profile_service.starting_price_usd(profile),
+                match_score=lead.match_score,
+                public_profile_slug=(profile.public_profile_slug if profile is not None else None),
+                match_reasons=lead.match_reasons,
+                rule_score=None,
+                ai_score=None,
+            )
+        )
+    return reads
+
+
+async def matches_for_assessment(
+    session: AsyncSession,
+    assessment_id: uuid.UUID,
+    *,
+    limit: int,
+    offset: int = 0,
+    settings: Settings | None = None,
+) -> tuple[list[AdvisorMatchRead], int]:
+    """Paginated persisted matches. ``limit <= 0`` returns only the total."""
+    stmt = list_for_assessment_stmt(assessment_id)
+    total = int(
+        (
+            await session.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))
+        ).scalar_one()
+    )
+    if limit <= 0:
+        return [], total
+    leads = list((await session.execute(stmt.offset(offset).limit(limit))).scalars().all())
+    return await as_match_reads(session, leads, settings), total
 
 
 def list_for_advisor_stmt(

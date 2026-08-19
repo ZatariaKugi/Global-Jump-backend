@@ -1,7 +1,8 @@
 """Advisor dashboard aggregate (FE ``/advisor/dashboard``).
 
 One orchestration layer over existing services/tables — it owns no new state
-except the regulatory feed. The ``days`` window (7/30/90) scopes the stat tiles;
+except the regulatory feed. The optional ``days`` window (7/30/90/180/365;
+omitted = all-time) scopes the windowed stat tiles and regulatory card;
 profile completion is a point-in-time figure and is not windowed.
 """
 
@@ -47,7 +48,9 @@ _INQUIRIES_CARD_LIMIT = 5
 # nudges them toward the missing pieces (photo, languages, bookable services).
 
 
-def _since(days: int) -> datetime:
+def _since(days: int | None) -> datetime | None:
+    if days is None:
+        return None
     return datetime.now(UTC) - timedelta(days=days)
 
 
@@ -70,29 +73,35 @@ def profile_completion_percent(profile: AdvisorProfile) -> int:
     return round(100 * got / total) if total else 0
 
 
-async def _new_leads_count(session: AsyncSession, advisor_id: uuid.UUID, since: datetime) -> int:
-    result = await session.execute(
-        select(func.count(AdvisorLead.id)).where(
-            AdvisorLead.advisor_id == advisor_id,
-            AdvisorLead.status == AdvisorLeadStatus.new,
-            AdvisorLead.created_at >= since,
-        )
+async def _new_leads_count(
+    session: AsyncSession, advisor_id: uuid.UUID, since: datetime | None
+) -> int:
+    stmt = select(func.count(AdvisorLead.id)).where(
+        AdvisorLead.advisor_id == advisor_id,
+        AdvisorLead.status == AdvisorLeadStatus.new,
     )
+    if since is not None:
+        stmt = stmt.where(AdvisorLead.created_at >= since)
+    result = await session.execute(stmt)
     return int(result.scalar_one())
 
 
-async def _total_earned_usd(session: AsyncSession, advisor_id: uuid.UUID, since: datetime) -> float:
+async def _total_earned_usd(
+    session: AsyncSession, advisor_id: uuid.UUID, since: datetime | None
+) -> float:
     """Advisor payout on succeeded transactions in-window (matches earnings math)."""
-    result = await session.execute(
+    stmt = (
         select(func.coalesce(func.sum(Transaction.advisor_payout_usd), 0.0))
         .join(Booking, Booking.id == Transaction.booking_id)
         .where(
             Booking.advisor_id == advisor_id,
             Transaction.status == TransactionStatus.succeeded,
             Transaction.is_archived.is_(False),
-            Transaction.created_at >= since,
         )
     )
+    if since is not None:
+        stmt = stmt.where(Transaction.created_at >= since)
+    result = await session.execute(stmt)
     return round(float(result.scalar_one()), 2)
 
 
@@ -141,10 +150,12 @@ def regulatory_list_stmt() -> Select[tuple[RegulatoryUpdate]]:
 
 
 async def _regulatory_updates(
-    session: AsyncSession, since: datetime, limit: int
+    session: AsyncSession, since: datetime | None, limit: int
 ) -> list[RegulatoryUpdateRead]:
-    stmt = regulatory_list_stmt().where(RegulatoryUpdate.published_at >= since).limit(limit)
-    rows = (await session.execute(stmt)).scalars().all()
+    stmt = regulatory_list_stmt()
+    if since is not None:
+        stmt = stmt.where(RegulatoryUpdate.published_at >= since)
+    rows = (await session.execute(stmt.limit(limit))).scalars().all()
     return [RegulatoryUpdateRead.model_validate(r) for r in rows]
 
 
@@ -179,7 +190,7 @@ async def get_dashboard(
     advisor: User,
     profile: AdvisorProfile,
     settings: Settings,
-    days: int,
+    days: int | None,
 ) -> AdvisorDashboardRead:
     since = _since(days)
     stats = DashboardStats(
@@ -210,7 +221,7 @@ async def export_dashboard_csv(
     advisor: User,
     profile: AdvisorProfile,
     settings: Settings,
-    days: int,
+    days: int | None,
 ) -> str:
     """Flat metric/value CSV of the windowed stats + next appointment summary."""
     dashboard = await get_dashboard(session, advisor, profile, settings, days)
@@ -220,7 +231,7 @@ async def export_dashboard_csv(
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(_CSV_HEADERS)
-    writer.writerow(("window_days", days))
+    writer.writerow(("window_days", days if days is not None else ""))
     writer.writerow(("new_leads_count", stats.new_leads_count))
     writer.writerow(("total_earned_usd", f"{stats.total_earned_usd:.2f}"))
     writer.writerow(("pending_reviews_count", stats.pending_reviews_count))

@@ -33,6 +33,18 @@ DEFAULT_CONFIG = MatchingWeightConfig(
 )
 
 
+async def _singleton(session: AsyncSession) -> AdvisorMatchingWeights | None:
+    """Return the weights row, collapsing duplicates so only one remains."""
+    rows = list((await session.execute(select(AdvisorMatchingWeights))).scalars().all())
+    if not rows:
+        return None
+    if len(rows) > 1:
+        for extra in rows[1:]:
+            await session.delete(extra)
+        await session.flush()
+    return rows[0]
+
+
 async def get_config(session: AsyncSession) -> MatchingWeightConfig:
     row = (await session.execute(select(AdvisorMatchingWeights).limit(1))).scalar_one_or_none()
     if row is None:
@@ -67,8 +79,14 @@ async def get_read(session: AsyncSession) -> MatchingWeightsRead:
 async def upsert(
     session: AsyncSession, data: MatchingWeightsUpdate, admin_id: uuid.UUID
 ) -> MatchingWeightsRead:
-    row = (await session.execute(select(AdvisorMatchingWeights).limit(1))).scalar_one_or_none()
-    if row is None:
+    row = await _singleton(session)
+    if row is not None:
+        row.country_weight = data.country_weight
+        row.language_weight = data.language_weight
+        row.availability_weight = data.availability_weight
+        row.setting_weight = data.setting_weight
+        row.updated_by = admin_id
+    else:
         row = AdvisorMatchingWeights(
             country_weight=data.country_weight,
             language_weight=data.language_weight,
@@ -76,12 +94,6 @@ async def upsert(
             setting_weight=data.setting_weight,
             created_by=admin_id,
         )
-    else:
-        row.country_weight = data.country_weight
-        row.language_weight = data.language_weight
-        row.availability_weight = data.availability_weight
-        row.setting_weight = data.setting_weight
-        row.updated_by = admin_id
     session.add(row)
     await session.flush()
     await session.refresh(row)
