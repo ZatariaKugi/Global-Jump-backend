@@ -28,6 +28,13 @@ class BookingCreate(BaseModel):
     service_type: AdvisorServiceType
     scheduled_start: datetime
     seeker_note: str | None = Field(default=None, max_length=1000)
+    timezone: str | None = Field(
+        default=None,
+        description=(
+            "IANA timezone of the user (e.g. 'Asia/Karachi'). If scheduled_start "
+            "is naive, it is treated as local to this timezone and converted to UTC."
+        ),
+    )
 
 
 class AdvisorBookingCreate(BaseModel):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import Select, and_, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -341,6 +342,11 @@ async def get_notice_hours(session: AsyncSession, advisor_id: uuid.UUID) -> int:
     return hours if hours is not None else DEFAULT_NOTICE_HOURS
 
 
+def _floor_to_minute(dt: datetime) -> datetime:
+    """Strip microseconds/seconds for stable comparison across JSON round-trips."""
+    return dt.replace(second=0, microsecond=0)
+
+
 async def _assert_slot_free(
     session: AsyncSession,
     advisor_id: uuid.UUID,
@@ -348,18 +354,34 @@ async def _assert_slot_free(
     duration_minutes: int,
     exclude_booking_id: uuid.UUID | None = None,
 ) -> datetime:
-    """Validate the requested start against the advisor's free slots; return end."""
+    """Validate the requested start against the advisor's free slots; return end.
+
+    Queries date ± 1 day because free_slots expands weekly slots in the
+    advisor's local timezone — a slot at e.g. 00:30 Asia/Karachi maps to
+    19:30 UTC the previous day, so the UTC date differs from the advisor-local
+    date.
+    """
+    day = as_utc(start_utc).date()
     free = await availability_service.free_slots(
         session,
         advisor_id,
-        start_utc.date(),
-        start_utc.date(),
+        day - timedelta(days=1),
+        day + timedelta(days=1),
         duration_minutes,
         exclude_booking_id=exclude_booking_id,
     )
+    requested = _floor_to_minute(start_utc)
     for slot_start, slot_end in free:
-        if slot_start == start_utc:
+        if _floor_to_minute(slot_start) == requested:
             return slot_end
+    log.warning(
+        "slot_unavailable",
+        advisor_id=str(advisor_id),
+        requested_utc=start_utc.isoformat(),
+        requested_date=str(day),
+        free_slots_count=len(free),
+        free_slots=[(s.isoformat(), e.isoformat()) for s, e in free[:10]],
+    )
     raise AppError("Requested time is not available", code="slot_unavailable")
 
 
@@ -372,11 +394,18 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
     await _resolve_advisor(session, data.advisor_id)
     service = await _resolve_service(session, data.advisor_id, str(data.service_type))
 
-    start_utc = as_utc(data.scheduled_start)
+    if data.scheduled_start.tzinfo is None and data.timezone:
+        tz = ZoneInfo(data.timezone)
+        start_utc = data.scheduled_start.replace(tzinfo=tz).astimezone(UTC)
+    else:
+        start_utc = as_utc(data.scheduled_start)
+
     if start_utc <= datetime.now(UTC):
         raise AppError("Booking must be in the future", code="invalid_booking")
 
-    end_utc = await _assert_slot_free(session, data.advisor_id, start_utc, service.duration_minutes)
+    end_utc = await _assert_slot_free(
+        session, data.advisor_id, start_utc, service.duration_minutes
+    )
 
     booking = Booking(
         seeker_id=seeker.id,
