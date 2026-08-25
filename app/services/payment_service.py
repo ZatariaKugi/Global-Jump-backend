@@ -226,7 +226,6 @@ async def create_checkout_session(
     # connected account later, after the hold window — see run_due_transfers. The
     # platform keeps commission + withheld tax on its own balance.
     checkout_session = await stripe.checkout.Session.create_async(
-        payment_method_types=["card"],
         line_items=[
             {
                 "price_data": {
@@ -244,6 +243,7 @@ async def create_checkout_session(
         success_url=f"{settings.FRONTEND_URL}/bookings/{booking_id}?payment=success",
         cancel_url=f"{settings.FRONTEND_URL}/bookings/{booking_id}?payment=cancelled",
         metadata={"booking_id": str(booking_id)},
+        managed_payments={"enabled": False},
     )
 
     txn = Transaction(
@@ -463,6 +463,9 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
         booking.payment_status = PaymentStatus.paid
         if booking.paid_at is None:
             booking.paid_at = datetime.now(UTC)
+        if booking.status == BookingStatus.pending:
+            booking.status = BookingStatus.confirmed
+            booking.confirmed_at = datetime.now(UTC)
         session.add(booking)
 
     await session.flush()
@@ -535,6 +538,17 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
             entity_id=booking.id,
             actor_id=booking.seeker_id,
         )
+        if booking.status == BookingStatus.confirmed:
+            await notification_service.notify(
+                session,
+                user_id=booking.seeker_id,
+                type=NotificationType.booking_confirmed,
+                title="Booking confirmed",
+                body=f"Your {booking.service_type} session has been confirmed",
+                entity_type=NotificationEntityType.booking,
+                entity_id=booking.id,
+                actor_id=booking.advisor_id,
+            )
         await booking_meeting_service.maybe_provision_meeting(session, booking, settings)
     await _log_event(session, txn.id, TransactionEventType.receipt_sent)
     await _log_event(session, txn.id, TransactionEventType.closed)
