@@ -122,6 +122,10 @@ class DocumentPortfolioSummary(BaseModel):
     rejected: int
     progress_percent: int
     checklist: list[DocumentChecklistItem]
+    # Upcoming Expires sidebar data: docs whose expires_at falls within the next
+    # 30 days (inclusive of today), excluding already-expired docs. Sorted
+    # soonest-first, capped at ~20. Always present (empty list when none).
+    expiring_soon: list[SeekerDocumentRead] = Field(default_factory=list)
 
 
 class CustomerDocumentsRowRead(BaseModel):

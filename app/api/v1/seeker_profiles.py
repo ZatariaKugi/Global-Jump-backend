@@ -274,6 +274,7 @@ async def submit_visa_application(
         session,
         current_user.id,
         current_user.id,
+        settings,
         visa_type=resolved_visa,
         country=resolved_country,
     )
@@ -334,12 +335,13 @@ async def upload_document(
 async def get_my_documents_summary(
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     visa_type: Annotated[OptionalVisaType, Query()] = None,
 ) -> ResponseEnvelope[DocumentPortfolioSummary]:
     _require_seeker(current_user)
     summary = await seeker_document_service.portfolio_summary(
-        session, current_user.id, visa_type=visa_type
+        session, current_user.id, settings, visa_type=visa_type
     )
     return ResponseEnvelope[DocumentPortfolioSummary](
         data=summary,

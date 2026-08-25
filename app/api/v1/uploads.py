@@ -82,7 +82,7 @@ async def upload_file(
       ``POST /users/me/documents`` → ``file_key``.
     - ``general`` — anything else that does not fit the categories above.
 
-    **Accepted formats:** pdf, jpg, jpeg, png, docx.
+    **Accepted formats:** pdf, jpg, jpeg, png, doc, docx.
     ``seeker_document`` accepts pdf / jpg / jpeg / png only.
     """
     subdir = f"{category.value}/{current_user.id}"

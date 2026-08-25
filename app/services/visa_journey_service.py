@@ -401,6 +401,7 @@ async def _advisor_selected(session: AsyncSession, seeker_id: uuid.UUID) -> bool
 async def compute_state(
     session: AsyncSession,
     seeker_id: uuid.UUID,
+    settings: Settings,
     *,
     visa_type: VisaType | None,
     country: str | None,
@@ -410,7 +411,7 @@ async def compute_state(
     bookings = await _active_bookings(session, seeker_id)
     primary_booking = _pick_primary_booking(bookings)
     summary = await seeker_document_service.portfolio_summary(
-        session, seeker_id, visa_type=visa_type
+        session, seeker_id, settings, visa_type=visa_type
     )
     profile = await seeker_profile_service.get_or_create(session, seeker_id)
     submitted = profile.application_submitted_at is not None
@@ -466,12 +467,15 @@ async def submit_application(
     session: AsyncSession,
     seeker_id: uuid.UUID,
     actor_id: uuid.UUID,
+    settings: Settings,
     *,
     visa_type: VisaType | None,
     country: str | None,
 ) -> JourneyState:
     """Mark the visa application submitted. Idempotent. Requires Review complete."""
-    state = await compute_state(session, seeker_id, visa_type=visa_type, country=country)
+    state = await compute_state(
+        session, seeker_id, settings, visa_type=visa_type, country=country
+    )
     if state.statuses[JourneyStepKey.application_preparation] != JourneyStepStatus.completed:
         raise ConflictError("Complete the review stage before submitting your application")
     profile = await seeker_profile_service.get_or_create(session, seeker_id)
@@ -480,7 +484,9 @@ async def submit_application(
         profile.updated_by = actor_id
         session.add(profile)
         await session.flush()
-    return await compute_state(session, seeker_id, visa_type=visa_type, country=country)
+    return await compute_state(
+        session, seeker_id, settings, visa_type=visa_type, country=country
+    )
 
 
 async def get_journey(
@@ -492,7 +498,9 @@ async def get_journey(
     country: str | None,
 ) -> VisaJourneyRead:
     """Build the Visa Journey Tracking payload for the seeker."""
-    state = await compute_state(session, seeker_id, visa_type=visa_type, country=country)
+    state = await compute_state(
+        session, seeker_id, settings, visa_type=visa_type, country=country
+    )
     assessment, booking, summary = state.assessment, state.booking, state.summary
     statuses = state.statuses
 

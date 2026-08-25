@@ -28,14 +28,15 @@ from fastapi import UploadFile
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError
 
-_ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".docx"}
-# Seeker portfolio uploads are images + PDF only (no Word).
-_SEEKER_DOCUMENT_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
+_ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".doc", ".docx"}
+# Seeker portfolio uploads: PDF, images, and Word documents.
+_SEEKER_DOCUMENT_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".doc", ".docx"}
 _MAX_FILE_NAME_LEN = 255
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _PNG_MAGIC = b"\x89PNG"  # 89 50 4E 47
 _JPEG_MAGIC = b"\xff\xd8\xff"
 _ZIP_MAGIC = b"PK\x03\x04"
+_DOC_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
 def seeker_document_extensions() -> set[str]:
@@ -99,6 +100,8 @@ def assert_file_magic(suffix: str, content: bytes) -> None:
         ok = content.startswith(_JPEG_MAGIC)
     elif suffix == ".docx":
         ok = content.startswith(_ZIP_MAGIC) and _docx_has_content_types(content)
+    elif suffix == ".doc":
+        ok = content.startswith(_DOC_MAGIC)
     else:
         ok = False
     if not ok:

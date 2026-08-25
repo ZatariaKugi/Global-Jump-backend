@@ -206,7 +206,7 @@ async def get_dashboard(
     )
 
     state = await visa_journey_service.compute_state(
-        session, seeker_id, visa_type=visa_type, country=country
+        session, seeker_id, settings, visa_type=visa_type, country=country
     )
     doc_progress = visa_journey_service.documentation_progress(state.summary)
     journey_progress = visa_journey_service.overall_progress(state.statuses, doc_progress)

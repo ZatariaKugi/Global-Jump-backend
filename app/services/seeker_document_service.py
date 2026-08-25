@@ -294,12 +294,15 @@ def _checklist_status_for_docs(
 async def portfolio_summary(
     session: AsyncSession,
     seeker_id: uuid.UUID,
+    settings: Settings,
     visa_type: VisaType | None = None,
 ) -> DocumentPortfolioSummary:
     """Overview tallies + required-category checklist for the Documents page.
 
     Default (no ``visa_type``) is portfolio-wide. Progress is share of required
     categories that have ≥1 active file (any status except missing).
+    Also returns ``expiring_soon``: active docs whose ``expires_at`` falls within
+    the next 30 days (inclusive of today), sorted soonest-first and capped at 20.
     """
     await refresh_expired_statuses(session, seeker_id)
     stmt = list_by_seeker_stmt(seeker_id, visa_type=visa_type)
@@ -335,6 +338,11 @@ async def portfolio_summary(
     required_n = len(REQUIRED_CHECKLIST)
     progress_percent = int(round(100 * filled / required_n)) if required_n else 0
 
+    expiring_soon_docs = await _expiring_soon_docs(session, seeker_id, visa_type=visa_type)
+    expiring_soon = await build_reads(
+        session, expiring_soon_docs, settings, include_unread=True
+    )
+
     return DocumentPortfolioSummary(
         total=total,
         approved=approved,
@@ -343,7 +351,35 @@ async def portfolio_summary(
         rejected=rejected,
         progress_percent=progress_percent,
         checklist=checklist,
+        expiring_soon=expiring_soon,
     )
+
+
+EXPIRING_SOON_WINDOW_DAYS = 30
+EXPIRING_SOON_MAX_ITEMS = 20
+
+
+async def _expiring_soon_docs(
+    session: AsyncSession,
+    seeker_id: uuid.UUID,
+    *,
+    visa_type: VisaType | None = None,
+) -> list[SeekerDocument]:
+    """Active docs expiring in the next ``EXPIRING_SOON_WINDOW_DAYS`` days.
+
+    Future-only (``expires_at`` >= today), sorted soonest-first, capped at
+    ``EXPIRING_SOON_MAX_ITEMS``. Same visa scope as the rest of the summary
+    (untagged docs included when ``visa_type`` is set).
+    """
+    today = date.today()
+    cutoff = today + timedelta(days=EXPIRING_SOON_WINDOW_DAYS)
+    stmt = list_by_seeker_stmt(seeker_id, visa_type=visa_type).where(
+        SeekerDocument.expires_at.is_not(None),
+        SeekerDocument.expires_at >= today,
+        SeekerDocument.expires_at <= cutoff,
+    )
+    stmt = stmt.order_by(SeekerDocument.expires_at.asc()).limit(EXPIRING_SOON_MAX_ITEMS)
+    return list((await session.execute(stmt)).scalars().all())
 
 
 async def add_comment(
