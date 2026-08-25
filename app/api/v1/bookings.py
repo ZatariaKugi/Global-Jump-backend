@@ -7,6 +7,7 @@ from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Query
+from sqlalchemy import select
 
 from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.api.pagination import PaginationDep, page_meta, paginate
@@ -48,6 +49,26 @@ from app.services.availability_service import as_utc
 from app.services.booking_service import get_notice_hours
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
+
+
+async def _get_user_timezone(session: SessionDep, user_id: uuid.UUID) -> str | None:
+    """Get user's timezone from their profile (seeker or advisor)."""
+    from app.models.advisor_profile import AdvisorProfile
+    from app.models.seeker_profile import SeekerProfile
+
+    # Try seeker profile first
+    result = await session.execute(
+        select(SeekerProfile.timezone).where(SeekerProfile.user_id == user_id)
+    )
+    tz = result.scalar_one_or_none()
+    if tz:
+        return tz
+
+    # Try advisor profile
+    result = await session.execute(
+        select(AdvisorProfile.timezone).where(AdvisorProfile.user_id == user_id)
+    )
+    return result.scalar_one_or_none()
 
 
 async def _party_names(session: SessionDep, booking: Booking) -> tuple[User | None, User | None]:
@@ -113,6 +134,7 @@ async def _send_confirmations(session: SessionDep, booking: Booking, settings: S
     for recipient, other in ((seeker, advisor), (advisor, seeker)):
         if recipient is None:
             continue
+        user_tz = await _get_user_timezone(session, recipient.id)
         email_service.schedule_email(
             email_service.send_booking_confirmation_email(
                 recipient.email,
@@ -126,27 +148,9 @@ async def _send_confirmations(session: SessionDep, booking: Booking, settings: S
                 price_usd=booking.price_usd,
                 notice_hours=notice,
                 settings=settings,
+                user_timezone=user_tz,
             )
         )
-
-
-async def _send_new_request_notification(
-    session: SessionDep, booking: Booking, settings: SettingsDep
-) -> None:
-    seeker, advisor = await _party_names(session, booking)
-    if advisor is None:
-        return
-    email_service.schedule_email(
-        email_service.send_new_consultation_request_email(
-            advisor.email,
-            advisor.full_name or advisor.email,
-            (seeker.full_name or seeker.email) if seeker else "a seeker",
-            booking_id=str(booking.id),
-            service_type=booking.service_type,
-            start_utc=as_utc(booking.scheduled_start),
-            settings=settings,
-        )
-    )
 
 
 async def _send_reschedule_notifications(
@@ -157,6 +161,7 @@ async def _send_reschedule_notifications(
     for recipient, other in ((seeker, advisor), (advisor, seeker)):
         if recipient is None:
             continue
+        user_tz = await _get_user_timezone(session, recipient.id)
         email_service.schedule_email(
             email_service.send_booking_rescheduled_email(
                 recipient.email,
@@ -170,6 +175,7 @@ async def _send_reschedule_notifications(
                 price_usd=booking.price_usd,
                 notice_hours=notice,
                 settings=settings,
+                user_timezone=user_tz,
             )
         )
 
@@ -185,6 +191,7 @@ async def _send_cancellation_notifications(
     for recipient, other in ((seeker, advisor), (advisor, seeker)):
         if recipient is None:
             continue
+        user_tz = await _get_user_timezone(session, recipient.id)
         email_service.schedule_email(
             email_service.send_booking_cancelled_email(
                 recipient.email,
@@ -196,6 +203,7 @@ async def _send_cancellation_notifications(
                 reason=booking.cancellation_reason,
                 cancelled_by=cancelled_by,
                 settings=settings,
+                user_timezone=user_tz,
             )
         )
 
@@ -206,6 +214,7 @@ async def _send_rejection_notification(
     seeker, advisor = await _party_names(session, booking)
     if seeker is None:
         return
+    user_tz = await _get_user_timezone(session, seeker.id)
     email_service.schedule_email(
         email_service.send_booking_rejected_email(
             seeker.email,
@@ -216,6 +225,7 @@ async def _send_rejection_notification(
             start_utc=as_utc(booking.scheduled_start),
             reason=booking.cancellation_reason,
             settings=settings,
+            user_timezone=user_tz,
         )
     )
 
@@ -256,7 +266,8 @@ async def create_booking(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.create(session, current_user, data)
-    await _send_new_request_notification(session, booking, settings)
+    # Advisor notification is sent only after payment succeeds
+    # (see payment_service._handle_checkout_completed)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(

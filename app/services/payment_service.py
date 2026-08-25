@@ -387,6 +387,8 @@ def _stripe_get(obj: object, key: str, default: object = None) -> object:
 
 async def _handle_checkout_completed(session: AsyncSession, cs: object, settings: Settings) -> None:
     session_id = str(_stripe_get(cs, "id") or "")
+    log.info("webhook_checkout_started", session_id=session_id)
+    
     txn_result = await session.execute(
         select(Transaction).where(Transaction.stripe_checkout_session_id == session_id)
     )
@@ -394,6 +396,15 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
     if txn is None:
         log.warning("webhook_checkout_no_txn", session_id=session_id)
         return
+    
+    log.info(
+        "webhook_checkout_txn_found",
+        session_id=session_id,
+        txn_id=str(txn.id),
+        current_status=txn.status.value,
+        booking_id=str(txn.booking_id),
+    )
+    
     # Idempotent against duplicate webhook delivery — Stripe may deliver the same
     # event more than once. If we've already processed this checkout, do nothing
     # (re-running would re-arm the hold and re-send the receipt).
@@ -455,7 +466,15 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
         session.add(booking)
 
     await session.flush()
-    log.info("payment_succeeded", booking_id=str(txn.booking_id), amount_usd=txn.amount_usd)
+    
+    log.info(
+        "payment_succeeded_db_updated",
+        booking_id=str(txn.booking_id),
+        amount_usd=txn.amount_usd,
+        txn_status=txn.status.value,
+        booking_payment_status=booking.payment_status.value if booking else None,
+        invoice_number=txn.invoice_number,
+    )
 
     if booking is not None:
         seeker = await session.get(User, booking.seeker_id)
@@ -503,6 +522,19 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
             body=f"Your client paid ${txn.amount_usd:.2f} for {booking.service_type}",
             actor_id=booking.seeker_id,
         )
+        # Notify advisor of the new booking request only after payment is confirmed
+        from app.models.notification import NotificationEntityType
+
+        await notification_service.notify(
+            session,
+            user_id=booking.advisor_id,
+            type=NotificationType.booking_requested,
+            title="New consultation request",
+            body=f"Payment received for {booking.service_type}",
+            entity_type=NotificationEntityType.booking,
+            entity_id=booking.id,
+            actor_id=booking.seeker_id,
+        )
         await booking_meeting_service.maybe_provision_meeting(session, booking, settings)
     await _log_event(session, txn.id, TransactionEventType.receipt_sent)
     await _log_event(session, txn.id, TransactionEventType.closed)
@@ -528,6 +560,19 @@ async def _handle_checkout_expired(session: AsyncSession, cs: object) -> None:
     await _log_event(session, txn.id, TransactionEventType.closed)
     booking = await session.get(Booking, txn.booking_id)
     if booking is not None:
+        # If the booking is still pending (advisor hasn't accepted), cancel it
+        # to release the slot. If the advisor already accepted (confirmed), keep
+        # the booking so the seeker can retry payment.
+        if booking.status == BookingStatus.pending:
+            booking.status = BookingStatus.cancelled
+            booking.cancellation_reason = "Payment failed — checkout expired"
+            session.add(booking)
+            await _log_event(session, txn.id, TransactionEventType.failed)
+            log.info(
+                "booking_cancelled_payment_failed",
+                booking_id=str(booking.id),
+                session_id=session_id,
+            )
         await _notify_payment(
             session,
             txn,
@@ -536,6 +581,19 @@ async def _handle_checkout_expired(session: AsyncSession, cs: object) -> None:
             title="Checkout expired",
             body=f"Your payment for {booking.service_type} was not completed",
         )
+        # Notify advisor if they were already notified of the request
+        if booking.status == BookingStatus.cancelled:
+            from app.services import notification_service
+
+            await notification_service.notify(
+                session,
+                user_id=booking.advisor_id,
+                type=NotificationType.booking_cancelled,
+                title="Consultation request cancelled",
+                body="The consultation request was cancelled due to a failed payment",
+                entity_type=NotificationEntityType.booking,
+                entity_id=booking.id,
+            )
     await session.flush()
     log.info("checkout_expired", session_id=session_id)
 

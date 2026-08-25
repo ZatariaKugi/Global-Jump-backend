@@ -22,7 +22,7 @@ from app.models.booking_document_request import DocumentRequestStatus
 from app.models.notification import NotificationEntityType, NotificationType
 from app.models.review import Review
 from app.models.seeker_profile import SeekerProfile
-from app.models.transaction import Transaction
+from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.booking import (
     AdvisorBookingCreate,
@@ -396,14 +396,9 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
-    await _notify_booking(
-        session,
-        booking,
-        recipient_id=booking.advisor_id,
-        actor_id=seeker.id,
-        type=NotificationType.booking_requested,
-        title="New consultation request",
-    )
+    # Advisor notification is sent only after payment succeeds
+    # (see payment_service._handle_checkout_completed) to avoid
+    # misleading advisors with unpaid booking requests.
     return booking
 
 
@@ -724,6 +719,15 @@ async def accept(
         raise PermissionDeniedError("Only the advisor can do this")
     if booking.status != BookingStatus.pending:
         raise AppError("Booking is not pending", code="invalid_state")
+    # Paid bookings only — free (advisor-self-created, price_usd <= 0) bookings don't go
+    # through checkout, so they're allowed through without a payment record. This is the
+    # BE enforcement that pairs with the FE soft-gate; without it, an unpaid booking can
+    # still be confirmed via direct API call and produce an unpaid "confirmed" appointment.
+    if booking.price_usd > 0 and booking.payment_status != PaymentStatus.paid:
+        raise AppError(
+            "Booking must be paid before it can be accepted",
+            code="payment_required",
+        )
     booking.status = BookingStatus.confirmed
     booking.confirmed_at = datetime.now(UTC)
     booking.deal_later_at = None
@@ -849,6 +853,95 @@ async def expire_unaccepted_pending_bookings(
             "booking_expired_unaccepted",
             booking_id=str(booking.id),
             paid=was_paid,
+        )
+        expired += 1
+
+    return expired
+
+
+STALE_UNPAID_EXPIRY_REASON = "Payment was not completed within the allowed time window"
+
+async def expire_stale_unpaid_bookings(
+    session: AsyncSession, settings: Settings
+) -> int:
+    """Cancel pending+unpaid bookings older than ``STALE_UNPAID_BOOKING_MINUTES``.
+
+    Safety net: if the checkout.session.expired webhook was missed or the seeker
+    never initiated payment, this sweep releases the slot. Only targets bookings
+    where payment_status is unpaid and no transaction exists (or the transaction
+    has already failed).
+
+    Uses ``FOR UPDATE SKIP LOCKED`` so multiple app instances do not double-process.
+    Returns the number of bookings expired this pass.
+    """
+    stale_minutes = getattr(settings, "STALE_UNPAID_BOOKING_MINUTES", 60)
+    cutoff = datetime.now(UTC) - timedelta(minutes=stale_minutes)
+
+    # Find pending+unpaid bookings created before the cutoff
+    # that have no successful transaction
+    due = list(
+        (
+            await session.execute(
+                select(Booking)
+                .where(
+                    Booking.status == BookingStatus.pending,
+                    Booking.payment_status == PaymentStatus.unpaid,
+                    Booking.created_at < cutoff,
+                )
+                .with_for_update(skip_locked=True)
+                .limit(100)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    expired = 0
+    for booking in due:
+        if booking.status != BookingStatus.pending:
+            continue
+        # Double-check: if a successful transaction exists, skip (payment may have
+        # succeeded between the query and this check)
+        txn = (
+            await session.execute(
+                select(Transaction).where(
+                    Transaction.booking_id == booking.id,
+                    Transaction.status == TransactionStatus.succeeded,
+                )
+            )
+        ).scalar_one_or_none()
+        if txn is not None:
+            continue
+
+        booking.status = BookingStatus.cancelled
+        booking.cancellation_reason = STALE_UNPAID_EXPIRY_REASON
+        booking.cancelled_by = None
+        booking.updated_by = None
+        session.add(booking)
+        await session.flush()
+        await session.refresh(booking)
+
+        await _notify_booking(
+            session,
+            booking,
+            recipient_id=booking.seeker_id,
+            actor_id=booking.advisor_id,
+            type=NotificationType.booking_cancelled,
+            title="Consultation request cancelled",
+            body=STALE_UNPAID_EXPIRY_REASON,
+        )
+        await _notify_booking(
+            session,
+            booking,
+            recipient_id=booking.advisor_id,
+            actor_id=booking.seeker_id,
+            type=NotificationType.booking_cancelled,
+            title="Consultation request cancelled",
+            body=STALE_UNPAID_EXPIRY_REASON,
+        )
+        log.info(
+            "booking_expired_stale_unpaid",
+            booking_id=str(booking.id),
         )
         expired += 1
 

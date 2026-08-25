@@ -16,6 +16,7 @@ import pathlib
 from collections.abc import Coroutine
 from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from aiosmtplib.errors import SMTPException
 from fastapi import UploadFile
@@ -32,6 +33,27 @@ logger = get_logger(__name__)
 
 # Keep strong refs until background sends finish (asyncio only weak-refs tasks).
 _background_email_tasks: set[asyncio.Task[None]] = set()
+
+
+def _format_user_time(
+    utc_dt: datetime,
+    user_timezone: str | None,
+    fmt: str = "%A, %d %B %Y at %I:%M %p",
+) -> str:
+    """Format a UTC datetime in the user's local timezone.
+
+    Falls back to UTC if user_timezone is None or invalid.
+    Uses 12-hour format with AM/PM for user-friendly display.
+    """
+    if user_timezone:
+        try:
+            tz = ZoneInfo(user_timezone)
+            local_dt = utc_dt.astimezone(tz)
+            return local_dt.strftime(fmt)
+        except (ValueError, KeyError):
+            pass
+    # Fallback to UTC with 12-hour format
+    return utc_dt.astimezone(UTC).strftime(fmt)
 
 
 def schedule_email(coro: Coroutine[Any, Any, None]) -> None:
@@ -554,6 +576,7 @@ async def send_booking_confirmation_email(
     price_usd: float,
     notice_hours: int,
     settings: Settings,
+    user_timezone: str | None = None,
 ) -> None:
     """Booking confirmation with a ``booking.ics`` calendar attachment."""
     ctx = {
@@ -561,7 +584,7 @@ async def send_booking_confirmation_email(
         "full_name": full_name or to,
         "other_party": other_party,
         "service_type": service_type,
-        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "start_str": _format_user_time(start_utc, user_timezone),
         "duration_minutes": duration_minutes,
         "price_usd": f"{price_usd:.2f}",
         "notice_hours": notice_hours,
@@ -640,6 +663,7 @@ async def send_booking_meeting_email(
     passcode: str | None,
     is_host: bool,
     settings: Settings,
+    user_timezone: str | None = None,
 ) -> None:
     """Send Zoom join (seeker) or start (advisor host) link after meeting is provisioned."""
     ctx = {
@@ -647,7 +671,7 @@ async def send_booking_meeting_email(
         "full_name": full_name or to,
         "other_party": other_party,
         "service_type": service_type,
-        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "start_str": _format_user_time(start_utc, user_timezone),
         "duration_minutes": duration_minutes,
         "meeting_url": meeting_url,
         "passcode": passcode,
@@ -706,6 +730,7 @@ async def send_new_consultation_request_email(
     service_type: str,
     start_utc: datetime,
     settings: Settings,
+    user_timezone: str | None = None,
 ) -> None:
     """Notify an advisor that a new consultation request is awaiting accept/reject."""
     ctx = {
@@ -713,7 +738,7 @@ async def send_new_consultation_request_email(
         "full_name": full_name or to,
         "other_party": other_party,
         "service_type": service_type,
-        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "start_str": _format_user_time(start_utc, user_timezone),
         "year": datetime.now(UTC).year,
     }
 
@@ -763,6 +788,7 @@ async def send_booking_rejected_email(
     start_utc: datetime,
     reason: str | None,
     settings: Settings,
+    user_timezone: str | None = None,
 ) -> None:
     """Notify a seeker that their consultation request was declined."""
     ctx: dict[str, object] = {
@@ -770,7 +796,7 @@ async def send_booking_rejected_email(
         "full_name": full_name or to,
         "other_party": other_party,
         "service_type": service_type,
-        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "start_str": _format_user_time(start_utc, user_timezone),
         "reason": reason,
         "year": datetime.now(UTC).year,
     }
@@ -824,6 +850,7 @@ async def send_booking_rescheduled_email(
     price_usd: float,
     notice_hours: int,
     settings: Settings,
+    user_timezone: str | None = None,
 ) -> None:
     """Notify a party that a consultation was rescheduled (updated ``booking.ics`` attached)."""
     ctx = {
@@ -831,7 +858,7 @@ async def send_booking_rescheduled_email(
         "full_name": full_name or to,
         "other_party": other_party,
         "service_type": service_type,
-        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "start_str": _format_user_time(start_utc, user_timezone),
         "duration_minutes": duration_minutes,
         "price_usd": f"{price_usd:.2f}",
         "notice_hours": notice_hours,
@@ -909,6 +936,7 @@ async def send_booking_cancelled_email(
     reason: str | None,
     cancelled_by: str | None = None,
     settings: Settings,
+    user_timezone: str | None = None,
 ) -> None:
     """Notify a party that a consultation was cancelled."""
     ctx: dict[str, object] = {
@@ -916,7 +944,7 @@ async def send_booking_cancelled_email(
         "full_name": full_name or to,
         "other_party": other_party,
         "service_type": service_type,
-        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "start_str": _format_user_time(start_utc, user_timezone),
         "reason": reason,
         "cancelled_by": cancelled_by,
         "year": datetime.now(UTC).year,
