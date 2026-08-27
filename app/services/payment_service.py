@@ -6,6 +6,7 @@ import csv
 import io
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 import stripe
 import structlog
@@ -1211,29 +1212,14 @@ async def build_invoice(
         from_address = getattr(settings, "INVOICE_FROM_ADDRESS", None)
         line_items = [
             InvoiceLineItem(
-                description="Platform Charges",
+                description=booking.service_type,
                 quantity=1,
-                unit_price_usd=txn.commission_usd,
-                total_usd=txn.commission_usd,
-            ),
-            InvoiceLineItem(
-                description="Consultant Fee",
-                quantity=1,
-                unit_price_usd=txn.advisor_payout_usd,
-                total_usd=txn.advisor_payout_usd,
-            ),
-        ]
-        if txn.tax_usd and txn.tax_usd > 0:
-            line_items.append(
-                InvoiceLineItem(
-                    description="Tax",
-                    quantity=1,
-                    unit_price_usd=txn.tax_usd,
-                    total_usd=txn.tax_usd,
-                )
+                unit_price_usd=txn.amount_usd,
+                total_usd=txn.amount_usd,
             )
-        subtotal = round(txn.commission_usd + txn.advisor_payout_usd, 2)
-        tax = txn.tax_usd
+        ]
+        subtotal = txn.amount_usd
+        tax = 0.0
         total = txn.amount_usd
 
     return InvoiceRead(
@@ -1335,8 +1321,6 @@ async def seeker_payment_read(
         ),
         service_type=booking.service_type,
         created_at=txn.created_at,
-        platform_fee_usd=txn.commission_usd,
-        consultant_fee_usd=txn.advisor_payout_usd,
         amount_usd=txn.amount_usd,
         total_amount=txn.amount_usd,
         status=txn.status,
@@ -1357,8 +1341,6 @@ _SEEKER_CSV_HEADERS = (
     "Advisor Email",
     "Services",
     "Date",
-    "Platform Fee",
-    "Consultant Fee",
     "Total Amount",
     "Status",
 )
@@ -1398,8 +1380,6 @@ async def export_seeker_history_csv(
                 row.advisor_email or "",
                 row.service_type,
                 row.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                f"{row.platform_fee_usd:.2f}",
-                f"{row.consultant_fee_usd:.2f}",
                 f"{row.total_amount:.2f}",
                 row.display_status,
             ]
@@ -1429,25 +1409,26 @@ async def seeker_payment_summary(
     stmt = stmt.order_by(Transaction.created_at.desc())
 
     rows = list((await session.execute(stmt)).scalars().all())
-    total_paid = 0.0
-    pending_amount = 0.0
-    refund_amount = 0.0
+    total_paid = Decimal("0")
+    pending_amount = Decimal("0")
+    refund_amount = Decimal("0")
     for t in rows:
+        amount = Decimal(str(t.amount_usd))
         if t.status in (TransactionStatus.succeeded, TransactionStatus.partially_refunded):
-            total_paid += t.amount_usd
+            total_paid += amount
         if t.status == TransactionStatus.pending:
-            pending_amount += t.amount_usd
+            pending_amount += amount
         if t.status in (TransactionStatus.refunded, TransactionStatus.partially_refunded):
             if t.refunded_amount_usd is not None:
-                refund_amount += t.refunded_amount_usd
+                refund_amount += Decimal(str(t.refunded_amount_usd))
             elif t.status == TransactionStatus.refunded:
-                refund_amount += t.amount_usd
+                refund_amount += amount
     last = rows[0] if rows else None
     return SeekerPaymentSummaryRead(
-        total_paid_usd=round(total_paid, 2),
-        pending_amount_usd=round(pending_amount, 2),
-        refund_amount_usd=round(refund_amount, 2),
-        last_transaction_usd=round(last.amount_usd, 2) if last else None,
+        total_paid_usd=float(round(total_paid, 2)),
+        pending_amount_usd=float(round(pending_amount, 2)),
+        refund_amount_usd=float(round(refund_amount, 2)),
+        last_transaction_usd=float(round(Decimal(str(last.amount_usd)), 2)) if last else None,
     )
 
 

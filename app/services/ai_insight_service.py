@@ -258,6 +258,7 @@ async def generate_insights(
             return None
         response = await client.chat.completions.create(
             model=settings.OPENAI_MODEL,
+            temperature=0,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": _build_user_prompt(assessment, answered, policy)},
@@ -368,6 +369,7 @@ async def generate_onboarding_suggestions(data: OnboardingSubmit, settings: Sett
             return []
         response = await client.chat.completions.create(
             model=settings.OPENAI_MODEL,
+            temperature=0,
             messages=[
                 {"role": "system", "content": _ONBOARDING_SYSTEM_PROMPT},
                 {"role": "user", "content": _build_onboarding_prompt(data)},

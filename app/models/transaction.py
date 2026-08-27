@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -70,12 +70,12 @@ class Transaction(BaseModel):
     )
     transfer_last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
-    amount_usd: Mapped[float] = mapped_column(Float, nullable=False)
-    commission_rate: Mapped[float] = mapped_column(Float, nullable=False)
-    commission_usd: Mapped[float] = mapped_column(Float, nullable=False)
-    tax_rate: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.08")
-    tax_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
-    advisor_payout_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    amount_usd: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    commission_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
+    commission_usd: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    tax_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False, server_default="0.08")
+    tax_usd: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False, server_default="0")
+    advisor_payout_usd: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     payment_method: Mapped[str] = mapped_column(
         String(50), default="card", server_default="card", nullable=False
     )
@@ -100,4 +100,4 @@ class Transaction(BaseModel):
     refunded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refunded_by: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     refund_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    refunded_amount_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    refunded_amount_usd: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)

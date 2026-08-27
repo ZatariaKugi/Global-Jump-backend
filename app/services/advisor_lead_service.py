@@ -173,6 +173,8 @@ async def as_match_reads(
                 match_reasons=lead.match_reasons,
                 rule_score=None,
                 ai_score=None,
+                visa_specializations=[s.specialization for s in (profile.visa_specializations or [])] if profile is not None else None,
+                country_expertise=[c.country_code for c in (profile.country_expertise or [])] if profile is not None else None,
             )
         )
     return reads

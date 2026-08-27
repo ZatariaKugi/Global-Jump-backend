@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator
 from typing import Annotated
 
 from fastapi import Depends
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -23,6 +24,14 @@ engine: AsyncEngine = create_async_engine(
     future=True,
     echo=False,
 )
+
+
+@event.listens_for(engine.sync_engine, "connect")
+def _set_session_timezone(dbapi_conn, connection_record):  # type: ignore[no-untyped-def]
+    """Ensure every new connection uses UTC so extract(day) is consistent."""
+    cursor = dbapi_conn.cursor()
+    cursor.execute("SET timezone = 'UTC'")
+    cursor.close()
 
 async_session_factory = async_sessionmaker(
     bind=engine,

@@ -461,8 +461,14 @@ async def create_by_advisor(
         appointment_number=await _next_appointment_number(session),
         service_type=str(data.service_type),
         duration_minutes=data.duration_minutes,
-        # Advisor-created bookings are not paid consultations.
+        # Advisor-created bookings are not paid consultations — no checkout
+        # session is ever created for them (see create_checkout_session, which
+        # rejects price_usd <= 0), so the booking must not surface to the
+        # seeker as an unpaid $0 invoice they cannot pay. Marking
+        # payment_status=paid here keeps it out of "Pay now" lists while
+        # preserving the existing paid-or-free chat-gate clause.
         price_usd=0.0,
+        payment_status=PaymentStatus.paid,
         scheduled_start=start_utc,
         scheduled_end=end_utc,
         status=BookingStatus.confirmed,

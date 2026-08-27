@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.core.visa_types import parse_visa_type
 from app.models.advisor_availability import AdvisorWeeklySlot
-from app.models.advisor_profile import AdvisorProfile
+from app.models.advisor_profile import AdvisorCountryExpertise, AdvisorProfile
 from app.models.assessment import Assessment, AssessmentStatus
 from app.models.seeker_profile import SeekerProfile
 from app.models.user import User, UserRole, VerificationStatus
@@ -417,9 +417,17 @@ async def match_from_context(
         stmt = (
             select(User, AdvisorProfile)
             .join(AdvisorProfile, AdvisorProfile.user_id == User.id)
+            .join(
+                AdvisorCountryExpertise,
+                AdvisorCountryExpertise.profile_id == AdvisorProfile.id,
+            )
             .where(User.role == UserRole.advisor)
             .where(User.is_active.is_(True))
             .where(User.verification_status == VerificationStatus.approved)
+            .where(
+                AdvisorCountryExpertise.country_code == case.destination_country.upper()
+            )
+            .distinct()
         )
         stmt = apply_integrations_ready_filter(stmt)
         rows = [(user, profile) for user, profile in (await session.execute(stmt)).all()]
@@ -471,6 +479,8 @@ async def match_from_context(
                 rule_score=None,
                 ai_score=None,
                 match_reasons=None,
+                visa_specializations=[s.specialization for s in (profile.visa_specializations or [])],
+                country_expertise=[c.country_code for c in (profile.country_expertise or [])],
             )
         )
 

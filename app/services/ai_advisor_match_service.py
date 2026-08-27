@@ -174,11 +174,14 @@ def _build_user_prompt(case: SeekerMatchCase, candidates: list[AdvisorMatchRead]
         "Candidate advisors (already country-filtered). Re-rank all of them:",
     ]
     for c in candidates:
+        visa_specs = ", ".join(c.visa_specializations) if c.visa_specializations else "none"
+        countries = ", ".join(c.country_expertise) if c.country_expertise else "none"
         lines.append(
             "- "
             f"id={c.user_id}; name={c.full_name or 'Advisor'}; title={c.title or '-'}; "
             f"experience_years={c.years_of_experience}; rating={c.average_rating}; "
-            f"starting_price_usd={c.starting_price_usd}; rule_score={c.match_score}"
+            f"starting_price_usd={c.starting_price_usd}; rule_score={c.match_score}; "
+            f"visa_specializations=[{visa_specs}]; country_expertise=[{countries}]"
         )
     return "\n".join(lines)
 
@@ -227,6 +230,7 @@ async def rerank_advisors(
             return None
         response = await client.chat.completions.create(
             model=settings.OPENAI_MODEL,
+            temperature=0,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": _build_user_prompt(case, pool)},

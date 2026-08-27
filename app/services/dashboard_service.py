@@ -8,6 +8,7 @@ zero-fills chart buckets and maps the already-limited activity rows.
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -157,8 +158,21 @@ async def get_dashboard_summary(
     session: AsyncSession, days: int | None = None
 ) -> DashboardSummaryRead:
     since = _dashboard_since(days)
-    stats = await _user_stat_counts(session, since)
-    revenue_today_usd = await _revenue_today_usd(session)
+    (
+        stats,
+        revenue_today_usd,
+        user_registration_trend,
+        ai_assessment_volume,
+        revenue_breakdown,
+        recent_activities,
+    ) = await asyncio.gather(
+        _user_stat_counts(session, since),
+        _revenue_today_usd(session),
+        _user_registration_trend(session, since, days),
+        _ai_assessment_volume(session, since, days),
+        _revenue_breakdown(session, since),
+        get_recent_activities(session, days, limit=_HOME_ACTIVITY_LIMIT),
+    )
     return DashboardSummaryRead(
         window_days=days,
         total_users=stats["total_users"],
@@ -168,10 +182,10 @@ async def get_dashboard_summary(
         verified_advisors=stats["verified_advisors"],
         active_advisors=stats["active_advisors"],
         revenue_today_usd=revenue_today_usd,
-        user_registration_trend=await _user_registration_trend(session, since, days),
-        ai_assessment_volume=await _ai_assessment_volume(session, since, days),
-        revenue_breakdown=await _revenue_breakdown(session, since),
-        recent_activities=await get_recent_activities(session, days, limit=_HOME_ACTIVITY_LIMIT),
+        user_registration_trend=user_registration_trend,
+        ai_assessment_volume=ai_assessment_volume,
+        revenue_breakdown=revenue_breakdown,
+        recent_activities=recent_activities,
     )
 
 
@@ -180,8 +194,9 @@ async def _user_stat_counts(session: AsyncSession, since: datetime | None) -> di
     seeker = User.role == UserRole.seeker
     advisor = User.role == UserRole.advisor
     approved = User.verification_status == VerificationStatus.approved
+    non_admin = User.role != UserRole.admin
     stmt = select(
-        func.count().label("total_users"),
+        func.coalesce(func.sum(case((non_admin, 1), else_=0)), 0).label("total_users"),
         func.coalesce(func.sum(case((seeker, 1), else_=0)), 0).label("total_seekers"),
         func.coalesce(
             func.sum(case((seeker & User.email_verified_at.is_not(None), 1), else_=0)),

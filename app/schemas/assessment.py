@@ -194,6 +194,9 @@ class AdvisorMatchRead(BaseModel):
     rule_score: float | None = None
     # AI-only score when re-rank ran; null if OpenAI skipped.
     ai_score: float | None = None
+    # Advisor specialization data for AI re-ranking.
+    visa_specializations: list[str] | None = None
+    country_expertise: list[str] | None = None
 
 
 class AssessmentRead(BaseModel):
