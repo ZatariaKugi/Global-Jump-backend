@@ -247,11 +247,14 @@ async def _grouped_timestamp_counts(
     since: datetime | None,
     *,
     daily: bool,
+    where: Any | None = None,
 ) -> dict[str, int]:
     parts = _period_parts(column, daily=daily)
     stmt = select(*parts, func.count())
     if since is not None:
         stmt = stmt.where(column >= since)
+    if where is not None:
+        stmt = stmt.where(where)
     stmt = stmt.group_by(*parts)
     counts: dict[str, int] = {}
     for *bucket, count in (await session.execute(stmt)).all():
@@ -262,10 +265,15 @@ async def _grouped_timestamp_counts(
 async def _user_registration_trend(
     session: AsyncSession, since: datetime | None, days: int | None
 ) -> list[MonthlyCountPoint]:
-    """ALL users regardless of role (seeker+advisor combined) — the mockup
-    shows one line with no role split."""
+    """Non-admin users (seeker+advisor combined) — the mockup shows one line
+    with no role split. Admins are excluded to stay consistent with the stat
+    cards (which count total_users as non-admin)."""
     counts = await _grouped_timestamp_counts(
-        session, User.created_at, since, daily=days == 7 and since is not None
+        session,
+        User.created_at,
+        since,
+        daily=days == 7 and since is not None,
+        where=User.role != UserRole.admin,
     )
     return _trend_from_counts(counts, since, days)
 
