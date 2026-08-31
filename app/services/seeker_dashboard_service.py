@@ -48,8 +48,9 @@ from app.services.ai_advisor_match_service import ai_match_status
 MATCHED_ADVISORS_LIMIT = 10
 
 # Chart labels for the four seeker-facing timeline bars (Review is not shown).
+# ``assessment`` key is kept for API stability — label is profile recommendations.
 _STAGE_LABELS: dict[JourneyStepKey, str] = {
-    JourneyStepKey.assessment: "Assessment",
+    JourneyStepKey.assessment: "AI Recommendation",
     JourneyStepKey.advisor: "Advisor",
     JourneyStepKey.documentation: "Documents",
     JourneyStepKey.submission: "Submission",
@@ -117,7 +118,7 @@ async def _documents_uploaded(
 def _build_stages(
     statuses: dict[JourneyStepKey, JourneyStepStatus], doc_progress: int
 ) -> list[JourneyStageRead]:
-    """Dashboard timeline bars — Assessment → Advisor → Documents → Submission."""
+    """Dashboard timeline bars — Profile recs → Advisor → Documents → Submission."""
     keys = tuple(
         key
         for key in visa_journey_service.VISIBLE_STEP_KEYS
@@ -256,7 +257,7 @@ async def get_dashboard(
             country_name=country_name(country),
             journey_progress_percent=journey_progress,
             documents_uploaded=documents_uploaded,
-            documents_progress_percent=state.summary.progress_percent,
+            documents_progress_percent=doc_progress,
             application_status=application_state,
             application_status_percent=application_percent,
         ),

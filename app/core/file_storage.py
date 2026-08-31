@@ -187,8 +187,7 @@ def resolve_url(url_path: str, settings: Settings) -> str:
         return str(
             client.generate_presigned_url(
                 "get_object",
-                Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-                ExpiresIn=3600,
+                Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key}
             )
         )
     except Exception:  # noqa: BLE001 — never fail API responses on signing

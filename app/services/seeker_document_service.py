@@ -6,7 +6,7 @@ import uuid
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import ColumnElement, Select, exists, func, or_, select
+from sqlalchemy import ColumnElement, Select, delete, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -265,6 +265,19 @@ async def set_status(
     return document
 
 
+def _review_stale_after_document_update(
+    document: SeekerDocument,
+    review: SeekerDocumentAdvisorReview,
+) -> bool:
+    """True when the file/metadata changed after this review (e.g. seeker re-uploaded)."""
+    if document.status != SeekerDocumentStatus.under_review:
+        return False
+    if document.updated_at is None:
+        return False
+    # Allow a small clock/skew window so a fresh approve/reject is not treated as stale.
+    return review.reviewed_at < document.updated_at - timedelta(seconds=2)
+
+
 def advisor_effective_status(
     document: SeekerDocument,
     review: SeekerDocumentAdvisorReview | None,
@@ -272,9 +285,53 @@ def advisor_effective_status(
     """Status shown to a specific advisor (isolated from other advisors' reviews)."""
     if document.status == SeekerDocumentStatus.expired:
         return SeekerDocumentStatus.expired
-    if review is not None:
-        return review.status
+    if review is None:
+        return SeekerDocumentStatus.under_review
+    if _review_stale_after_document_update(document, review):
+        return SeekerDocumentStatus.under_review
+    return review.status
+
+
+def seeker_effective_status(
+    document: SeekerDocument,
+    reviews: list[SeekerDocumentAdvisorReview],
+) -> SeekerDocumentStatus:
+    """Status shown to the seeker — from advisor review rows only (not stale global)."""
+    if document.status == SeekerDocumentStatus.expired:
+        return SeekerDocumentStatus.expired
+    active = [r for r in reviews if not _review_stale_after_document_update(document, r)]
+    if any(r.status == SeekerDocumentStatus.rejected for r in active):
+        return SeekerDocumentStatus.rejected
+    if any(r.status == SeekerDocumentStatus.approved for r in active):
+        return SeekerDocumentStatus.approved
     return SeekerDocumentStatus.under_review
+
+
+def _latest_review(
+    reviews: list[SeekerDocumentAdvisorReview],
+) -> SeekerDocumentAdvisorReview | None:
+    if not reviews:
+        return None
+    return max(reviews, key=lambda r: r.reviewed_at)
+
+
+async def reviews_by_document(
+    session: AsyncSession, document_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[SeekerDocumentAdvisorReview]]:
+    if not document_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(SeekerDocumentAdvisorReview).where(
+                SeekerDocumentAdvisorReview.document_id.in_(document_ids),
+                SeekerDocumentAdvisorReview.is_archived.is_(False),
+            )
+        )
+    ).scalars()
+    grouped: dict[uuid.UUID, list[SeekerDocumentAdvisorReview]] = defaultdict(list)
+    for row in rows:
+        grouped[row.document_id].append(row)
+    return grouped
 
 
 async def reviews_for_advisor(
@@ -297,15 +354,12 @@ async def reviews_for_advisor(
 
 
 async def clear_advisor_reviews(session: AsyncSession, document_id: uuid.UUID) -> None:
-    result = await session.execute(
-        select(SeekerDocumentAdvisorReview).where(
+    """Drop all advisor review rows for a document (file replace / reset to review)."""
+    await session.execute(
+        delete(SeekerDocumentAdvisorReview).where(
             SeekerDocumentAdvisorReview.document_id == document_id,
-            SeekerDocumentAdvisorReview.is_archived.is_(False),
         )
     )
-    for review in result.scalars():
-        review.archive(review.advisor_id)
-        session.add(review)
     await session.flush()
 
 
@@ -326,7 +380,6 @@ async def set_advisor_review(
             select(SeekerDocumentAdvisorReview).where(
                 SeekerDocumentAdvisorReview.document_id == document.id,
                 SeekerDocumentAdvisorReview.advisor_id == advisor_id,
-                SeekerDocumentAdvisorReview.is_archived.is_(False),
             )
         )
     ).scalar_one_or_none()
@@ -343,6 +396,8 @@ async def set_advisor_review(
         )
     else:
         review = existing
+        if review.is_archived:
+            review.unarchive(advisor_id)
         review.status = status.status
         review.reviewed_at = now
         review.note = status.note
@@ -352,6 +407,7 @@ async def set_advisor_review(
     session.add(document)
     await session.flush()
     await session.refresh(review)
+    await session.refresh(document)
     return review
 
 
@@ -419,20 +475,53 @@ async def assert_portfolio_editable(session: AsyncSession, seeker_id: uuid.UUID)
 
 def _checklist_status_for_docs(
     docs: list[SeekerDocument],
+    reviews_by_doc: dict[uuid.UUID, list[SeekerDocumentAdvisorReview]],
 ) -> tuple[ChecklistItemStatus, uuid.UUID | None]:
     """Pick the best status for a required category from matching uploads."""
     if not docs:
         return "missing", None
-    approved = next((d for d in docs if d.status == SeekerDocumentStatus.approved), None)
+    approved = next(
+        (
+            d
+            for d in docs
+            if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+            == SeekerDocumentStatus.approved
+        ),
+        None,
+    )
     if approved is not None:
         return "approved", approved.id
-    reviewing = next((d for d in docs if d.status == SeekerDocumentStatus.under_review), None)
+    reviewing = next(
+        (
+            d
+            for d in docs
+            if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+            == SeekerDocumentStatus.under_review
+        ),
+        None,
+    )
     if reviewing is not None:
         return "under_review", reviewing.id
-    rejected = next((d for d in docs if d.status == SeekerDocumentStatus.rejected), None)
+    rejected = next(
+        (
+            d
+            for d in docs
+            if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+            == SeekerDocumentStatus.rejected
+        ),
+        None,
+    )
     if rejected is not None:
         return "rejected", rejected.id
-    expired = next((d for d in docs if d.status == SeekerDocumentStatus.expired), None)
+    expired = next(
+        (
+            d
+            for d in docs
+            if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+            == SeekerDocumentStatus.expired
+        ),
+        None,
+    )
     if expired is not None:
         return "expired", expired.id
     return "under_review", docs[0].id
@@ -454,11 +543,27 @@ async def portfolio_summary(
     await refresh_expired_statuses(session, seeker_id)
     stmt = list_by_seeker_stmt(seeker_id, visa_type=visa_type)
     docs = list((await session.execute(stmt)).scalars().all())
+    reviews_by_doc = await reviews_by_document(session, [d.id for d in docs])
 
     total = len(docs)
-    approved = sum(1 for d in docs if d.status == SeekerDocumentStatus.approved)
-    under_review = sum(1 for d in docs if d.status == SeekerDocumentStatus.under_review)
-    rejected = sum(1 for d in docs if d.status == SeekerDocumentStatus.rejected)
+    approved = sum(
+        1
+        for d in docs
+        if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+        == SeekerDocumentStatus.approved
+    )
+    under_review = sum(
+        1
+        for d in docs
+        if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+        == SeekerDocumentStatus.under_review
+    )
+    rejected = sum(
+        1
+        for d in docs
+        if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+        == SeekerDocumentStatus.rejected
+    )
 
     by_category: dict[DocumentCategory, list[SeekerDocument]] = defaultdict(list)
     for doc in docs:
@@ -468,7 +573,9 @@ async def portfolio_summary(
     missing = 0
     filled = 0
     for category in REQUIRED_CHECKLIST:
-        status, document_id = _checklist_status_for_docs(by_category.get(category, []))
+        status, document_id = _checklist_status_for_docs(
+            by_category.get(category, []), reviews_by_doc
+        )
         if status == "missing":
             missing += 1
         else:
@@ -686,8 +793,12 @@ async def build_reads(
         else {d.id: False for d in documents}
     )
     reviews: dict[uuid.UUID, SeekerDocumentAdvisorReview] = {}
-    if advisor_id is not None and documents:
-        reviews = await reviews_for_advisor(session, [d.id for d in documents], advisor_id)
+    seeker_reviews: dict[uuid.UUID, list[SeekerDocumentAdvisorReview]] = {}
+    if documents:
+        if advisor_id is not None:
+            reviews = await reviews_for_advisor(session, [d.id for d in documents], advisor_id)
+        else:
+            seeker_reviews = await reviews_by_document(session, [d.id for d in documents])
     reads: list[SeekerDocumentRead] = []
     for d in documents:
         if advisor_id is not None:
@@ -704,12 +815,17 @@ async def build_reads(
                 )
             )
         else:
+            doc_reviews = seeker_reviews.get(d.id, [])
+            latest = _latest_review(doc_reviews)
             reads.append(
                 build_read(
                     d,
                     settings,
                     comments_count=counts.get(d.id, 0),
                     has_unread_comments=unread.get(d.id, False),
+                    status=seeker_effective_status(d, doc_reviews),
+                    reviewed_at=latest.reviewed_at if latest is not None else None,
+                    reviewed_by=latest.advisor_id if latest is not None else None,
                 )
             )
     return reads
@@ -732,7 +848,6 @@ async def build_read_enriched(
     if advisor_id is not None:
         reviews = await reviews_for_advisor(session, [document.id], advisor_id)
         review = reviews.get(document.id)
-    if advisor_id is not None:
         return build_read(
             document,
             settings,
@@ -742,11 +857,18 @@ async def build_read_enriched(
             reviewed_at=review.reviewed_at if review is not None else None,
             reviewed_by=review.advisor_id if review is not None else None,
         )
+    doc_reviews = list(
+        (await reviews_by_document(session, [document.id])).get(document.id, [])
+    )
+    latest = _latest_review(doc_reviews)
     return build_read(
         document,
         settings,
         comments_count=counts.get(document.id, 0),
         has_unread_comments=unread,
+        status=seeker_effective_status(document, doc_reviews),
+        reviewed_at=latest.reviewed_at if latest is not None else None,
+        reviewed_by=latest.advisor_id if latest is not None else None,
     )
 
 

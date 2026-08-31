@@ -1,7 +1,12 @@
-"""Seeker Visa Journey Tracking — derived from assessment, bookings, and documents.
+"""Seeker Visa Journey Tracking — derived from profile recommendations, bookings,
+and documents.
 
 No separate journey table: step status is computed from existing portfolio data
 for the requested (or profile-default) visa type + destination country.
+
+The first visible step is **Profile Based Recommendation** (saved
+``seeker_advisor_recommendations``), not AI Assessment. Recommendations are
+refreshed on cache miss when journey/dashboard loads.
 
 Advisor-step progress considers **any** active consultation: the Advisor stage
 completes when at least one pending/confirmed/completed booking is paid, even
@@ -24,11 +29,12 @@ from app.core.exceptions import ConflictError
 from app.core.file_storage import resolve_media_url
 from app.core.visa_types import parse_visa_type, visa_type_name
 from app.models.advisor_bookmark import AdvisorBookmark
-from app.models.assessment import Assessment, AssessmentStatus
+from app.models.assessment import Assessment
 from app.models.booking import Booking, BookingStatus, PaymentStatus
 from app.models.booking_document_request import BookingDocumentRequest, DocumentRequestStatus
 from app.models.conversation import Conversation
 from app.models.message import Message
+from app.models.seeker_advisor_recommendation import SeekerAdvisorRecommendation
 from app.models.user import User
 from app.models.visa_type import VisaType
 from app.schemas.seeker_document import DocumentPortfolioSummary
@@ -44,14 +50,15 @@ from app.services import (
     conversation_service,
     seeker_document_service,
     seeker_profile_service,
+    seeker_recommendation_service,
 )
 from app.services.conversation_service import PUBLIC_STATUSES
 
 _STEP_COPY: tuple[tuple[JourneyStepKey, str, str], ...] = (
     (
         JourneyStepKey.assessment,
-        "Assessment",
-        "We have reviewed your assessment",
+        "Profile Based Recommendation",
+        "We have matched advisors based on your profile",
     ),
     (
         JourneyStepKey.advisor,
@@ -61,7 +68,7 @@ _STEP_COPY: tuple[tuple[JourneyStepKey, str, str], ...] = (
     (
         JourneyStepKey.documentation,
         "Documentation",
-        "Please upload and verify all the documents for application",
+        "Please upload your documents and wait for advisor approval",
     ),
     (
         JourneyStepKey.application_preparation,
@@ -164,7 +171,7 @@ async def _all_requests_fulfilled(session: AsyncSession, booking_id: uuid.UUID) 
     )
     rows = list(result.scalars().all())
     if not rows:
-        return False
+        return True
     return all(r.status == DocumentRequestStatus.fulfilled for r in rows)
 
 
@@ -198,12 +205,13 @@ async def _latest_advisor_message(
     return result.scalars().first()
 
 
-def _assessment_status(assessment: Assessment | None) -> JourneyStepStatus:
-    if assessment is None:
-        return JourneyStepStatus.pending
-    if assessment.status == AssessmentStatus.completed:
+def _profile_recommendation_status(
+    recs: list[SeekerAdvisorRecommendation],
+) -> JourneyStepStatus:
+    """First journey step — complete once profile-based matches exist."""
+    if recs:
         return JourneyStepStatus.completed
-    return JourneyStepStatus.in_progress
+    return JourneyStepStatus.pending
 
 
 def _advisor_status(
@@ -219,6 +227,18 @@ def _advisor_status(
     return JourneyStepStatus.pending
 
 
+def _checklist_approved_count(summary: DocumentPortfolioSummary) -> int:
+    return sum(1 for item in summary.checklist if item.status == "approved")
+
+
+def _documentation_all_approved(summary: DocumentPortfolioSummary) -> bool:
+    if not summary.checklist:
+        return False
+    if summary.rejected > 0:
+        return False
+    return all(item.status == "approved" for item in summary.checklist)
+
+
 def _documentation_status(
     unlocked: bool, *, summary: DocumentPortfolioSummary
 ) -> JourneyStepStatus:
@@ -230,12 +250,12 @@ def _documentation_status(
     # Rejected uploads — keep the step active so the seeker can fix and re-upload.
     if summary.rejected > 0:
         return JourneyStepStatus.in_progress
-    # All required categories have at least one upload (under review counts as filled).
-    if summary.missing == 0:
+    # Complete only when every required category is advisor-approved.
+    if _documentation_all_approved(summary):
         return JourneyStepStatus.completed
     if summary.total > 0 or summary.missing < required_n:
         return JourneyStepStatus.in_progress
-    return JourneyStepStatus.in_progress
+    return JourneyStepStatus.pending
 
 
 def _app_prep_status(unlocked: bool, prep_done: bool) -> JourneyStepStatus:
@@ -255,14 +275,10 @@ def _submission_status(unlocked: bool, *, done: bool) -> JourneyStepStatus:
 
 
 def documentation_progress(summary: DocumentPortfolioSummary) -> int:
-    """0–100 mix of required-category uploads and advisor approvals (Documents bar)."""
+    """0–100 share of required categories advisor-approved (Documents bar)."""
     required = len(summary.checklist) or 1
-    upload = max(0, min(summary.progress_percent, 100))
-    if summary.missing == 0 and summary.rejected == 0:
-        upload = 100
-    approved_categories = sum(1 for item in summary.checklist if item.status == "approved")
-    approve = int(round(100 * approved_categories / required))
-    return max(0, min(100, int(round((upload + approve) / 2))))
+    approved = _checklist_approved_count(summary)
+    return max(0, min(100, int(round(100 * approved / required))))
 
 
 def weighted_progress(
@@ -406,6 +422,28 @@ async def _advisor_selected(session: AsyncSession, seeker_id: uuid.UUID) -> bool
     )
 
 
+async def _profile_recommendations(
+    session: AsyncSession,
+    seeker_id: uuid.UUID,
+    settings: Settings,
+    *,
+    visa_type: VisaType | None,
+    country: str | None,
+) -> list[SeekerAdvisorRecommendation]:
+    """Saved profile matches; refresh on cache miss (same as dashboard)."""
+    recs = await seeker_recommendation_service.list_for_seeker(session, seeker_id)
+    if not recs:
+        recs, _, _ = await seeker_recommendation_service.refresh_for_seeker(
+            session, seeker_id, settings=settings
+        )
+    if country is not None:
+        dest = country.upper()
+        recs = [r for r in recs if r.destination_country == dest]
+    if visa_type is not None:
+        recs = [r for r in recs if r.visa_type == visa_type.value]
+    return recs
+
+
 async def compute_state(
     session: AsyncSession,
     seeker_id: uuid.UUID,
@@ -416,6 +454,10 @@ async def compute_state(
 ) -> JourneyState:
     """Compute step statuses (all ``STEP_KEYS``) from portfolio data."""
     assessment = await _latest_assessment(session, seeker_id, visa_type, country)
+    profile_recs = await _profile_recommendations(
+        session, seeker_id, settings, visa_type=visa_type, country=country
+    )
+    advisor_engaged = await _advisor_selected(session, seeker_id)
     bookings = await _active_bookings(session, seeker_id)
     primary_booking = _pick_primary_booking(bookings)
     summary = await seeker_document_service.portfolio_summary(
@@ -424,10 +466,10 @@ async def compute_state(
     profile = await seeker_profile_service.get_or_create(session, seeker_id)
     submitted = profile.application_submitted_at is not None
 
-    assessment_st = _assessment_status(assessment)
-    advisor_unlocked = assessment_st == JourneyStepStatus.completed
+    profile_rec_st = _profile_recommendation_status(profile_recs)
+    advisor_unlocked = profile_rec_st == JourneyStepStatus.completed
     advisor_st = _advisor_status(
-        bookings, advisor_unlocked, selected=await _advisor_selected(session, seeker_id)
+        bookings, advisor_unlocked, selected=advisor_engaged
     )
 
     docs_unlocked = advisor_st in (
@@ -457,7 +499,7 @@ async def compute_state(
     submission_st = _submission_status(submission_unlocked, done=submitted)
 
     statuses = {
-        JourneyStepKey.assessment: assessment_st,
+        JourneyStepKey.assessment: profile_rec_st,
         JourneyStepKey.advisor: advisor_st,
         JourneyStepKey.documentation: docs_st,
         JourneyStepKey.application_preparation: prep_st,
@@ -484,8 +526,24 @@ async def submit_application(
     state = await compute_state(
         session, seeker_id, settings, visa_type=visa_type, country=country
     )
-    if state.statuses[JourneyStepKey.application_preparation] != JourneyStepStatus.completed:
-        raise ConflictError("Complete the review stage before submitting your application")
+    prep_st = state.statuses[JourneyStepKey.application_preparation]
+    if prep_st != JourneyStepStatus.completed:
+        docs_st = state.statuses[JourneyStepKey.documentation]
+        if docs_st != JourneyStepStatus.completed:
+            pending = [
+                item.label
+                for item in state.summary.checklist
+                if item.status != "approved"
+            ]
+            raise ConflictError(
+                "All required documents must be advisor-approved before submitting",
+                code="documents_incomplete",
+                detail={"pending_categories": pending} if pending else None,
+            )
+        raise ConflictError(
+            "Fulfill all advisor-requested documents from your booking before submitting",
+            code="review_incomplete",
+        )
     profile = await seeker_profile_service.get_or_create(session, seeker_id)
     if profile.application_submitted_at is None:
         profile.application_submitted_at = datetime.now(UTC)

@@ -30,6 +30,7 @@ from app.models.advisor_profile import AdvisorProfile, AdvisorServiceType
 from app.models.assessment import Assessment
 from app.models.booking import Booking, BookingStatus
 from app.models.regulatory_update import RegulatoryUpdate
+from app.models.seeker_document import SeekerDocumentStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.advisor_credential import (
     AdvisorCredentialCreate,
@@ -66,6 +67,7 @@ from app.schemas.payout import PayoutPreviewRead, PayoutRequestCreate, PayoutReq
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.review import AdvisorReviewSummaryRead
 from app.schemas.seeker_document import (
+    AdvisorDocumentReviewUpdate,
     CustomerDocumentsRowRead,
     CustomerDocumentsRowStatus,
     DocumentCommentCreate,
@@ -1249,36 +1251,64 @@ async def list_client_documents(
 async def review_client_document(
     seeker_id: uuid.UUID,
     document_id: uuid.UUID,
-    data: SeekerDocumentStatusUpdate,
+    data: AdvisorDocumentReviewUpdate,
     current_user: CurrentUser,
     session: SessionDep,
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[SeekerDocumentRead]:
     await _assert_advisor_client_relationship(session, current_user.id, seeker_id)
+    await seeker_document_service.refresh_expired_statuses(session, seeker_id)
+    document = await seeker_document_service.get_for_seeker(session, document_id, seeker_id)
+
+    if data.status is None:
+        return ResponseEnvelope[SeekerDocumentRead](
+            data=await seeker_document_service.build_read_enriched(
+                session, document, settings, advisor_id=current_user.id
+            ),
+            meta=Meta(request_id=request_id),
+        )
+
+    existing = (
+        await seeker_document_service.reviews_for_advisor(
+            session, [document.id], current_user.id
+        )
+    ).get(document.id)
+    current_status = seeker_document_service.advisor_effective_status(document, existing)
+    if data.status == current_status and (existing is None or existing.note == data.note):
+        return ResponseEnvelope[SeekerDocumentRead](
+            data=await seeker_document_service.build_read_enriched(
+                session, document, settings, advisor_id=current_user.id
+            ),
+            meta=Meta(request_id=request_id),
+        )
+
     await seeker_document_service.assert_advisor_portfolio_editable(
         session, seeker_id, current_user.id
     )
-    document = await seeker_document_service.get_for_seeker(session, document_id, seeker_id)
-    await seeker_document_service.set_advisor_review(session, document, data, current_user.id)
-
-    await seeker_document_service.notify_seeker_of_document_status_update(
-        session, document, current_user, status=data.status, note=data.note
+    review_data = SeekerDocumentStatusUpdate(status=data.status, note=data.note)
+    await seeker_document_service.set_advisor_review(
+        session, document, review_data, current_user.id
     )
-    seeker = await session.get(User, seeker_id)
-    if seeker is not None:
-        email_service.schedule_email(
-            email_service.send_document_status_email(
-                seeker.email,
-                seeker.full_name or seeker.email,
-                current_user.full_name or current_user.email,
-                document.document_name,
-                status=data.status,
-                note=data.note,
-                document_id=str(document.id),
-                settings=settings,
-            )
+
+    if data.status in (SeekerDocumentStatus.approved, SeekerDocumentStatus.rejected):
+        await seeker_document_service.notify_seeker_of_document_status_update(
+            session, document, current_user, status=data.status, note=data.note
         )
+        seeker = await session.get(User, seeker_id)
+        if seeker is not None:
+            email_service.schedule_email(
+                email_service.send_document_status_email(
+                    seeker.email,
+                    seeker.full_name or seeker.email,
+                    current_user.full_name or current_user.email,
+                    document.document_name,
+                    status=data.status,
+                    note=data.note,
+                    document_id=str(document.id),
+                    settings=settings,
+                )
+            )
 
     return ResponseEnvelope[SeekerDocumentRead](
         data=await seeker_document_service.build_read_enriched(

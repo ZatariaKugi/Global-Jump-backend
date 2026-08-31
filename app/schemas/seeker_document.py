@@ -91,6 +91,13 @@ class SeekerDocumentStatusUpdate(BaseModel):
     note: str | None = None
 
 
+class AdvisorDocumentReviewUpdate(BaseModel):
+    """Advisor PATCH body — omit ``status`` to open/preview without changing review state."""
+
+    status: SeekerDocumentStatus | None = None
+    note: str | None = None
+
+
 class SeekerDocumentRead(BaseModel):
     id: uuid.UUID
     seeker_id: uuid.UUID
