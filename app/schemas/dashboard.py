@@ -25,7 +25,7 @@ class ActivityEventType(StrEnum):
 
 
 class RevenueBreakdownSliceRead(BaseModel):
-    label: str  # "Advisor" | "Document Review" | "Platform"
+    label: str  # "Platform" | "Advisors"
     amount_usd: float
     pct: float  # 0-100, 2dp; slices sum to ~100 modulo rounding
 

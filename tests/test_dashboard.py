@@ -290,17 +290,20 @@ async def test_revenue_breakdown_bucketing(client: AsyncClient, admin_token: str
         await session.refresh(review_booking)
         consult_booking_id, review_booking_id = consult_booking.id, review_booking.id
 
-    await _seed_transaction(engine, consult_booking_id, amount_usd=100.0, created_at=now)
-    await _seed_transaction(engine, review_booking_id, amount_usd=50.0, created_at=now)
+    await _seed_transaction(
+        engine, consult_booking_id, amount_usd=100.0, advisor_payout_usd=77.0, created_at=now
+    )
+    await _seed_transaction(
+        engine, review_booking_id, amount_usd=50.0, advisor_payout_usd=38.5, created_at=now
+    )
 
     resp = await client.get(DASHBOARD, headers=admin_headers)
     assert resp.status_code == 200, resp.text
     breakdown = {s["label"]: s for s in resp.json()["data"]["revenue_breakdown"]}
-    assert "Platform" not in breakdown
-    assert breakdown["Advisor"]["amount_usd"] == 100.0
-    assert breakdown["Advisor"]["pct"] == 66.67
-    assert breakdown["Document Review"]["amount_usd"] == 50.0
-    assert breakdown["Document Review"]["pct"] == 33.33
+    assert breakdown["Platform"]["amount_usd"] == 34.5  # commission + tax on both bookings
+    assert breakdown["Advisors"]["amount_usd"] == 115.5
+    assert breakdown["Platform"]["pct"] == 23.0
+    assert breakdown["Advisors"]["pct"] == 77.0
 
 
 # ── Activity feed ─────────────────────────────────────────────────────────────

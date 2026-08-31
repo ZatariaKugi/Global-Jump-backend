@@ -68,17 +68,26 @@ class AdvisorLanguage(Base):
 
 
 class AdvisorOfferedService(Base):
-    """One row per service category selected during advisor onboarding."""
+    """One row per service category — either advisor-owned or a global admin catalog entry.
+
+    ``profile_id`` is null for admin-managed global catalog rows (no owning advisor).
+    ``price_usd`` is optional — set a price to make the offering bookable.
+    ``duration_minutes`` defaults to 30 when the service is selected.
+    """
 
     __tablename__ = "advisor_offered_services"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    profile_id: Mapped[uuid.UUID] = mapped_column(
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("advisor_profiles.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     service_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    price_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    duration_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=30, server_default="30"
+    )
 
 
 class AdvisorService(Base):

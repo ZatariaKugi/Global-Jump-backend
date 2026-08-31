@@ -57,6 +57,9 @@ class SeekerDocumentUpdate(BaseModel):
     File replace: ``POST /uploads`` (``category=seeker_document``) first, then
     send ``file_key`` + ``file_name`` + ``file_size_bytes`` here. Status returns
     to ``under_review``; comments on this id are kept.
+
+    Expired documents: send a new future ``expires_at`` in the same PATCH as the
+    file replace, or PATCH ``expires_at`` afterward once the new file is uploaded.
     """
 
     document_name: str | None = Field(default=None, min_length=1)
@@ -85,6 +88,7 @@ class SeekerDocumentUpdate(BaseModel):
 
 class SeekerDocumentStatusUpdate(BaseModel):
     status: SeekerDocumentStatus
+    note: str | None = None
 
 
 class SeekerDocumentRead(BaseModel):

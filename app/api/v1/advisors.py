@@ -51,11 +51,14 @@ from app.schemas.advisor_profile import (
     AdvisorProfileRead,
     AdvisorProfileUpdate,
     AdvisorVerificationResubmitRead,
+    OfferedServiceItemInput,
+    OfferedServicesReplaceRequest,
 )
 from app.schemas.booking import AdvisorBookingCreate, BookingRead, BookingSort, ClientRead
 from app.schemas.payment import (
     AdvisorConnectStatus,
     AdvisorEarnings,
+    StripeDashboardLink,
     TransactionAdvisorRead,
     TransactionRead,
 )
@@ -75,8 +78,10 @@ from app.services import (
     advisor_dashboard_service,
     advisor_lead_service,
     advisor_matching_service,
+    advisor_offered_service_service,
     advisor_profile_service,
     advisor_search_service,
+    advisor_seeker_match_service,
     booking_service,
     bookmark_service,
     conversation_service,
@@ -85,6 +90,7 @@ from app.services import (
     payout_service,
     review_service,
     seeker_document_service,
+    seeker_profile_service,
     seeker_recommendation_service,
 )
 from app.services.advisor_search_service import AdvisorSearchFilters, SortOption
@@ -228,16 +234,21 @@ async def list_advisors(
     stmt = advisor_search_service.build_search_stmt(filters)
     destination, match_visa = await _seeker_match_context(session, principal)
     blended_pct: dict[uuid.UUID, int] = {}
+    ai_match_meta = None
 
     if recommended and destination and match_visa and principal.role == UserRole.seeker.value:
         # Prefer persisted AI suggestions; compute+save once when cache is empty/stale.
-        recs = await seeker_recommendation_service.ensure_for_seeker(
+        recs, ai_failure, ai_attempted = await seeker_recommendation_service.ensure_for_seeker(
             session,
             principal.id,
             destination=destination,
             visa_type=match_visa,
             settings=settings,
         )
+        if ai_attempted:
+            from app.services.ai_advisor_match_service import ai_match_status
+
+            ai_match_meta = ai_match_status(ai_failure, attempted=True)
         score_by_id = {r.advisor_id: int(round(r.match_score)) for r in recs}
         ordered_ids = [r.advisor_id for r in recs]
         all_users = list((await session.execute(stmt)).scalars().all())
@@ -300,7 +311,7 @@ async def list_advisors(
             )
             for u in users
         ],
-        meta=page_meta(params, total, request_id),
+        meta=page_meta(params, total, request_id, ai_match=ai_match_meta),
     )
 
 
@@ -463,6 +474,12 @@ async def complete_advisor_onboarding(
     endpoint once after Verification Documents (step 6).  Sets the advisor's
     ``verification_status`` to ``under_review`` for the Approval Pending screen.
 
+    Persists matching signals (same dimensions seekers onboarding collects):
+    offered services, languages, visa specializations, and countries served.
+
+    After save, returns ``matched_seekers`` (rule + optional AI re-rank) the
+    same way seeker onboarding returns ``matched_advisors``.
+
     Upload files first via ``POST /uploads`` (``category=advisor_document``
     or ``credential``), then pass the returned ``file_key`` values in
     ``documents``.
@@ -473,23 +490,73 @@ async def complete_advisor_onboarding(
             session, current_user.full_name
         )
 
+    resolved_types = await seeker_profile_service.resolve_service_types(
+        session, list(data.service_types)
+    )
+
+    priced_by_type: dict[str, OfferedServiceItemInput] = {}
+    if data.services is not None:
+        for item in data.services:
+            resolved = await seeker_profile_service.resolve_service_types(
+                session, [item.service_type]
+            )
+            service_type = resolved[0] if resolved else item.service_type
+            priced_by_type[service_type.casefold()] = OfferedServiceItemInput(
+                service_type=service_type,
+                price_usd=item.price_usd,
+                duration_minutes=item.duration_minutes,
+            )
+    else:
+        # Keep prices already saved via PUT /offered_services when POST only sends types.
+        for row in profile.offered_services or []:
+            priced_by_type[row.service_type.casefold()] = OfferedServiceItemInput(
+                service_type=row.service_type,
+                price_usd=row.price_usd,
+                duration_minutes=row.duration_minutes or 30,
+            )
+
+    offered_items: list[OfferedServiceItemInput] = []
+    seen: set[str] = set()
+    for service_type in resolved_types:
+        key = service_type.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        existing = priced_by_type.get(key)
+        offered_items.append(
+            existing
+            if existing is not None
+            else OfferedServiceItemInput(service_type=service_type)
+        )
+    if data.services is not None:
+        for key, item in priced_by_type.items():
+            if key not in seen:
+                seen.add(key)
+                offered_items.append(item)
+
     update_fields: dict[str, object] = {
         "bio": data.bio,
         "years_of_experience": data.years_of_experience,
         "country_of_residence": data.country_of_residence,
         "expertise_description": data.expertise_description,
-        "offered_services": data.service_types or None,
         "visa_specializations": data.areas_of_expertise or None,
         "country_expertise": data.countries_you_serve or None,
     }
-    # Priced offerings and weekly hours are optional on onboarding — only apply
-    # (and thus replace) when the FE actually sends them.
-    if data.services is not None:
-        update_fields["services"] = data.services
+    if data.languages is not None:
+        update_fields["languages"] = data.languages
     if data.weekly_slots is not None:
         update_fields["weekly_slots"] = data.weekly_slots
     update = AdvisorProfileUpdate(**update_fields)
     profile = await advisor_profile_service.update(session, profile, update)
+
+    if data.service_types or data.services is not None:
+        await advisor_offered_service_service.replace_for_advisor(
+            session,
+            current_user.id,
+            OfferedServicesReplaceRequest(services=offered_items),
+            actor_id=current_user.id,
+        )
+        profile = await advisor_profile_service.get_or_create(session, current_user.id)
 
     allowed_prefixes = (
         f"advisor_document/{current_user.id}/",
@@ -519,10 +586,21 @@ async def complete_advisor_onboarding(
         session, profile, current_user, settings
     )
 
+    matched_seekers, ai_failure = await advisor_seeker_match_service.match_seekers_for_advisor(
+        session,
+        current_user.id,
+        profile,
+        settings=settings,
+        use_ai=True,
+    )
+    from app.services.ai_advisor_match_service import ai_match_status
+
     return ResponseEnvelope[AdvisorOnboardingCompleteRead](
         data=AdvisorOnboardingCompleteRead(
             **profile_data.model_dump(),
             onboarding_status=onboarding_status,
+            matched_seekers=matched_seekers,
+            ai_match=ai_match_status(ai_failure, attempted=True),
         ),
         meta=Meta(request_id=request_id),
     )
@@ -662,6 +740,40 @@ async def get_stripe_connect_status(
         data=status,
         meta=Meta(request_id=request_id),
     )
+
+
+@router.post(
+    "/me/stripe-connect/dashboard",
+    response_model=ResponseEnvelope[StripeDashboardLink],
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def open_stripe_connect_dashboard(
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[StripeDashboardLink]:
+    """Return a URL to open the advisor's Stripe Express dashboard."""
+    dashboard_url = await payment_service.create_stripe_dashboard_url(
+        session, current_user.id, settings
+    )
+    return ResponseEnvelope[StripeDashboardLink](
+        data=StripeDashboardLink(dashboard_url=dashboard_url),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.delete(
+    "/me/stripe-connect",
+    status_code=204,
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def disconnect_stripe_connect(
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> None:
+    """Disconnect the advisor's Stripe Connect account."""
+    await payment_service.disconnect_connect_account(session, current_user.id)
 
 
 # ── Reviews summary ──────────────────────────────────────────────────────────
@@ -1122,7 +1234,9 @@ async def list_client_documents(
     documents, total = await paginate(session, stmt, params)
     seeker = await seeker_document_service.build_client_seeker_brief(session, seeker_id, settings)
     return ResponseEnvelope[list[SeekerDocumentRead]](
-        data=await seeker_document_service.build_reads(session, list(documents), settings),
+        data=await seeker_document_service.build_reads(
+            session, list(documents), settings, advisor_id=current_user.id
+        ),
         meta=page_meta(params, total, request_id, seeker=seeker),
     )
 
@@ -1142,11 +1256,34 @@ async def review_client_document(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[SeekerDocumentRead]:
     await _assert_advisor_client_relationship(session, current_user.id, seeker_id)
-    await seeker_document_service.assert_portfolio_editable(session, seeker_id)
+    await seeker_document_service.assert_advisor_portfolio_editable(
+        session, seeker_id, current_user.id
+    )
     document = await seeker_document_service.get_for_seeker(session, document_id, seeker_id)
-    document = await seeker_document_service.set_status(session, document, data, current_user.id)
+    await seeker_document_service.set_advisor_review(session, document, data, current_user.id)
+
+    await seeker_document_service.notify_seeker_of_document_status_update(
+        session, document, current_user, status=data.status, note=data.note
+    )
+    seeker = await session.get(User, seeker_id)
+    if seeker is not None:
+        email_service.schedule_email(
+            email_service.send_document_status_email(
+                seeker.email,
+                seeker.full_name or seeker.email,
+                current_user.full_name or current_user.email,
+                document.document_name,
+                status=data.status,
+                note=data.note,
+                document_id=str(document.id),
+                settings=settings,
+            )
+        )
+
     return ResponseEnvelope[SeekerDocumentRead](
-        data=await seeker_document_service.build_read_enriched(session, document, settings),
+        data=await seeker_document_service.build_read_enriched(
+            session, document, settings, advisor_id=current_user.id
+        ),
         meta=Meta(request_id=request_id),
     )
 

@@ -15,11 +15,16 @@ from app.models.booking import Booking
 from app.models.booking_document_request import BookingDocumentRequest, DocumentRequestStatus
 from app.models.notification import NotificationEntityType, NotificationType
 from app.schemas.booking_document_request import DocumentRequestRead
-from app.services import notification_service
+from app.services import email_service, notification_service
 
 
 async def create_request(
-    session: AsyncSession, booking: Booking, actor_id: uuid.UUID, description: str
+    session: AsyncSession,
+    booking: Booking,
+    actor_id: uuid.UUID,
+    description: str,
+    *,
+    settings: Settings,
 ) -> BookingDocumentRequest:
     if actor_id != booking.advisor_id:
         raise PermissionDeniedError("Only the advisor can request documents")
@@ -42,6 +47,21 @@ async def create_request(
         entity_id=booking.id,
         actor_id=actor_id,
     )
+    from app.models.user import User
+
+    seeker = await session.get(User, booking.seeker_id)
+    advisor = await session.get(User, booking.advisor_id)
+    if seeker is not None and advisor is not None:
+        email_service.schedule_email(
+            email_service.send_document_requested_email(
+                seeker.email,
+                seeker.full_name or seeker.email,
+                advisor.full_name or advisor.email,
+                description,
+                booking_id=str(booking.id),
+                settings=settings,
+            )
+        )
     return request
 
 

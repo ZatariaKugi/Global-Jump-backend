@@ -1,0 +1,17 @@
+Hi {{ full_name }},
+
+{{ advisor_name }} has {{ status }} your document "{{ document_name }}".
+{% if note %}
+  "{{ note }}"
+{% endif %}
+View the document:
+{{ documents_url }}
+
+— The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}
+How it works: {{ how_it_works_url }}
+FAQs: {{ faq_url }}

@@ -1,11 +1,10 @@
 """AI-matched customer leads for advisors — the inverse of advisor_matching_service.
 
-Generated once, when a seeker's eligibility assessment completes
-(``assessment_service.submit_answers``): uses the hybrid matcher
+Generated on first ``GET /assessments/{id}/matched-advisors`` for a completed
+assessment (not during ``submit_answers``): uses the hybrid matcher
 (country gate + rule score + optional OpenAI re-rank blend) and persists
-``AdvisorLead`` rows for positive matches. Seekers read that snapshot on
-history / ``GET /assessments/{id}/matched-advisors`` (no OpenAI). Advisors
-then work this list as a queue (new -> viewed -> contacted or dismissed)
+``AdvisorLead`` rows for positive matches. Later reads reuse that snapshot.
+Advisors work this list as a queue (new -> viewed -> contacted or dismissed)
 via ``GET/POST /advisors/me/leads...``.
 """
 
@@ -28,14 +27,37 @@ from app.models.user import User
 from app.schemas.assessment import AdvisorMatchRead
 from app.services import advisor_matching_service, advisor_profile_service, review_service
 from app.services.advisor_profile_service import build_match_reasons
+from app.services.ai_advisor_match_service import AiMatchFailure
+
+
+async def ensure_for_assessment(
+    session: AsyncSession,
+    assessment: Assessment,
+) -> tuple[list[AdvisorLead], AiMatchFailure | None]:
+    """Generate leads once if none exist yet; otherwise leave the snapshot alone."""
+    existing = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(AdvisorLead)
+                .where(
+                    AdvisorLead.assessment_id == assessment.id,
+                    AdvisorLead.is_archived.is_(False),
+                )
+            )
+        ).scalar_one()
+    )
+    if existing > 0:
+        return [], None
+    return await generate_for_assessment(session, assessment)
 
 
 async def generate_for_assessment(
     session: AsyncSession,
     assessment: Assessment,
-) -> list[AdvisorLead]:
+) -> tuple[list[AdvisorLead], AiMatchFailure | None]:
     """Persist leads from the hybrid matcher (rule score + optional AI blend)."""
-    ranked, _total = await advisor_matching_service.match(
+    ranked, _total, ai_failure = await advisor_matching_service.match(
         session,
         assessment,
         limit=500,
@@ -86,7 +108,7 @@ async def generate_for_assessment(
         await session.flush()
         for lead in leads:
             await session.refresh(lead)
-    return leads
+    return leads, ai_failure
 
 
 def list_for_assessment_stmt(assessment_id: uuid.UUID) -> Select[tuple[AdvisorLead]]:
@@ -173,8 +195,16 @@ async def as_match_reads(
                 match_reasons=lead.match_reasons,
                 rule_score=None,
                 ai_score=None,
-                visa_specializations=[s.specialization for s in (profile.visa_specializations or [])] if profile is not None else None,
-                country_expertise=[c.country_code for c in (profile.country_expertise or [])] if profile is not None else None,
+                visa_specializations=(
+                    [s.specialization for s in (profile.visa_specializations or [])]
+                    if profile is not None
+                    else None
+                ),
+                country_expertise=(
+                    [c.country_code for c in (profile.country_expertise or [])]
+                    if profile is not None
+                    else None
+                ),
             )
         )
     return reads

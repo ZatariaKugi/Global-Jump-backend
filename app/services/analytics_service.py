@@ -12,6 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.countries import country_name, country_numeric
+from app.core.money import as_float, money_sum
 from app.core.visa_types import VISA_TYPE_LABELS, parse_visa_type
 from app.models.activity_log import ActivityLog
 from app.models.advisor_lead import AdvisorLead
@@ -412,14 +413,14 @@ def _finance_window_totals(
         for t in transactions
         if t.status in _GROSS_STATUSES and window_start <= _as_utc(t.created_at) < window_end
     ]
-    gross = round(sum(t.amount_usd for t in gross_txns), 2)
+    gross = round(money_sum(t.amount_usd for t in gross_txns), 2)
 
     refunded = [
         t
         for t in transactions
         if t.refunded_at is not None and window_start <= _as_utc(t.refunded_at) < window_end
     ]
-    refunds = round(sum(t.refunded_amount_usd or 0.0 for t in refunded), 2)
+    refunds = round(money_sum(t.refunded_amount_usd for t in refunded), 2)
     net = round(gross - refunds, 2)
 
     window_payouts = [
@@ -427,7 +428,7 @@ def _finance_window_totals(
         for p in payouts
         if p.processed_at is not None and window_start <= _as_utc(p.processed_at) < window_end
     ]
-    advisor_payout = round(sum(p.amount_usd for p in window_payouts), 2)
+    advisor_payout = round(money_sum(p.amount_usd for p in window_payouts), 2)
     return gross, refunds, net, advisor_payout
 
 
@@ -488,7 +489,7 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
     ]
     revenue_trend_map: dict[str, float] = defaultdict(float)
     for t in current_gross:
-        revenue_trend_map[_month_key(t.created_at)] += t.amount_usd
+        revenue_trend_map[_month_key(t.created_at)] += as_float(t.amount_usd)
     revenue_trend = [
         MonthlyAmountPoint(month=month, amount_usd=round(amount, 2))
         for month, amount in sorted(revenue_trend_map.items())
@@ -501,7 +502,7 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
         refunded_at = _as_utc(t.refunded_at)
         if refunded_at < since:
             continue
-        refund_trend_map[_month_key(refunded_at)] += t.refunded_amount_usd or 0.0
+        refund_trend_map[_month_key(refunded_at)] += as_float(t.refunded_amount_usd)
     refund_trend = [
         MonthlyAmountPoint(month=month, amount_usd=round(amount, 2))
         for month, amount in sorted(refund_trend_map.items())
@@ -512,7 +513,7 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
         assert p.processed_at is not None
         if _as_utc(p.processed_at) < since:
             continue
-        payout_trend_map[_month_key(p.processed_at)] += p.amount_usd
+        payout_trend_map[_month_key(p.processed_at)] += as_float(p.amount_usd)
     monthly_payouts = [
         MonthlyAmountPoint(month=month, amount_usd=round(amount, 2))
         for month, amount in sorted(payout_trend_map.items())

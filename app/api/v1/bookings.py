@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Query
@@ -14,6 +15,7 @@ from app.api.pagination import PaginationDep, page_meta, paginate
 from app.core.config import Settings
 from app.core.exceptions import PermissionDeniedError
 from app.core.file_storage import resolve_url
+from app.core.logging import get_logger
 from app.db.session import SessionDep
 from app.models.advisor_profile import AdvisorServiceType
 from app.models.booking import Booking, BookingStatus
@@ -47,6 +49,9 @@ from app.services import (
 )
 from app.services.availability_service import as_utc
 from app.services.booking_service import get_notice_hours
+
+log = get_logger(__name__)
+
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
@@ -88,6 +93,7 @@ def _read(
     review_id: uuid.UUID | None = None,
     cancellation_notice_hours: int = booking_service.DEFAULT_NOTICE_HOURS,
     viewer_role: UserRole = UserRole.seeker,
+    is_unread: bool = False,
 ) -> BookingRead:
     return booking_service.build_read(
         booking,
@@ -99,6 +105,7 @@ def _read(
         review_id=review_id,
         cancellation_notice_hours=cancellation_notice_hours,
         viewer_role=viewer_role,
+        is_unread=is_unread,
     )
 
 
@@ -109,12 +116,14 @@ async def _read_booking(
     advisor: User | None,
     settings: Settings,
     *,
+    viewer_id: uuid.UUID,
     viewer_role: UserRole = UserRole.seeker,
 ) -> BookingRead:
     advisor_photos = await booking_service.advisor_photo_keys(session, {booking.advisor_id})
     seeker_photos = await booking_service.seeker_photo_keys(session, {booking.seeker_id})
     review_ids = await booking_service.review_ids_by_booking(session, {booking.id})
     notice_hours = await get_notice_hours(session, booking.advisor_id)
+    unread_flags = await booking_service.unread_flags_for_viewer(session, [booking], viewer_id)
     return _read(
         booking,
         seeker,
@@ -125,6 +134,7 @@ async def _read_booking(
         review_id=review_ids.get(booking.id),
         cancellation_notice_hours=notice_hours,
         viewer_role=viewer_role,
+        is_unread=unread_flags.get(booking.id, False),
     )
 
 
@@ -181,13 +191,18 @@ async def _send_reschedule_notifications(
 
 
 async def _send_cancellation_notifications(
-    session: SessionDep, booking: Booking, cancelled_by_id: uuid.UUID, settings: SettingsDep
+    session: SessionDep,
+    booking: Booking,
+    cancelled_by_id: uuid.UUID,
+    settings: SettingsDep,
+    refund_amount_usd: Decimal | None = None,
 ) -> None:
     seeker, advisor = await _party_names(session, booking)
     canceller = next(
         (u for u in (seeker, advisor) if u is not None and u.id == cancelled_by_id), None
     )
     cancelled_by = (canceller.full_name or canceller.email) if canceller else None
+
     for recipient, other in ((seeker, advisor), (advisor, seeker)):
         if recipient is None:
             continue
@@ -204,6 +219,7 @@ async def _send_cancellation_notifications(
                 cancelled_by=cancelled_by,
                 settings=settings,
                 user_timezone=user_tz,
+                refund_amount_usd=refund_amount_usd if recipient.id == booking.seeker_id else None,
             )
         )
 
@@ -271,7 +287,9 @@ async def create_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
+            session, booking, seeker, advisor, settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
         ),
         meta=Meta(request_id=request_id),
     )
@@ -352,6 +370,15 @@ async def list_my_bookings(
     review_ids = await booking_service.review_ids_by_booking(session, booking_ids)
     notice_map = await booking_service.notice_hours_by_advisor(session, advisor_ids)
 
+    unread_bookings = list(bookings)
+    if next_booking is not None:
+        unread_bookings.append(next_booking)
+    if chat_booking is not None:
+        unread_bookings.append(chat_booking)
+    unread_flags = await booking_service.unread_flags_for_viewer(
+        session, unread_bookings, current_user.id
+    )
+
     def _row(b: Booking) -> BookingRead:
         return _read(
             b,
@@ -365,6 +392,7 @@ async def list_my_bookings(
                 b.advisor_id, booking_service.DEFAULT_NOTICE_HOURS
             ),
             viewer_role=role,
+            is_unread=unread_flags.get(b.id, False),
         )
 
     return BookingsListResponse(
@@ -389,7 +417,9 @@ async def get_next_upcoming_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead | None](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
+            session, booking, seeker, advisor, settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
         ),
         meta=Meta(request_id=request_id),
     )
@@ -407,7 +437,9 @@ async def get_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
+            session, booking, seeker, advisor, settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
         ),
         meta=Meta(request_id=request_id),
     )
@@ -443,7 +475,9 @@ async def accept_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
+            session, booking, seeker, advisor, settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
         ),
         meta=Meta(request_id=request_id),
     )
@@ -464,7 +498,9 @@ async def reject_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
+            session, booking, seeker, advisor, settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
         ),
         meta=Meta(request_id=request_id),
     )
@@ -484,7 +520,9 @@ async def deal_later_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
+            session, booking, seeker, advisor, settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
         ),
         meta=Meta(request_id=request_id),
     )
@@ -509,6 +547,32 @@ async def get_booking_history(
     )
 
 
+@router.post("/{booking_id}/actions-read", response_model=ResponseEnvelope[BookingRead])
+async def mark_booking_actions_read(
+    booking_id: uuid.UUID,
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[BookingRead]:
+    """Clear the ⋯ menu unread dot after the user opens the actions menu."""
+    booking = await booking_service.get_for_party(session, booking_id, current_user.id)
+    booking = await booking_service.mark_actions_read(session, booking, current_user.id)
+    seeker, advisor = await _party_names(session, booking)
+    return ResponseEnvelope[BookingRead](
+        data=await _read_booking(
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
+        ),
+        meta=Meta(request_id=request_id),
+    )
+
+
 @router.patch("/{booking_id}/important", response_model=ResponseEnvelope[BookingRead])
 async def update_booking_important(
     booking_id: uuid.UUID,
@@ -525,7 +589,9 @@ async def update_booking_important(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
+            session, booking, seeker, advisor, settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
         ),
         meta=Meta(request_id=request_id),
     )
@@ -547,7 +613,9 @@ async def update_booking_interpreter(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
+            session, booking, seeker, advisor, settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
         ),
         meta=Meta(request_id=request_id),
     )
@@ -574,14 +642,27 @@ async def cancel_booking(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
+    log.info("cancel_booking_start", booking_id=str(booking_id))
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
-    booking = await booking_service.cancel(session, booking, current_user.id, data.reason, settings)
-    await _send_cancellation_notifications(session, booking, current_user.id, settings)
+    log.info("cancel_booking_after_get", booking_id=str(booking.id))
+    booking, refund_amount = await booking_service.cancel(session, booking, current_user.id, data.reason, settings)
+    log.info("cancel_booking_after_cancel", booking_id=str(booking.id))
+    await _send_cancellation_notifications(session, booking, current_user.id, settings, refund_amount)
+    log.info("cancel_booking_after_notifications", booking_id=str(booking.id))
     seeker, advisor = await _party_names(session, booking)
+    log.info("cancel_booking_after_parties", booking_id=str(booking.id))
+    read_data = await _read_booking(
+        session,
+        booking,
+        seeker,
+        advisor,
+        settings,
+        viewer_id=current_user.id,
+        viewer_role=current_user.role,
+    )
+    await session.commit()
     return ResponseEnvelope[BookingRead](
-        data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
-        ),
+        data=read_data,
         meta=Meta(request_id=request_id),
     )
 
@@ -603,10 +684,43 @@ async def reschedule_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
+            session, booking, seeker, advisor, settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
         ),
         meta=Meta(request_id=request_id),
     )
+
+
+async def _booking_action_read(
+    session: SessionDep,
+    booking: Booking,
+    current_user: CurrentUser,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[BookingRead]:
+    seeker, advisor = await _party_names(session, booking)
+    return ResponseEnvelope[BookingRead](
+        data=await _read_booking(
+            session, booking, seeker, advisor, settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
+        ),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.get("/{booking_id}/complete", response_model=ResponseEnvelope[BookingRead])
+async def get_booking_complete_state(
+    booking_id: uuid.UUID,
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[BookingRead]:
+    """Return the booking's current status (including ``completed`` after POST complete)."""
+    booking = await booking_service.get_for_party(session, booking_id, current_user.id)
+    return await _booking_action_read(session, booking, current_user, settings, request_id)
 
 
 @router.post("/{booking_id}/complete", response_model=ResponseEnvelope[BookingRead])
@@ -619,13 +733,7 @@ async def complete_booking(
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
     booking = await booking_service.complete(session, booking, current_user.id)
-    seeker, advisor = await _party_names(session, booking)
-    return ResponseEnvelope[BookingRead](
-        data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
-        ),
-        meta=Meta(request_id=request_id),
-    )
+    return await _booking_action_read(session, booking, current_user, settings, request_id)
 
 
 @router.post("/{booking_id}/no-show", response_model=ResponseEnvelope[BookingRead])
@@ -641,7 +749,9 @@ async def mark_booking_no_show(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
+            session, booking, seeker, advisor, settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
         ),
         meta=Meta(request_id=request_id),
     )
@@ -728,7 +838,7 @@ async def create_document_request(
 ) -> ResponseEnvelope[DocumentRequestRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
     request = await booking_document_service.create_request(
-        session, booking, current_user.id, data.description
+        session, booking, current_user.id, data.description, settings=settings
     )
     return ResponseEnvelope[DocumentRequestRead](
         data=booking_document_service.build_read(request, settings),

@@ -9,7 +9,6 @@ zero-fills chart buckets and maps the already-limited activity rows.
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -40,6 +39,12 @@ _GROSS_STATUSES = (
     TransactionStatus.succeeded,
     TransactionStatus.partially_refunded,
     TransactionStatus.refunded,
+)
+
+# Paid rows only — fully refunded charges are excluded from the platform/advisor split.
+_REVENUE_BREAKDOWN_STATUSES = (
+    TransactionStatus.succeeded,
+    TransactionStatus.partially_refunded,
 )
 
 _HOME_ACTIVITY_LIMIT = 6
@@ -132,23 +137,6 @@ def _trend_from_counts(
     if days == 7 and since is not None:
         return _daily_points_from_counts(counts, since)
     return _monthly_points_from_counts(counts, since, all_time=days is None)
-
-
-def _bucket_service_type(service_type: str) -> str:
-    """Case-insensitive substring match, checked in this order (a value could
-    contain both — "review" wins since document-review is more specific):
-      contains "review"  -> "Document Review"
-      contains "consult" -> "Advisor"
-      otherwise           -> "Platform"
-    None of today's literal service_type values collide, but this ordering
-    is deliberate for future values like "consultation_with_review".
-    """
-    s = service_type.lower()
-    if "review" in s:
-        return "Document Review"
-    if "consult" in s:
-        return "Advisor"
-    return "Platform"
 
 
 # ── Dashboard summary ────────────────────────────────────────────────────────
@@ -293,17 +281,21 @@ async def _ai_assessment_volume(
 async def _revenue_breakdown(
     session: AsyncSession, since: datetime | None
 ) -> list[RevenueBreakdownSliceRead]:
-    stmt = (
-        select(Booking.service_type, func.coalesce(func.sum(Transaction.amount_usd), 0.0))
-        .join(Booking, Booking.id == Transaction.booking_id)
-        .where(Transaction.status.in_(_GROSS_STATUSES))
-        .group_by(Booking.service_type)
-    )
+    """Platform vs advisor share of gross booking revenue (commission+tax vs payout)."""
+    stmt = select(
+        func.coalesce(
+            func.sum(Transaction.commission_usd + Transaction.tax_usd),
+            0.0,
+        ),
+        func.coalesce(func.sum(Transaction.advisor_payout_usd), 0.0),
+    ).where(Transaction.status.in_(_REVENUE_BREAKDOWN_STATUSES))
     if since is not None:
         stmt = stmt.where(Transaction.created_at >= since)
-    totals: dict[str, float] = defaultdict(float)
-    for service_type, amount_usd in (await session.execute(stmt)).all():
-        totals[_bucket_service_type(service_type)] += float(amount_usd)
+    platform_total, advisor_total = (await session.execute(stmt)).one()
+    totals = {
+        "Platform": float(platform_total),
+        "Advisors": float(advisor_total),
+    }
     grand_total = sum(totals.values())
     if grand_total <= 0:
         return []
@@ -313,8 +305,8 @@ async def _revenue_breakdown(
             amount_usd=round(amount, 2),
             pct=round(100.0 * amount / grand_total, 2),
         )
-        for label, amount in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
-        if amount > 0  # omit empty buckets — no 0% wedge, matches how a real donut renders
+        for label, amount in (("Platform", totals["Platform"]), ("Advisors", totals["Advisors"]))
+        if amount > 0
     ]
 
 

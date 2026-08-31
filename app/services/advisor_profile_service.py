@@ -18,7 +18,6 @@ from app.models.advisor_profile import (
     AdvisorOfferedService,
     AdvisorProfile,
     AdvisorService,
-    AdvisorServiceType,
     AdvisorVisaSpecialization,
 )
 from app.models.conversation import Conversation
@@ -33,38 +32,40 @@ from app.schemas.advisor_profile import (
     AdvisorProfileRead,
     AdvisorProfileUpdate,
     LanguageEntry,
-    ServiceOffering,
 )
 from app.schemas.availability import WeeklySlotRead
 from app.services import availability_service, review_service
 
-_VALID_SERVICE_TYPES = {e.value for e in AdvisorServiceType}
-
 
 def offered_service_types(profile: AdvisorProfile) -> list[str]:
-    """Service-type strings for booking dropdowns.
+    """Service-type strings for listing cards and booking dropdowns.
 
-    Prefer bookable ``AdvisorService`` types (what ``POST /bookings`` resolves),
-    then any onboarding ``offered_services`` categories, de-duplicated.
-    Only ``AdvisorServiceType`` enum values are returned so the FE cannot
-    offer freeform labels that fail booking validation.
+    Prefer bookable ``AdvisorService`` types, then onboarding ``offered_services``
+    categories, de-duplicated. Free-form catalog slugs are allowed (matching
+    compares the same strings seekers select).
     """
     out: list[str] = []
     seen: set[str] = set()
     for raw in [s.service_type for s in (profile.services or [])] + [
         s.service_type for s in (profile.offered_services or [])
     ]:
-        if raw in _VALID_SERVICE_TYPES and raw not in seen:
-            seen.add(raw)
+        if not raw:
+            continue
+        key = raw.casefold()
+        if key not in seen:
+            seen.add(key)
             out.append(raw)
     return out
 
 
 def starting_price_usd(profile: AdvisorProfile | None) -> float | None:
-    """Lowest bookable service price, or None when the advisor has no services."""
-    if profile is None or not profile.services:
+    """Lowest bookable price from ``advisor_services`` or priced offered services."""
+    if profile is None:
         return None
-    prices = [s.price_usd for s in profile.services if s.service_type in _VALID_SERVICE_TYPES]
+    prices: list[float] = [s.price_usd for s in (profile.services or [])]
+    prices.extend(
+        s.price_usd for s in (profile.offered_services or []) if s.price_usd is not None
+    )
     return min(prices) if prices else None
 
 
@@ -221,21 +222,11 @@ def _build_common(profile: AdvisorProfile, settings: Settings) -> dict[str, obje
         "years_of_experience": profile.years_of_experience,
         "successful_applications": profile.successful_applications,
         "successful_application_rate": profile.successful_application_rate,
-        "offered_services": offered_service_types(profile),
         "visa_specializations": _visa_specializations(profile),
         "country_expertise": [c.country_code for c in (profile.country_expertise or [])],
         "languages": [
             LanguageEntry(language=lang.language, proficiency=lang.proficiency)
             for lang in (profile.languages or [])
-        ],
-        "services": [
-            ServiceOffering(
-                service_type=AdvisorServiceType(s.service_type),
-                duration_minutes=s.duration_minutes,
-                price_usd=s.price_usd,
-            )
-            for s in (profile.services or [])
-            if s.service_type in _VALID_SERVICE_TYPES
         ],
         "starting_price_usd": starting_price_usd(profile),
         "is_featured": profile.is_featured,
@@ -403,6 +394,7 @@ def build_public_read(
         return AdvisorProfilePublicRead(
             user_id=user.id,
             full_name=user.full_name,
+            email=user.email,
             match_percentage=match_percentage,
             is_bookmarked=is_bookmarked,
             **_build_common(profile, settings),
@@ -410,6 +402,7 @@ def build_public_read(
     return AdvisorProfilePublicRead(
         user_id=user.id,
         full_name=user.full_name,
+        email=user.email,
         title=None,
         bio=None,
         profile_photo_url=None,
@@ -421,11 +414,9 @@ def build_public_read(
         years_of_experience=None,
         successful_applications=None,
         successful_application_rate=None,
-        offered_services=[],
         visa_specializations=[],
         country_expertise=[],
         languages=[],
-        services=[],
         starting_price_usd=None,
         is_featured=False,
         public_profile_slug=None,
@@ -462,6 +453,8 @@ async def build_onboarding_status(
         verification_status=user.verification_status,
         area_of_expertise_completed=area_of_expertise_completed,
         profile_completed=profile_completed,
+        languages_completed=bool(profile.languages),
+        services_completed=bool(profile.offered_services) or bool(profile.services),
         government_id_uploaded=DocumentType.government_id in doc_types,
         license_uploaded=has_license,
         certification_uploaded=DocumentType.certification in doc_types,

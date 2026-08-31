@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, Field, model_validator
 
@@ -177,6 +177,16 @@ class CategoryScoreRead(BaseModel):
     score: float
 
 
+class AiMatchStatusRead(BaseModel):
+    """Whether AI re-ranking ran for advisor matches and what ranking was used."""
+
+    available: bool
+    ranking: Literal["ai", "rule"]
+    message: str | None = None
+    reason: str | None = None
+    error: str | None = None
+
+
 class AdvisorMatchRead(BaseModel):
     user_id: uuid.UUID
     full_name: str | None
@@ -215,7 +225,6 @@ class AssessmentRead(BaseModel):
     weaknesses: list[str]
     missing_requirements: list[str]
     ai_summary: str | None
-    matched_advisors: list[AdvisorMatchRead]
 
 
 class AssessmentSummaryRead(BaseModel):

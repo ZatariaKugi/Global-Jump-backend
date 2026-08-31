@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError
+from app.core.money import as_float
 from app.models.booking import Booking
 from app.models.notification import NotificationEntityType, NotificationType
 from app.models.payout_request import PayoutRequest, PayoutStatus
@@ -32,14 +33,14 @@ async def get_available_balance(session: AsyncSession, advisor_id: uuid.UUID) ->
         .where(Transaction.status == TransactionStatus.succeeded)
         .where(Transaction.is_archived.is_(False))
     )
-    total_earned = earned_result.scalar_one_or_none() or 0.0
+    total_earned = as_float(earned_result.scalar_one_or_none())
 
     reserved_result = await session.execute(
         select(func.sum(PayoutRequest.amount_usd))
         .where(PayoutRequest.advisor_id == advisor_id)
         .where(PayoutRequest.status != PayoutStatus.rejected)
     )
-    total_reserved = reserved_result.scalar_one_or_none() or 0.0
+    total_reserved = as_float(reserved_result.scalar_one_or_none())
 
     return round(total_earned - total_reserved, 2)
 

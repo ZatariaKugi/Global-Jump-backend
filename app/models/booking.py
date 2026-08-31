@@ -81,6 +81,14 @@ class Booking(BaseModel):
     interpreter_contact: Mapped[str | None] = mapped_column(String(255), nullable=True)
     interpreter_language: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
+    # When each party last opened the booking actions (⋯) menu — drives ``is_unread``.
+    advisor_actions_read_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    seeker_actions_read_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
 
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

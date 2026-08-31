@@ -1,0 +1,17 @@
+Hi {{ full_name }},
+
+{{ advisor_name }} has requested a document for your upcoming consultation.
+{% if description %}
+  "{{ description }}"
+{% endif %}
+View the request:
+{{ booking_url }}
+
+— The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}
+How it works: {{ how_it_works_url }}
+FAQs: {{ faq_url }}

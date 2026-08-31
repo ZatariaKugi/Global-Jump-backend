@@ -73,6 +73,7 @@ class ClientRead(BaseModel):
     status: BookingStatus | None = None
     # From the latest booking — drives Clients-table bookmark / red-dot.
     is_important: bool = False
+    is_unread: bool = False
 
 
 class BookingReschedule(BaseModel):
@@ -118,10 +119,12 @@ class BookingRead(BaseModel):
     scheduled_end: datetime
     status: BookingStatus
     payment_status: PaymentStatus
+    completed_at: datetime | None = None
     cancellation_reason: str | None
     seeker_note: str | None
     deal_later_at: datetime | None
     is_important: bool
+    is_unread: bool = False
     interpreter_name: str | None
     interpreter_contact: str | None
     interpreter_language: str | None

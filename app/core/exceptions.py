@@ -32,11 +32,18 @@ class AppError(Exception):
     code: str = "app_error"
     message: str = "Application error"
 
-    def __init__(self, message: str | None = None, *, code: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        code: str | None = None,
+        detail: object = None,
+    ) -> None:
         if message is not None:
             self.message = message
         if code is not None:
             self.code = code
+        self.detail = detail
         super().__init__(self.message)
 
 
@@ -95,7 +102,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def _app_error_handler(request: Request, exc: AppError) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code,
-            content=_envelope(exc.code, exc.message, request),
+            content=_envelope(exc.code, exc.message, request, detail=exc.detail),
         )
 
     @app.exception_handler(StarletteHTTPException)
@@ -109,6 +116,12 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def _validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        logger.warning(
+            "request_validation_failed",
+            path=request.url.path,
+            method=request.method,
+            errors=jsonable_encoder(exc.errors()),
+        )
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content=_envelope(

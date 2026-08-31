@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from app.core.visa_types import OptionalVisaType
 from app.models.assessment import EligibilityTier
-from app.schemas.assessment import AdvisorMatchRead
+from app.schemas.assessment import AdvisorMatchRead, AiMatchStatusRead
 from app.schemas.booking import BookingRead
 from app.schemas.visa_journey import JourneyStepKey, JourneyStepStatus
 
@@ -84,3 +84,4 @@ class SeekerDashboardRead(BaseModel):
     eligibility_breakdown: EligibilityBreakdownRead | None
     matched_advisors: list[AdvisorMatchRead]
     assessment_id: uuid.UUID | None
+    ai_match: AiMatchStatusRead | None = None

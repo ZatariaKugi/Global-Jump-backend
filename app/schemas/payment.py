@@ -149,6 +149,13 @@ class AdvisorConnectStatus(BaseModel):
     payouts_enabled: bool = False
     onboarding_complete: bool
     onboarding_url: str | None = None
+    account_type: str | None = None
+
+
+class StripeDashboardLink(BaseModel):
+    """``POST /advisors/me/stripe-connect/dashboard`` — open the advisor's Stripe dashboard."""
+
+    dashboard_url: str
 
 
 class AdvisorEarnings(BaseModel):

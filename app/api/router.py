@@ -7,6 +7,8 @@ from fastapi import APIRouter
 from app.api.v1 import (
     admin,
     admin_profile,
+    advisor_offered_services,
+    advisor_services,
     advisors,
     assessments,
     auth,
@@ -17,10 +19,13 @@ from app.api.v1 import (
     countries,
     devices,
     integrations_zoom,
+    languages,
+    nationality_countries,
     notifications,
     payments,
     reviews,
     seeker_profiles,
+    support,
     tickets,
     uploads,
     users,
@@ -29,10 +34,14 @@ from app.api.v1 import (
 api_router = APIRouter()
 api_router.include_router(auth.router)
 api_router.include_router(countries.router)
+api_router.include_router(nationality_countries.router)
+api_router.include_router(languages.router)
 api_router.include_router(users.router)
 api_router.include_router(seeker_profiles.router)
 api_router.include_router(availability.router)  # before advisors: /me/availability vs /{id}
 api_router.include_router(advisors.router)
+api_router.include_router(advisor_services.router)
+api_router.include_router(advisor_offered_services.router)
 api_router.include_router(bookings.router)
 api_router.include_router(bookmarks.router)
 api_router.include_router(payments.router)
@@ -43,6 +52,7 @@ api_router.include_router(notifications.router)
 api_router.include_router(assessments.router)
 api_router.include_router(uploads.router)
 api_router.include_router(tickets.router)
+api_router.include_router(support.router)
 api_router.include_router(integrations_zoom.advisor_router)
 api_router.include_router(integrations_zoom.router)
 api_router.include_router(admin.router)

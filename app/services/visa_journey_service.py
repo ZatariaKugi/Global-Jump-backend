@@ -224,12 +224,17 @@ def _documentation_status(
 ) -> JourneyStepStatus:
     if not unlocked:
         return JourneyStepStatus.pending
-    # Advisor rejected at least one document → send the seeker back to fix it.
+    required_n = len(summary.checklist)
+    if required_n == 0:
+        return JourneyStepStatus.in_progress
+    # Rejected uploads — keep the step active so the seeker can fix and re-upload.
     if summary.rejected > 0:
-        return JourneyStepStatus.pending
-    # Every required document uploaded and approved by the advisor.
-    if summary.total > 0 and summary.approved == summary.total and summary.missing == 0:
+        return JourneyStepStatus.in_progress
+    # All required categories have at least one upload (under review counts as filled).
+    if summary.missing == 0:
         return JourneyStepStatus.completed
+    if summary.total > 0 or summary.missing < required_n:
+        return JourneyStepStatus.in_progress
     return JourneyStepStatus.in_progress
 
 
@@ -250,10 +255,13 @@ def _submission_status(unlocked: bool, *, done: bool) -> JourneyStepStatus:
 
 
 def documentation_progress(summary: DocumentPortfolioSummary) -> int:
-    """0–100 mix of category uploads and approvals (in-progress Documents bar)."""
-    upload = max(0, min(summary.progress_percent, 100))
+    """0–100 mix of required-category uploads and advisor approvals (Documents bar)."""
     required = len(summary.checklist) or 1
-    approve = int(round(100 * summary.approved / required))
+    upload = max(0, min(summary.progress_percent, 100))
+    if summary.missing == 0 and summary.rejected == 0:
+        upload = 100
+    approved_categories = sum(1 for item in summary.checklist if item.status == "approved")
+    approve = int(round(100 * approved_categories / required))
     return max(0, min(100, int(round((upload + approve) / 2))))
 
 

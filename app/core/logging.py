@@ -3,12 +3,14 @@
 Console renderer in dev (colorama-colored levels), JSON renderer in prod.
 A ``request_id`` (and any other context bound by middleware) is merged into
 every log line via contextvars. Stdlib loggers (uvicorn, httpx, etc.) use the
-same colorama level colors.
+same colorama level colors. Uvicorn access lines are colored by HTTP status
+(2xx green, 4xx yellow, 5xx red) instead of always green INFO.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from typing import Any, cast
 
@@ -40,13 +42,33 @@ _STDLIB_LEVEL_COLORS = {
     logging.DEBUG: Fore.CYAN,
 }
 
+# uvicorn.access: '127.0.0.1:1234 - "GET /path HTTP/1.1" 404' (optional trailing text)
+_ACCESS_STATUS_RE = re.compile(r'"[^"]*"\s+(\d{3})\b')
+
+
+def _color_for_http_status(status_code: int) -> str:
+    if status_code >= 500:
+        return Fore.RED + Style.BRIGHT
+    if status_code >= 400:
+        return Fore.YELLOW + Style.BRIGHT
+    if status_code >= 300:
+        return Fore.CYAN
+    return Fore.GREEN
+
 
 class ColoramaLogFormatter(logging.Formatter):
-    """Colorize the full stdlib log line (uvicorn ``WARNING: …``, httpx, etc.)."""
+    """Colorize the full stdlib log line (uvicorn ``WARNING: …``, httpx, etc.).
+
+    Access-log lines use HTTP status for color so 4xx/5xx are not painted green.
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         message = super().format(record)
         color = _STDLIB_LEVEL_COLORS.get(record.levelno, "")
+        if record.name == "uvicorn.access":
+            match = _ACCESS_STATUS_RE.search(record.getMessage())
+            if match is not None:
+                color = _color_for_http_status(int(match.group(1)))
         if not color:
             return message
         return f"{color}{message}{Style.RESET_ALL}"

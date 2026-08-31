@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
 
+from app.schemas.assessment import AiMatchStatusRead
 from app.schemas.seeker_document import ClientSeekerBrief
 
 
@@ -44,6 +45,8 @@ class Meta(BaseModel):
     pagination: PageMeta | None = None
     # Set on advisor client-documents detail so FE can skip a second list call.
     seeker: ClientSeekerBrief | None = None
+    # Profile-based recommended advisor list when OpenAI re-rank was attempted.
+    ai_match: AiMatchStatusRead | None = None
 
 
 class ResponseEnvelope[T](BaseModel):

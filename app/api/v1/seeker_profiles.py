@@ -13,6 +13,7 @@ from app.api.pagination import PaginationDep, page_meta, paginate
 from app.core.countries import country_code
 from app.core.exceptions import AppError, PermissionDeniedError
 from app.core.file_storage import resolve_url
+from app.core.logging import get_logger
 from app.core.visa_types import OptionalVisaType
 from app.db.session import SessionDep
 from app.models.seeker_document import DocumentCategory, SeekerDocumentStatus
@@ -36,15 +37,16 @@ from app.schemas.seeker_profile import (
 )
 from app.schemas.visa_journey import VisaJourneyRead
 from app.services import (
-    ai_insight_service,
     seeker_dashboard_service,
     seeker_document_service,
     seeker_profile_service,
     seeker_recommendation_service,
     visa_journey_service,
 )
+from app.services.ai_advisor_match_service import ai_match_status
 
 router = APIRouter(prefix="/users/me", tags=["seeker-profile"])
+log = get_logger(__name__)
 
 
 def _require_seeker(current_user: User) -> None:
@@ -62,7 +64,7 @@ async def get_my_profile(
     _require_seeker(current_user)
     profile = await seeker_profile_service.get_or_create(session, current_user.id)
     return ResponseEnvelope[SeekerProfileRead](
-        data=seeker_profile_service.build_read(profile, settings),
+        data=await seeker_profile_service.build_read(session, profile, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -80,33 +82,88 @@ async def complete_onboarding(
     """Accept the complete onboarding wizard payload in one shot.
 
     The frontend accumulates step data in browser storage and calls this
-    endpoint once at the final wizard step. Step 5 AI suggestions are
-    generated from the submitted data and returned alongside the profile.
+    endpoint once at the final wizard step. Profile-based advisor matching
+    runs after the profile is saved.
     """
-    _require_seeker(current_user)
-    profile = await seeker_profile_service.get_or_create(session, current_user.id)
-    update = SeekerProfileUpdate(
-        intended_visa_type=data.intended_visa_type,
-        intended_destination=data.intended_destination,
-        annual_income_band=data.annual_income_band,
-        nationality=data.nationality,
-        country_of_residence=data.country_of_residence,
-        education_level=data.education_level,
-        employment_status=data.employment_status,
-        employer_name=data.employer_name,
+    user_id = str(current_user.id)
+    log.info(
+        "onboarding_start",
+        user_id=user_id,
+        request_id=request_id,
+        destination=data.intended_destination,
+        visa=data.intended_visa_type,
+        languages=data.preferred_languages,
+        services=data.services,
     )
-    profile = await seeker_profile_service.update(session, profile, update, settings)
-    suggestions = await ai_insight_service.generate_onboarding_suggestions(data, settings)
-    await seeker_recommendation_service.refresh_for_seeker(
-        session,
-        current_user.id,
-        settings=settings,
-    )
-    profile_read = seeker_profile_service.build_read(profile, settings)
-    return ResponseEnvelope[OnboardingCompleteRead](
-        data=OnboardingCompleteRead(**profile_read.model_dump(), ai_suggestions=suggestions),
-        meta=Meta(request_id=request_id),
-    )
+    try:
+        log.info("onboarding_require_seeker", user_id=user_id)
+        _require_seeker(current_user)
+
+        log.info("onboarding_get_or_create_profile", user_id=user_id)
+        profile = await seeker_profile_service.get_or_create(session, current_user.id)
+
+        log.info(
+            "onboarding_build_profile_update",
+            user_id=user_id,
+            profile_id=str(profile.id),
+        )
+        update = SeekerProfileUpdate(
+            intended_visa_types=data.intended_visa_types,
+            intended_visa_type=data.intended_visa_type,
+            intended_destinations=data.intended_destinations,
+            intended_destination=data.intended_destination,
+            annual_income_band=data.annual_income_band,
+            # Single profile-country field; residence aliases map to nationality.
+            nationality=data.nationality or data.country_of_residence,
+            education_level=data.education_level,
+            employment_status=data.employment_status,
+            employer_name=data.employer_name,
+            preferred_languages=data.preferred_languages,
+            needed_services=data.services or data.service_ids,
+            service_ids=data.service_ids or data.services,
+        )
+
+        log.info("onboarding_save_profile", user_id=user_id, profile_id=str(profile.id))
+        profile = await seeker_profile_service.update(session, profile, update, settings)
+
+        log.info("onboarding_refresh_advisor_matches", user_id=user_id)
+        recs, ai_failure, ai_attempted = await seeker_recommendation_service.refresh_for_seeker(
+            session,
+            current_user.id,
+            settings=settings,
+        )
+        log.info(
+            "onboarding_advisor_matches_done",
+            user_id=user_id,
+            matches=len(recs),
+            ai_attempted=ai_attempted,
+            ai_failed=ai_failure is not None,
+        )
+
+        log.info("onboarding_build_response", user_id=user_id)
+        profile_read = await seeker_profile_service.build_read(session, profile, settings)
+        matched_advisors = await seeker_recommendation_service.as_match_reads(
+            session, recs, settings
+        )
+        response = ResponseEnvelope[OnboardingCompleteRead](
+            data=OnboardingCompleteRead(
+                **profile_read.model_dump(exclude={"ai_match"}),
+                matched_advisors=matched_advisors,
+                ai_match=ai_match_status(ai_failure, attempted=ai_attempted),
+            ),
+            meta=Meta(request_id=request_id),
+        )
+        log.info("onboarding_complete", user_id=user_id, request_id=request_id)
+        return response
+    except Exception:
+        log.exception(
+            "onboarding_failed",
+            user_id=user_id,
+            request_id=request_id,
+            destination=data.intended_destination,
+            visa=data.intended_visa_type,
+        )
+        raise
 
 
 @router.patch("/profile", response_model=ResponseEnvelope[SeekerProfileRead])
@@ -121,14 +178,17 @@ async def update_my_profile(
     profile = await seeker_profile_service.get_or_create(session, current_user.id)
     prev_intent = (profile.intended_destination, profile.intended_visa_type)
     profile = await seeker_profile_service.update(session, profile, data, settings)
+    ai_match = None
     if (profile.intended_destination, profile.intended_visa_type) != prev_intent:
-        await seeker_recommendation_service.refresh_for_seeker(
+        _recs, ai_failure, ai_attempted = await seeker_recommendation_service.refresh_for_seeker(
             session,
             current_user.id,
             settings=settings,
         )
+        ai_match = ai_match_status(ai_failure, attempted=ai_attempted)
+    profile_read = await seeker_profile_service.build_read(session, profile, settings)
     return ResponseEnvelope[SeekerProfileRead](
-        data=seeker_profile_service.build_read(profile, settings),
+        data=SeekerProfileRead(**profile_read.model_dump(exclude={"ai_match"}), ai_match=ai_match),
         meta=Meta(request_id=request_id),
     )
 

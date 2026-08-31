@@ -152,6 +152,14 @@ async def remove_meeting(
             meeting_id=meeting_id,
             code=exc.code,
         )
+    except Exception as exc:
+        # Never fail cancel/reject because Zoom API/token refresh misbehaved.
+        logger.warning(
+            "zoom_meeting_delete_unexpected_error",
+            booking_id=str(booking.id),
+            meeting_id=meeting_id,
+            error=str(exc),
+        )
 
     _clear_meeting_fields(booking)
     session.add(booking)

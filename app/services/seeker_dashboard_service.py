@@ -43,6 +43,7 @@ from app.services import (
     seeker_recommendation_service,
     visa_journey_service,
 )
+from app.services.ai_advisor_match_service import ai_match_status
 
 MATCHED_ADVISORS_LIMIT = 10
 
@@ -215,7 +216,7 @@ async def get_dashboard(
     )
     application_state = visa_journey_service.application_status_state(state.statuses)
 
-    matched = await seeker_recommendation_service.matches_for_dashboard(
+    matched, ai_failure, ai_attempted = await seeker_recommendation_service.matches_for_dashboard(
         session,
         seeker_id,
         settings,
@@ -263,4 +264,5 @@ async def get_dashboard(
         eligibility_breakdown=breakdown,
         matched_advisors=matched,
         assessment_id=assessment.id if assessment is not None else None,
+        ai_match=ai_match_status(ai_failure, attempted=ai_attempted),
     )

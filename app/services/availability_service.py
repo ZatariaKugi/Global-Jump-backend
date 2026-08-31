@@ -19,14 +19,10 @@ from app.models.advisor_availability import (
     AdvisorAvailabilityOverride,
     AdvisorWeeklySlot,
 )
-from app.models.booking import Booking, BookingStatus, PaymentStatus
+from app.models.booking import Booking, BookingStatus
 from app.schemas.availability import OverrideInput, WeeklySlotInput
 
-# Statuses that occupy the slot. ``pending`` is only treated as occupying when the
-# booking is already paid — unpaid pending holds the slot for a short window so the
-# seeker can complete checkout, but if Stripe hasn't reported success yet we still
-# don't double-book if another seeker races to the same time. ``confirmed`` always
-# occupies regardless of payment status (it's already past the accept gate).
+# Statuses that occupy the slot for other seekers/advisors.
 ACTIVE_BOOKING_STATUSES = (BookingStatus.pending, BookingStatus.confirmed)
 
 
@@ -186,17 +182,6 @@ async def free_slots(
     )
     for booking in bookings_result.scalars().all():
         if exclude_booking_id is not None and booking.id == exclude_booking_id:
-            continue
-        # An unpaid pending booking doesn't actually hold the slot — ``_handle_checkout_expired``
-        # cancels it on Stripe's expiry webhook, but during the gap between booking creation and
-        # webhook delivery we don't want to mark the slot as taken. Confirmed bookings always
-        # occupy the slot (the advisor has accepted, payment is assumed). Free (price_usd <= 0)
-        # bookings occupy regardless of payment_status.
-        if (
-            booking.status == BookingStatus.pending
-            and booking.price_usd > 0
-            and booking.payment_status != PaymentStatus.paid
-        ):
             continue
         busy.append((as_utc(booking.scheduled_start), as_utc(booking.scheduled_end)))
 

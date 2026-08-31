@@ -16,6 +16,11 @@
     {{ details_row("Reason", reason) }}
   {% endif %}
   {{ details_close() }}
+  {% if refund_amount_usd is not none %}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    A refund of <strong>${{ "%.2f"|format(refund_amount_usd) }}</strong> has been issued to your original payment method. It may take 5-10 business days to appear on your statement.
+  </p>
+  {% endif %}
   <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
     You can book again anytime from your dashboard.
   </p>

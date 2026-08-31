@@ -150,8 +150,6 @@ async def test_onboarding_complete_wizard(client: AsyncClient, seeker_token: str
     assert data["education_level"] == "bachelor"
     assert data["employment_status"] == "employed"
     assert data["employer_name"] == "Acme Corp"
-    # Step 5 AI suggestions — no OpenAI key in tests, so it degrades to an empty list
-    assert data["ai_suggestions"] == []
 
 
 async def test_onboarding_accepts_country_code_destination(

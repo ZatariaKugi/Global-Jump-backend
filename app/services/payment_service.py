@@ -18,6 +18,7 @@ from sqlalchemy.orm import aliased
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError
 from app.core.file_storage import resolve_media_url
+from app.core.money import as_float, money_sum
 from app.models.advisor_profile import AdvisorProfile
 from app.models.booking import Booking, BookingStatus, PaymentStatus
 from app.models.notification import NotificationEntityType, NotificationType
@@ -45,6 +46,8 @@ from app.services import (
 )
 
 log = structlog.get_logger()
+
+STRIPE_STANDARD_DASHBOARD_URL = "https://dashboard.stripe.com"
 
 
 async def _notify_payment(
@@ -627,9 +630,9 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
     refunded_amount_usd = (
         round(int(amount_refunded_cents) / 100, 2)
         if isinstance(amount_refunded_cents, (int, float))
-        else txn.amount_usd
+        else as_float(txn.amount_usd)
     )
-    is_full = refunded_amount_usd >= txn.amount_usd
+    is_full = refunded_amount_usd >= as_float(txn.amount_usd)
 
     # Idempotent against duplicate webhook delivery and against an admin-initiated
     # refund that already moved the row (refund_transaction sets these same fields):
@@ -637,7 +640,7 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
     # Only proceed when this event reflects *more* refunded than we've recorded
     # (e.g. a genuine partial→larger escalation from the dashboard); otherwise the
     # refund is already accounted for — don't re-notify the seeker or re-log events.
-    already_refunded = txn.refunded_amount_usd or 0.0
+    already_refunded = as_float(txn.refunded_amount_usd)
     if (
         txn.status
         in (
@@ -694,13 +697,13 @@ async def _refund_transaction_record(
     if txn.transfer_status in (TransferStatus.completed, TransferStatus.failed):
         raise AppError("The refund window has closed for this payment", code="refund_window_closed")
 
-    refund_amount = amount_usd if amount_usd is not None else txn.amount_usd
-    if refund_amount > txn.amount_usd:
+    refund_amount = as_float(amount_usd if amount_usd is not None else txn.amount_usd)
+    if refund_amount > as_float(txn.amount_usd):
         raise AppError(
             "Refund amount cannot exceed the transaction amount", code="refund_amount_too_large"
         )
-    already_refunded = txn.refunded_amount_usd or 0.0
-    if already_refunded + refund_amount > txn.amount_usd:
+    already_refunded = as_float(txn.refunded_amount_usd)
+    if already_refunded + refund_amount > as_float(txn.amount_usd):
         raise AppError(
             "Refund would exceed total transaction amount", code="refund_amount_too_large"
         )
@@ -779,16 +782,17 @@ async def auto_refund_booking_if_paid(
     actor_id: uuid.UUID,
     reason: str | None,
     settings: Settings,
-) -> None:
+) -> Decimal | None:
     """Best-effort full refund when a paid booking is rejected or cancelled.
 
     Failures are logged but do not block the booking state transition — admin can
     refund manually from the Payments screen if the window has closed.
+    Returns the refunded amount if successful, None otherwise.
     """
     if booking.payment_status != PaymentStatus.paid:
-        return
+        return None
     try:
-        await refund_booking_payment(
+        txn = await refund_booking_payment(
             session,
             booking.id,
             actor_id,
@@ -803,8 +807,19 @@ async def auto_refund_booking_if_paid(
             code=code,
             detail=str(exc),
         )
+        return None
+    except stripe.StripeError as exc:
+        # Must not abort cancel/reject — Zoom teardown and status change still need to commit.
+        log.warning(
+            "booking_auto_refund_failed",
+            booking_id=str(booking.id),
+            code="stripe_error",
+            detail=str(exc),
+        )
+        return None
     else:
         log.info("booking_auto_refunded", booking_id=str(booking.id), actor_id=str(actor_id))
+        return Decimal(str(txn.refunded_amount_usd)) if txn.refunded_amount_usd else None
 
 
 async def refund_transaction(
@@ -1023,7 +1038,61 @@ async def create_connect_account(
         payouts_enabled=profile.stripe_payouts_enabled,
         onboarding_complete=profile.stripe_details_submitted and profile.stripe_charges_enabled,
         onboarding_url=account_link.url,
+        account_type="express",
     )
+
+
+async def create_stripe_dashboard_url(
+    session: AsyncSession,
+    advisor_user_id: uuid.UUID,
+    settings: Settings,
+) -> str:
+    """Return a URL the advisor can open to manage payouts in Stripe.
+
+    Express connected accounts receive a single-use Express Dashboard login link.
+    Standard (OAuth) accounts are sent to the public Stripe Dashboard — they sign
+    in with their own Stripe credentials there.
+    """
+    _init_stripe(settings)
+    profile = await _get_advisor_profile(session, advisor_user_id)
+    if not profile.stripe_account_id:
+        raise NotFoundError("No Stripe account connected")
+
+    account = await stripe.Account.retrieve_async(profile.stripe_account_id)
+    account_type = _stripe_get(account, "type", None)
+    if account_type == "express":
+        try:
+            login_link = await stripe.Account.create_login_link_async(profile.stripe_account_id)
+        except stripe.StripeError as exc:
+            raise AppError(
+                "Unable to open your Stripe dashboard. Please try again.",
+                code="stripe_dashboard_unavailable",
+            ) from exc
+        url = getattr(login_link, "url", None)
+        if not isinstance(url, str) or not url:
+            raise AppError(
+                "Unable to open your Stripe dashboard. Please try again.",
+                code="stripe_dashboard_unavailable",
+            )
+        return url
+
+    return STRIPE_STANDARD_DASHBOARD_URL
+
+
+async def disconnect_connect_account(
+    session: AsyncSession,
+    advisor_user_id: uuid.UUID,
+) -> None:
+    """Clear the advisor's linked Stripe Connect account from the platform."""
+    profile = await _get_advisor_profile(session, advisor_user_id)
+    profile.stripe_account_id = None
+    profile.stripe_charges_enabled = False
+    profile.stripe_payouts_enabled = False
+    profile.stripe_details_submitted = False
+    zoom_connection_service.sync_stripe_connect_flag(profile)
+    session.add(profile)
+    await session.commit()
+    log.info("stripe_connect_disconnected", advisor_id=str(advisor_user_id))
 
 
 async def get_connect_status(
@@ -1049,11 +1118,14 @@ async def get_connect_status(
     session.add(profile)
     await session.flush()
 
+    account_type = _stripe_get(account, "type", None)
+
     return AdvisorConnectStatus(
         stripe_account_id=profile.stripe_account_id,
         charges_enabled=profile.stripe_charges_enabled,
         payouts_enabled=profile.stripe_payouts_enabled,
         onboarding_complete=profile.stripe_details_submitted and profile.stripe_charges_enabled,
+        account_type=account_type if isinstance(account_type, str) else None,
     )
 
 
@@ -1064,18 +1136,16 @@ async def get_advisor_earnings(
     result = await session.execute(list_for_advisor_stmt(advisor_user_id))
     txns = list(result.scalars().all())
 
-    total_earned = sum(
-        (t.advisor_payout_usd for t in txns if t.status == TransactionStatus.succeeded),
-        0.0,
+    total_earned = money_sum(
+        t.advisor_payout_usd for t in txns if t.status == TransactionStatus.succeeded
     )
-    total_commission = sum(
-        (t.commission_usd for t in txns if t.status == TransactionStatus.succeeded),
-        0.0,
+    total_commission = money_sum(
+        t.commission_usd for t in txns if t.status == TransactionStatus.succeeded
     )
 
     return {
-        "total_earned_usd": round(float(total_earned), 2),
-        "total_commission_paid_usd": round(float(total_commission), 2),
+        "total_earned_usd": round(total_earned, 2),
+        "total_commission_paid_usd": round(total_commission, 2),
         "transactions": txns,
     }
 

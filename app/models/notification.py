@@ -42,6 +42,7 @@ class NotificationType(StrEnum):
     user_registered = "user_registered"
     message_received = "message_received"
     document_comment = "document_comment"
+    document_status_updated = "document_status_updated"
 
 
 class NotificationEntityType(StrEnum):

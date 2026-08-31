@@ -1,0 +1,20 @@
+New support message
+
+You have received a new support message from {{ sender_name }}.
+
+Name: {{ sender_name }}
+Email: {{ sender_email }}
+
+Message:
+  "{{ message }}"
+
+Reply directly to {{ sender_email }} to respond to this message.
+
+— The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}
+How it works: {{ how_it_works_url }}
+FAQs: {{ faq_url }}

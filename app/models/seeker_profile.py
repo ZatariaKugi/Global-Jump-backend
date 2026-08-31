@@ -60,6 +60,62 @@ class SeekerPriorVisa(Base):
     year: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
+class SeekerPreferredLanguage(Base):
+    """One row per language a seeker prefers to communicate in."""
+
+    __tablename__ = "seeker_preferred_languages"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("seeker_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    language: Mapped[str] = mapped_column(String(100), nullable=False)
+
+
+class SeekerNeededService(Base):
+    """One row per service type the seeker selected during onboarding."""
+
+    __tablename__ = "seeker_needed_services"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("seeker_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    service_type: Mapped[str] = mapped_column(String(100), nullable=False)
+
+
+class SeekerIntendedDestination(Base):
+    """One row per destination country the seeker selected during onboarding."""
+
+    __tablename__ = "seeker_intended_destinations"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("seeker_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    country_code: Mapped[str] = mapped_column(String(2), nullable=False)
+
+
+class SeekerIntendedVisaType(Base):
+    """One row per visa type the seeker selected during onboarding."""
+
+    __tablename__ = "seeker_intended_visa_types"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("seeker_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    visa_type: Mapped[str] = mapped_column(String(50), nullable=False)
+
+
 class SeekerProfile(BaseModel):
     __tablename__ = "seeker_profiles"
 
@@ -80,10 +136,9 @@ class SeekerProfile(BaseModel):
     # Edit-profile sheet (shared seeker settings)
     phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
     timezone: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    preferred_language: Mapped[str | None] = mapped_column(String(100), nullable=True)
     about: Mapped[str | None] = mapped_column(String(2000), nullable=True)
 
-    # Onboarding intent — captured during the post-registration onboarding wizard
+    # Primary onboarding intent (first selected value — kept for matching/legacy reads)
     intended_visa_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     intended_destination: Mapped[str | None] = mapped_column(String(2), nullable=True)
     # Set by POST /users/me/visa-journey/submit once Review is complete.
@@ -95,12 +150,24 @@ class SeekerProfile(BaseModel):
     passport_number_encrypted: Mapped[str | None] = mapped_column(String(500), nullable=True)
     passport_expiry: Mapped[date | None] = mapped_column(Date, nullable=True)
 
-    # Travel history — normalised into child tables
+    # Travel history / preferences — normalised into child tables
     countries_visited: Mapped[list[SeekerCountryVisited]] = relationship(
         "SeekerCountryVisited", cascade="all, delete-orphan", lazy="selectin"
     )
     prior_visas: Mapped[list[SeekerPriorVisa]] = relationship(
         "SeekerPriorVisa", cascade="all, delete-orphan", lazy="selectin"
+    )
+    preferred_languages: Mapped[list[SeekerPreferredLanguage]] = relationship(
+        "SeekerPreferredLanguage", cascade="all, delete-orphan", lazy="selectin"
+    )
+    needed_services: Mapped[list[SeekerNeededService]] = relationship(
+        "SeekerNeededService", cascade="all, delete-orphan", lazy="selectin"
+    )
+    intended_destinations: Mapped[list[SeekerIntendedDestination]] = relationship(
+        "SeekerIntendedDestination", cascade="all, delete-orphan", lazy="selectin"
+    )
+    intended_visa_types: Mapped[list[SeekerIntendedVisaType]] = relationship(
+        "SeekerIntendedVisaType", cascade="all, delete-orphan", lazy="selectin"
     )
 
     # Background
