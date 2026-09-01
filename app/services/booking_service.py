@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import Select, and_, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,11 +20,13 @@ from app.core.visa_types import humanize_slug
 from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorOfferedService, AdvisorProfile, AdvisorService
 from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus, PaymentStatus
+from app.models.booking_document_request import BookingDocumentRequest
+from app.models.booking_note import BookingNote
 from app.models.booking_document_request import DocumentRequestStatus
 from app.models.notification import NotificationEntityType, NotificationType
 from app.models.review import Review
 from app.models.seeker_profile import SeekerProfile
-from app.models.transaction import Transaction
+from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.booking import (
     AdvisorBookingCreate,
@@ -48,6 +52,7 @@ from app.services import (
     payment_service,
 )
 from app.services.availability_service import as_utc
+from app.services.seeker_profile_service import preferred_language_names
 
 DEFAULT_NOTICE_HOURS = 24
 UNACCEPTED_BOOKING_EXPIRY_REASON = (
@@ -172,6 +177,128 @@ def appointment_id_str(booking: Booking) -> str:
     return str(booking.appointment_number)
 
 
+def actions_read_at(booking: Booking, viewer_id: uuid.UUID) -> datetime | None:
+    if viewer_id == booking.advisor_id:
+        return booking.advisor_actions_read_at
+    if viewer_id == booking.seeker_id:
+        return booking.seeker_actions_read_at
+    return None
+
+
+def compute_is_unread(*, read_at: datetime | None, activity_at: datetime | None) -> bool:
+    """True when the other party changed something since the viewer opened the ⋯ menu."""
+    if activity_at is None:
+        return False
+    if read_at is None:
+        return True
+    return activity_at > read_at
+
+
+def _merge_activity(
+    current: dict[uuid.UUID, datetime | None],
+    booking_id: uuid.UUID,
+    at: datetime | None,
+) -> None:
+    if at is None:
+        return
+    prev = current.get(booking_id)
+    current[booking_id] = at if prev is None else max(prev, at)
+
+
+async def other_party_activity_at_by_booking(
+    session: AsyncSession,
+    bookings: list[Booking],
+    viewer_id: uuid.UUID,
+) -> dict[uuid.UUID, datetime | None]:
+    """Latest menu-relevant activity from the other party, per booking."""
+    if not bookings:
+        return {}
+
+    ids = [b.id for b in bookings]
+    activity: dict[uuid.UUID, datetime | None] = {b.id: None for b in bookings}
+
+    for booking in bookings:
+        if viewer_id not in (booking.advisor_id, booking.seeker_id):
+            continue
+        if booking.updated_by is not None and booking.updated_by != viewer_id:
+            _merge_activity(activity, booking.id, booking.updated_at)
+
+    note_rows = (
+        await session.execute(
+            select(BookingNote.booking_id, func.max(BookingNote.created_at))
+            .where(BookingNote.booking_id.in_(ids))
+            .where(BookingNote.author_id != viewer_id)
+            .group_by(BookingNote.booking_id)
+        )
+    ).all()
+    for booking_id, at in note_rows:
+        _merge_activity(activity, booking_id, at)
+
+    seeker_booking_ids = [b.id for b in bookings if b.seeker_id == viewer_id]
+    if seeker_booking_ids:
+        doc_rows = (
+            await session.execute(
+                select(
+                    BookingDocumentRequest.booking_id,
+                    func.max(BookingDocumentRequest.created_at),
+                )
+                .where(BookingDocumentRequest.booking_id.in_(seeker_booking_ids))
+                .group_by(BookingDocumentRequest.booking_id)
+            )
+        ).all()
+        for booking_id, at in doc_rows:
+            _merge_activity(activity, booking_id, at)
+
+    advisor_booking_ids = [b.id for b in bookings if b.advisor_id == viewer_id]
+    if advisor_booking_ids:
+        fulfill_rows = (
+            await session.execute(
+                select(
+                    BookingDocumentRequest.booking_id,
+                    func.max(BookingDocumentRequest.fulfilled_at),
+                )
+                .where(BookingDocumentRequest.booking_id.in_(advisor_booking_ids))
+                .where(BookingDocumentRequest.fulfilled_at.is_not(None))
+                .group_by(BookingDocumentRequest.booking_id)
+            )
+        ).all()
+        for booking_id, at in fulfill_rows:
+            _merge_activity(activity, booking_id, at)
+
+    return activity
+
+
+async def unread_flags_for_viewer(
+    session: AsyncSession,
+    bookings: list[Booking],
+    viewer_id: uuid.UUID,
+) -> dict[uuid.UUID, bool]:
+    activity = await other_party_activity_at_by_booking(session, bookings, viewer_id)
+    return {
+        booking.id: compute_is_unread(
+            read_at=actions_read_at(booking, viewer_id),
+            activity_at=activity.get(booking.id),
+        )
+        for booking in bookings
+    }
+
+
+async def mark_actions_read(
+    session: AsyncSession, booking: Booking, viewer_id: uuid.UUID
+) -> Booking:
+    now = datetime.now(UTC)
+    if viewer_id == booking.advisor_id:
+        booking.advisor_actions_read_at = now
+    elif viewer_id == booking.seeker_id:
+        booking.seeker_actions_read_at = now
+    else:
+        raise PermissionDeniedError("Not a party to this booking")
+    session.add(booking)
+    await session.flush()
+    await session.refresh(booking)
+    return booking
+
+
 def build_read(
     booking: Booking,
     seeker: User | None,
@@ -183,6 +310,7 @@ def build_read(
     review_id: uuid.UUID | None = None,
     cancellation_notice_hours: int = DEFAULT_NOTICE_HOURS,
     viewer_role: UserRole = UserRole.seeker,
+    is_unread: bool = False,
 ) -> BookingRead:
     platform_fee = round(booking.price_usd * settings.PLATFORM_COMMISSION_RATE, 2)
     advisor_fee = round(booking.price_usd - platform_fee, 2)
@@ -211,10 +339,12 @@ def build_read(
         scheduled_end=as_utc(booking.scheduled_end),
         status=booking.status,
         payment_status=booking.payment_status,
+        completed_at=as_utc(booking.completed_at) if booking.completed_at else None,
         cancellation_reason=booking.cancellation_reason,
         seeker_note=booking.seeker_note,
         deal_later_at=as_utc(booking.deal_later_at) if booking.deal_later_at else None,
         is_important=booking.is_important,
+        is_unread=is_unread,
         interpreter_name=booking.interpreter_name,
         interpreter_contact=booking.interpreter_contact,
         interpreter_language=booking.interpreter_language,
@@ -341,6 +471,22 @@ async def get_notice_hours(session: AsyncSession, advisor_id: uuid.UUID) -> int:
     return hours if hours is not None else DEFAULT_NOTICE_HOURS
 
 
+def _floor_to_minute(dt: datetime) -> datetime:
+    """Strip microseconds/seconds for stable comparison across JSON round-trips."""
+    return dt.replace(second=0, microsecond=0)
+
+
+async def _lock_advisor_schedule(session: AsyncSession, advisor_id: uuid.UUID) -> None:
+    """Serialize slot mutations for one advisor to prevent concurrent double-booking."""
+    result = await session.execute(
+        select(AdvisorProfile)
+        .where(AdvisorProfile.user_id == advisor_id)
+        .with_for_update()
+    )
+    if result.scalar_one_or_none() is None:
+        raise NotFoundError("Advisor profile not found")
+
+
 async def _assert_slot_free(
     session: AsyncSession,
     advisor_id: uuid.UUID,
@@ -348,18 +494,34 @@ async def _assert_slot_free(
     duration_minutes: int,
     exclude_booking_id: uuid.UUID | None = None,
 ) -> datetime:
-    """Validate the requested start against the advisor's free slots; return end."""
+    """Validate the requested start against the advisor's free slots; return end.
+
+    Queries date ± 1 day because free_slots expands weekly slots in the
+    advisor's local timezone — a slot at e.g. 00:30 Asia/Karachi maps to
+    19:30 UTC the previous day, so the UTC date differs from the advisor-local
+    date.
+    """
+    day = as_utc(start_utc).date()
     free = await availability_service.free_slots(
         session,
         advisor_id,
-        start_utc.date(),
-        start_utc.date(),
+        day - timedelta(days=1),
+        day + timedelta(days=1),
         duration_minutes,
         exclude_booking_id=exclude_booking_id,
     )
+    requested = _floor_to_minute(start_utc)
     for slot_start, slot_end in free:
-        if slot_start == start_utc:
+        if _floor_to_minute(slot_start) == requested:
             return slot_end
+    log.warning(
+        "slot_unavailable",
+        advisor_id=str(advisor_id),
+        requested_utc=start_utc.isoformat(),
+        requested_date=str(day),
+        free_slots_count=len(free),
+        free_slots=[(s.isoformat(), e.isoformat()) for s, e in free[:10]],
+    )
     raise AppError("Requested time is not available", code="slot_unavailable")
 
 
@@ -372,11 +534,19 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
     await _resolve_advisor(session, data.advisor_id)
     service = await _resolve_service(session, data.advisor_id, str(data.service_type))
 
-    start_utc = as_utc(data.scheduled_start)
+    if data.scheduled_start.tzinfo is None and data.timezone:
+        tz = ZoneInfo(data.timezone)
+        start_utc = data.scheduled_start.replace(tzinfo=tz).astimezone(UTC)
+    else:
+        start_utc = as_utc(data.scheduled_start)
+
     if start_utc <= datetime.now(UTC):
         raise AppError("Booking must be in the future", code="invalid_booking")
 
-    end_utc = await _assert_slot_free(session, data.advisor_id, start_utc, service.duration_minutes)
+    await _lock_advisor_schedule(session, data.advisor_id)
+    end_utc = await _assert_slot_free(
+        session, data.advisor_id, start_utc, service.duration_minutes
+    )
 
     booking = Booking(
         seeker_id=seeker.id,
@@ -396,14 +566,9 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
-    await _notify_booking(
-        session,
-        booking,
-        recipient_id=booking.advisor_id,
-        actor_id=seeker.id,
-        type=NotificationType.booking_requested,
-        title="New consultation request",
-    )
+    # Advisor notification is sent only after payment succeeds
+    # (see payment_service._handle_checkout_completed) to avoid
+    # misleading advisors with unpaid booking requests.
     return booking
 
 
@@ -429,6 +594,7 @@ async def create_by_advisor(
     if start_utc <= datetime.now(UTC):
         raise AppError("Booking must be in the future", code="invalid_booking")
 
+    await _lock_advisor_schedule(session, advisor.id)
     end_utc = await _assert_slot_free(session, advisor.id, start_utc, data.duration_minutes)
 
     booking = Booking(
@@ -437,8 +603,14 @@ async def create_by_advisor(
         appointment_number=await _next_appointment_number(session),
         service_type=str(data.service_type),
         duration_minutes=data.duration_minutes,
-        # Advisor-created bookings are not paid consultations.
+        # Advisor-created bookings are not paid consultations — no checkout
+        # session is ever created for them (see create_checkout_session, which
+        # rejects price_usd <= 0), so the booking must not surface to the
+        # seeker as an unpaid $0 invoice they cannot pay. Marking
+        # payment_status=paid here keeps it out of "Pay now" lists while
+        # preserving the existing paid-or-free chat-gate clause.
         price_usd=0.0,
+        payment_status=PaymentStatus.paid,
         scheduled_start=start_utc,
         scheduled_end=end_utc,
         status=BookingStatus.confirmed,
@@ -649,7 +821,7 @@ async def cancel(
     actor_id: uuid.UUID,
     reason: str | None,
     settings: Settings,
-) -> Booking:
+) -> tuple[Booking, Decimal | None]:
     _assert_active(booking)
     await _enforce_seeker_notice(session, booking, actor_id)
     booking.status = BookingStatus.cancelled
@@ -658,8 +830,7 @@ async def cancel(
     booking.updated_by = actor_id
     session.add(booking)
     await session.flush()
-    await session.refresh(booking)
-    await payment_service.auto_refund_booking_if_paid(
+    refund_amount = await payment_service.auto_refund_booking_if_paid(
         session, booking, actor_id, reason, settings
     )
     await booking_meeting_service.remove_meeting(session, booking, settings)
@@ -671,7 +842,10 @@ async def cancel(
         type=NotificationType.booking_cancelled,
         title="Booking cancelled",
     )
-    return booking
+    # Refresh after all flushes to ensure attributes like updated_at are loaded
+    # and not expired, preventing MissingGreenlet during read.
+    await session.refresh(booking)
+    return booking, refund_amount
 
 
 async def reschedule(
@@ -687,6 +861,7 @@ async def reschedule(
     start_utc = as_utc(new_start)
     if start_utc <= datetime.now(UTC):
         raise AppError("Booking must be in the future", code="invalid_booking")
+    await _lock_advisor_schedule(session, booking.advisor_id)
     end_utc = await _assert_slot_free(
         session,
         booking.advisor_id,
@@ -724,6 +899,15 @@ async def accept(
         raise PermissionDeniedError("Only the advisor can do this")
     if booking.status != BookingStatus.pending:
         raise AppError("Booking is not pending", code="invalid_state")
+    # Paid bookings only — free (advisor-self-created, price_usd <= 0) bookings don't go
+    # through checkout, so they're allowed through without a payment record. This is the
+    # BE enforcement that pairs with the FE soft-gate; without it, an unpaid booking can
+    # still be confirmed via direct API call and produce an unpaid "confirmed" appointment.
+    if booking.price_usd > 0 and booking.payment_status != PaymentStatus.paid:
+        raise AppError(
+            "Booking must be paid before it can be accepted",
+            code="payment_required",
+        )
     booking.status = BookingStatus.confirmed
     booking.confirmed_at = datetime.now(UTC)
     booking.deal_later_at = None
@@ -855,6 +1039,95 @@ async def expire_unaccepted_pending_bookings(
     return expired
 
 
+STALE_UNPAID_EXPIRY_REASON = "Payment was not completed within the allowed time window"
+
+async def expire_stale_unpaid_bookings(
+    session: AsyncSession, settings: Settings
+) -> int:
+    """Cancel pending+unpaid bookings older than ``STALE_UNPAID_BOOKING_MINUTES``.
+
+    Safety net: if the checkout.session.expired webhook was missed or the seeker
+    never initiated payment, this sweep releases the slot. Only targets bookings
+    where payment_status is unpaid and no transaction exists (or the transaction
+    has already failed).
+
+    Uses ``FOR UPDATE SKIP LOCKED`` so multiple app instances do not double-process.
+    Returns the number of bookings expired this pass.
+    """
+    stale_minutes = getattr(settings, "STALE_UNPAID_BOOKING_MINUTES", 60)
+    cutoff = datetime.now(UTC) - timedelta(minutes=stale_minutes)
+
+    # Find pending+unpaid bookings created before the cutoff
+    # that have no successful transaction
+    due = list(
+        (
+            await session.execute(
+                select(Booking)
+                .where(
+                    Booking.status == BookingStatus.pending,
+                    Booking.payment_status == PaymentStatus.unpaid,
+                    Booking.created_at < cutoff,
+                )
+                .with_for_update(skip_locked=True)
+                .limit(100)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    expired = 0
+    for booking in due:
+        if booking.status != BookingStatus.pending:
+            continue
+        # Double-check: if a successful transaction exists, skip (payment may have
+        # succeeded between the query and this check)
+        txn = (
+            await session.execute(
+                select(Transaction).where(
+                    Transaction.booking_id == booking.id,
+                    Transaction.status == TransactionStatus.succeeded,
+                )
+            )
+        ).scalar_one_or_none()
+        if txn is not None:
+            continue
+
+        booking.status = BookingStatus.cancelled
+        booking.cancellation_reason = STALE_UNPAID_EXPIRY_REASON
+        booking.cancelled_by = None
+        booking.updated_by = None
+        session.add(booking)
+        await session.flush()
+        await session.refresh(booking)
+
+        await _notify_booking(
+            session,
+            booking,
+            recipient_id=booking.seeker_id,
+            actor_id=booking.advisor_id,
+            type=NotificationType.booking_cancelled,
+            title="Consultation request cancelled",
+            body=STALE_UNPAID_EXPIRY_REASON,
+        )
+        await _notify_booking(
+            session,
+            booking,
+            recipient_id=booking.advisor_id,
+            actor_id=booking.seeker_id,
+            type=NotificationType.booking_cancelled,
+            title="Consultation request cancelled",
+            body=STALE_UNPAID_EXPIRY_REASON,
+        )
+        log.info(
+            "booking_expired_stale_unpaid",
+            booking_id=str(booking.id),
+        )
+        expired += 1
+
+    return expired
+
+
 async def deal_later(session: AsyncSession, booking: Booking, actor_id: uuid.UUID) -> Booking:
     """Advisor defers Accept/Reject on a pending consultation request (stays pending)."""
     if actor_id != booking.advisor_id:
@@ -912,7 +1185,25 @@ def _assert_advisor_post_start(booking: Booking, actor_id: uuid.UUID) -> None:
 
 
 async def complete(session: AsyncSession, booking: Booking, actor_id: uuid.UUID) -> Booking:
-    _assert_advisor_post_start(booking, actor_id)
+    if actor_id != booking.advisor_id:
+        raise PermissionDeniedError("Only the advisor can do this")
+    if booking.status == BookingStatus.completed:
+        return booking
+    if datetime.now(UTC) < as_utc(booking.scheduled_start):
+        raise AppError("Session has not started yet", code="invalid_state")
+    if booking.status == BookingStatus.pending:
+        if booking.price_usd > 0 and booking.payment_status != PaymentStatus.paid:
+            raise AppError(
+                "Booking must be paid before it can be completed",
+                code="payment_required",
+            )
+        # Paid (or free) pending past start — mirror payment webhook / accept.
+        booking.status = BookingStatus.confirmed
+        if booking.confirmed_at is None:
+            booking.confirmed_at = datetime.now(UTC)
+    elif booking.status != BookingStatus.confirmed:
+        raise AppError("Booking is not confirmed", code="invalid_state")
+
     booking.status = BookingStatus.completed
     booking.completed_at = datetime.now(UTC)
     booking.updated_by = actor_id
@@ -1157,7 +1448,9 @@ async def build_session_detail(
         else None
     )
     language = booking.interpreter_language or (
-        seeker_profile.preferred_language if seeker_profile else None
+        ", ".join(preferred_language_names(seeker_profile))
+        if seeker_profile and preferred_language_names(seeker_profile)
+        else None
     )
 
     notice_hours = await get_notice_hours(session, booking.advisor_id)
@@ -1290,6 +1583,9 @@ async def build_client_reads(
 
     photos = await seeker_photo_keys(session, set(seeker_ids))
 
+    latest_list = [b for b in latest_booking.values() if b is not None]
+    unread_flags = await unread_flags_for_viewer(session, latest_list, advisor_id)
+
     rows: list[ClientRead] = []
     for client in clients:
         latest = latest_booking.get(client.id)
@@ -1309,6 +1605,7 @@ async def build_client_reads(
                 match_score=lead_row.match_score if lead_row is not None else None,
                 status=latest.status if latest is not None else None,
                 is_important=latest.is_important if latest is not None else False,
+                is_unread=unread_flags.get(latest.id, False) if latest is not None else False,
             )
         )
     return rows

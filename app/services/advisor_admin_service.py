@@ -8,11 +8,13 @@ from typing import Literal, cast
 
 from sqlalchemy import Select, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings
 from app.core.countries import country_name
 from app.core.exceptions import NotFoundError
-from app.core.file_storage import resolve_media_url
+from app.core.file_storage import resolve_media_url, resolve_url
+from app.core.money import as_float
 from app.models.advisor_credential import AdvisorCredential, CredentialStatus
 from app.models.advisor_profile import AdvisorProfile, AdvisorVisaSpecialization
 from app.models.booking import Booking, BookingStatus
@@ -29,9 +31,9 @@ from app.schemas.advisor_admin import (
     AdvisorSessionRead,
     AdvisorStatus,
 )
+from app.schemas.advisor_credential import AdvisorCredentialRead
 from app.schemas.advisor_profile import LanguageEntry
 from app.services import (
-    advisor_profile_service,
     booking_service,
     payment_service,
     payout_service,
@@ -168,38 +170,83 @@ async def build_list_read(
 async def get_advisor_detail(
     session: AsyncSession, advisor_id: uuid.UUID, settings: Settings
 ) -> AdvisorManagementDetailRead:
+    """Admin advisor detail — fixed query count, no N+1, no full txn load.
+
+    Queries (≈6):
+      1. User
+      2. Profile + selectinload(visa / countries / languages)
+      3. Booking totals (total + completed in one SELECT)
+      4. Review rating aggregate
+      5. Succeeded payout SUM (no transaction rows)
+      6. Non-archived credentials (documents + pending/verified counts)
+    """
     advisor = await session.get(User, advisor_id)
     if advisor is None or advisor.role != UserRole.advisor:
         raise NotFoundError("Advisor not found")
-    profile = await advisor_profile_service.get_or_create(session, advisor_id)
 
-    total_sessions = (
-        await session.execute(
-            select(func.count()).select_from(Booking).where(Booking.advisor_id == advisor_id)
+    profile = await session.scalar(
+        select(AdvisorProfile)
+        .where(AdvisorProfile.user_id == advisor_id)
+        .options(
+            selectinload(AdvisorProfile.visa_specializations),
+            selectinload(AdvisorProfile.country_expertise),
+            selectinload(AdvisorProfile.languages),
         )
-    ).scalar_one()
-    completed_sessions = (
+    )
+    if profile is None:
+        raise NotFoundError("Advisor profile not found")
+
+    total_sessions, completed_sessions = (
         await session.execute(
-            select(func.count())
-            .select_from(Booking)
-            .where(Booking.advisor_id == advisor_id, Booking.status == BookingStatus.completed)
+            select(
+                func.count(Booking.id),
+                func.count(Booking.id).filter(Booking.status == BookingStatus.completed),
+            ).where(Booking.advisor_id == advisor_id)
         )
-    ).scalar_one()
+    ).one()
+
     avg, review_count = await review_service.rating_summary(session, advisor_id)
 
-    cred_rows = (
-        await session.execute(
-            select(AdvisorCredential.status, func.count())
-            .where(AdvisorCredential.user_id == advisor_id)
-            .group_by(AdvisorCredential.status)
-        )
-    ).all()
-    cred_counts: dict[CredentialStatus, int] = {}
-    for status, count in cred_rows:
-        cred_counts[status] = count
+    total_earned_usd = as_float(
+        (
+            await session.execute(
+                select(func.coalesce(func.sum(Transaction.advisor_payout_usd), 0))
+                .join(Booking, Booking.id == Transaction.booking_id)
+                .where(
+                    Booking.advisor_id == advisor_id,
+                    Transaction.status == TransactionStatus.succeeded,
+                    Transaction.is_archived.is_(False),
+                )
+            )
+        ).scalar_one()
+    )
 
-    earnings = await payment_service.get_advisor_earnings(session, advisor_id)
-    total_earned_usd = float(earnings["total_earned_usd"])  # type: ignore[arg-type]
+    credentials = list(
+        (
+            await session.execute(
+                select(AdvisorCredential)
+                .where(
+                    AdvisorCredential.user_id == advisor_id,
+                    AdvisorCredential.is_archived.is_(False),
+                )
+                .order_by(AdvisorCredential.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    pending_count = 0
+    verified_count = 0
+    documents: list[AdvisorCredentialRead] = []
+    for cred in credentials:
+        if cred.status == CredentialStatus.pending:
+            pending_count += 1
+        elif cred.status == CredentialStatus.verified:
+            verified_count += 1
+        doc = AdvisorCredentialRead.model_validate(cred)
+        doc.file_url = resolve_url(doc.file_url, settings)
+        documents.append(doc)
 
     expertise_codes = [c.country_code for c in profile.country_expertise]
     return AdvisorManagementDetailRead(
@@ -214,10 +261,10 @@ async def get_advisor_detail(
         verification_status=advisor.verification_status,
         is_suspended=bool(getattr(advisor, "is_suspended", False)),
         is_active=advisor.is_active,
-        session_count=total_sessions,
+        session_count=int(total_sessions),
         avg_rating=avg,
         review_count=review_count,
-        earnings=total_earned_usd,
+        earnings=round(total_earned_usd, 2),
         created_at=advisor.created_at,
         title=profile.title,
         timezone=profile.timezone,
@@ -235,9 +282,10 @@ async def get_advisor_detail(
             )
             for lang in profile.languages
         ],
-        completed_sessions=completed_sessions,
-        credentials_pending_count=cred_counts.get(CredentialStatus.pending, 0),
-        credentials_verified_count=cred_counts.get(CredentialStatus.verified, 0),
+        completed_sessions=int(completed_sessions),
+        credentials_pending_count=pending_count,
+        credentials_verified_count=verified_count,
+        documents=documents,
     )
 
 

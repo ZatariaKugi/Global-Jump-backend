@@ -10,6 +10,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.models.user import VerificationStatus
+from app.schemas.advisor_credential import AdvisorCredentialRead
 from app.schemas.advisor_profile import LanguageEntry
 from app.schemas.booking import BookingRead
 
@@ -63,6 +64,7 @@ class AdvisorManagementDetailRead(AdvisorManagementListRead):
     completed_sessions: int
     credentials_pending_count: int
     credentials_verified_count: int
+    documents: list[AdvisorCredentialRead] = Field(default_factory=list)
 
 
 class AdvisorSessionRead(BookingRead):

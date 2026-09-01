@@ -6,7 +6,7 @@ import uuid
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import ColumnElement, Select, exists, func, or_, select
+from sqlalchemy import ColumnElement, Select, delete, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -23,6 +23,7 @@ from app.models.notification import NotificationEntityType, NotificationType
 from app.models.seeker_document import (
     DocumentCategory,
     SeekerDocument,
+    SeekerDocumentAdvisorReview,
     SeekerDocumentComment,
     SeekerDocumentStatus,
 )
@@ -104,6 +105,13 @@ async def update_document(
         document.expires_at = None
     elif data.expires_at is not None:
         document.expires_at = data.expires_at
+        if document.status == SeekerDocumentStatus.expired:
+            # Seeker set a new future expiry without re-uploading (or before
+            # the file-replace block runs below).
+            document.status = SeekerDocumentStatus.under_review
+            document.reviewed_at = None
+            document.reviewed_by = None
+            await clear_advisor_reviews(session, document.id)
     if data.clear_visa_type:
         document.visa_type = None
     elif data.visa_type is not None:
@@ -116,6 +124,16 @@ async def update_document(
         document.status = SeekerDocumentStatus.under_review
         document.reviewed_at = None
         document.reviewed_by = None
+        await clear_advisor_reviews(session, document.id)
+        # A past expires_at would immediately flip the row back to expired (and the
+        # FE treats past expiry as expired even when status is under_review).
+        if (
+            data.expires_at is None
+            and not data.clear_expires_at
+            and document.expires_at is not None
+            and document.expires_at <= date.today()
+        ):
+            document.expires_at = None
     document.updated_by = actor_id
     session.add(document)
     await session.flush()
@@ -214,8 +232,10 @@ async def get_for_seeker(
 ) -> SeekerDocument:
     await refresh_expired_statuses(session, seeker_id)
     document = await session.get(SeekerDocument, document_id)
-    if document is None or document.seeker_id != seeker_id or document.is_archived:
+    if document is None or document.is_archived:
         raise NotFoundError("Document not found")
+    if document.seeker_id != seeker_id:
+        raise NotFoundError("Document does not belong to this user")
     return document
 
 
@@ -234,6 +254,7 @@ async def set_status(
     status: SeekerDocumentStatusUpdate,
     reviewer_id: uuid.UUID,
 ) -> SeekerDocument:
+    """Admin/global review — mutates the document row."""
     document.status = status.status
     document.reviewed_at = datetime.now(UTC)
     document.reviewed_by = reviewer_id
@@ -242,6 +263,188 @@ async def set_status(
     await session.flush()
     await session.refresh(document)
     return document
+
+
+def _review_stale_after_document_update(
+    document: SeekerDocument,
+    review: SeekerDocumentAdvisorReview,
+) -> bool:
+    """True when the file/metadata changed after this review (e.g. seeker re-uploaded)."""
+    if document.status != SeekerDocumentStatus.under_review:
+        return False
+    if document.updated_at is None:
+        return False
+    # Allow a small clock/skew window so a fresh approve/reject is not treated as stale.
+    return review.reviewed_at < document.updated_at - timedelta(seconds=2)
+
+
+def advisor_effective_status(
+    document: SeekerDocument,
+    review: SeekerDocumentAdvisorReview | None,
+) -> SeekerDocumentStatus:
+    """Status shown to a specific advisor (isolated from other advisors' reviews)."""
+    if document.status == SeekerDocumentStatus.expired:
+        return SeekerDocumentStatus.expired
+    if review is None:
+        return SeekerDocumentStatus.under_review
+    if _review_stale_after_document_update(document, review):
+        return SeekerDocumentStatus.under_review
+    return review.status
+
+
+def seeker_effective_status(
+    document: SeekerDocument,
+    reviews: list[SeekerDocumentAdvisorReview],
+) -> SeekerDocumentStatus:
+    """Status shown to the seeker — from advisor review rows only (not stale global)."""
+    if document.status == SeekerDocumentStatus.expired:
+        return SeekerDocumentStatus.expired
+    active = [r for r in reviews if not _review_stale_after_document_update(document, r)]
+    if any(r.status == SeekerDocumentStatus.rejected for r in active):
+        return SeekerDocumentStatus.rejected
+    if any(r.status == SeekerDocumentStatus.approved for r in active):
+        return SeekerDocumentStatus.approved
+    return SeekerDocumentStatus.under_review
+
+
+def _latest_review(
+    reviews: list[SeekerDocumentAdvisorReview],
+) -> SeekerDocumentAdvisorReview | None:
+    if not reviews:
+        return None
+    return max(reviews, key=lambda r: r.reviewed_at)
+
+
+async def reviews_by_document(
+    session: AsyncSession, document_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[SeekerDocumentAdvisorReview]]:
+    if not document_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(SeekerDocumentAdvisorReview).where(
+                SeekerDocumentAdvisorReview.document_id.in_(document_ids),
+                SeekerDocumentAdvisorReview.is_archived.is_(False),
+            )
+        )
+    ).scalars()
+    grouped: dict[uuid.UUID, list[SeekerDocumentAdvisorReview]] = defaultdict(list)
+    for row in rows:
+        grouped[row.document_id].append(row)
+    return grouped
+
+
+async def reviews_for_advisor(
+    session: AsyncSession,
+    document_ids: list[uuid.UUID],
+    advisor_id: uuid.UUID,
+) -> dict[uuid.UUID, SeekerDocumentAdvisorReview]:
+    if not document_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(SeekerDocumentAdvisorReview).where(
+                SeekerDocumentAdvisorReview.document_id.in_(document_ids),
+                SeekerDocumentAdvisorReview.advisor_id == advisor_id,
+                SeekerDocumentAdvisorReview.is_archived.is_(False),
+            )
+        )
+    ).scalars()
+    return {row.document_id: row for row in rows}
+
+
+async def clear_advisor_reviews(session: AsyncSession, document_id: uuid.UUID) -> None:
+    """Drop all advisor review rows for a document (file replace / reset to review)."""
+    await session.execute(
+        delete(SeekerDocumentAdvisorReview).where(
+            SeekerDocumentAdvisorReview.document_id == document_id,
+        )
+    )
+    await session.flush()
+
+
+async def set_advisor_review(
+    session: AsyncSession,
+    document: SeekerDocument,
+    status: SeekerDocumentStatusUpdate,
+    advisor_id: uuid.UUID,
+) -> SeekerDocumentAdvisorReview | None:
+    """Record this advisor's decision without changing global document status."""
+    now = datetime.now(UTC)
+    if status.status == SeekerDocumentStatus.under_review:
+        await clear_advisor_reviews(session, document.id)
+        return None
+
+    existing = (
+        await session.execute(
+            select(SeekerDocumentAdvisorReview).where(
+                SeekerDocumentAdvisorReview.document_id == document.id,
+                SeekerDocumentAdvisorReview.advisor_id == advisor_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if existing is None:
+        review = SeekerDocumentAdvisorReview(
+            document_id=document.id,
+            advisor_id=advisor_id,
+            status=status.status,
+            reviewed_at=now,
+            note=status.note,
+            created_by=advisor_id,
+            updated_by=advisor_id,
+        )
+    else:
+        review = existing
+        if review.is_archived:
+            review.unarchive(advisor_id)
+        review.status = status.status
+        review.reviewed_at = now
+        review.note = status.note
+        review.updated_by = advisor_id
+    session.add(review)
+    document.updated_by = advisor_id
+    session.add(document)
+    await session.flush()
+    await session.refresh(review)
+    await session.refresh(document)
+    return review
+
+
+async def is_advisor_portfolio_completed(
+    session: AsyncSession, seeker_id: uuid.UUID, advisor_id: uuid.UUID
+) -> bool:
+    """True when the seeker has ≥1 active doc and this advisor approved every one."""
+    docs = list(
+        (
+            await session.execute(
+                select(SeekerDocument).where(
+                    SeekerDocument.seeker_id == seeker_id,
+                    SeekerDocument.is_archived.is_(False),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not docs:
+        return False
+    reviews = await reviews_for_advisor(session, [d.id for d in docs], advisor_id)
+    return all(
+        advisor_effective_status(doc, reviews.get(doc.id)) == SeekerDocumentStatus.approved
+        for doc in docs
+    )
+
+
+async def assert_advisor_portfolio_editable(
+    session: AsyncSession, seeker_id: uuid.UUID, advisor_id: uuid.UUID
+) -> None:
+    """Block advisor review mutations once they have approved every document."""
+    if await is_advisor_portfolio_completed(session, seeker_id, advisor_id):
+        raise ConflictError(
+            "All documents are approved; this portfolio is locked",
+            code="portfolio_completed",
+        )
 
 
 async def is_portfolio_completed(session: AsyncSession, seeker_id: uuid.UUID) -> bool:
@@ -272,20 +475,53 @@ async def assert_portfolio_editable(session: AsyncSession, seeker_id: uuid.UUID)
 
 def _checklist_status_for_docs(
     docs: list[SeekerDocument],
+    reviews_by_doc: dict[uuid.UUID, list[SeekerDocumentAdvisorReview]],
 ) -> tuple[ChecklistItemStatus, uuid.UUID | None]:
     """Pick the best status for a required category from matching uploads."""
     if not docs:
         return "missing", None
-    approved = next((d for d in docs if d.status == SeekerDocumentStatus.approved), None)
+    approved = next(
+        (
+            d
+            for d in docs
+            if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+            == SeekerDocumentStatus.approved
+        ),
+        None,
+    )
     if approved is not None:
         return "approved", approved.id
-    reviewing = next((d for d in docs if d.status == SeekerDocumentStatus.under_review), None)
+    reviewing = next(
+        (
+            d
+            for d in docs
+            if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+            == SeekerDocumentStatus.under_review
+        ),
+        None,
+    )
     if reviewing is not None:
         return "under_review", reviewing.id
-    rejected = next((d for d in docs if d.status == SeekerDocumentStatus.rejected), None)
+    rejected = next(
+        (
+            d
+            for d in docs
+            if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+            == SeekerDocumentStatus.rejected
+        ),
+        None,
+    )
     if rejected is not None:
         return "rejected", rejected.id
-    expired = next((d for d in docs if d.status == SeekerDocumentStatus.expired), None)
+    expired = next(
+        (
+            d
+            for d in docs
+            if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+            == SeekerDocumentStatus.expired
+        ),
+        None,
+    )
     if expired is not None:
         return "expired", expired.id
     return "under_review", docs[0].id
@@ -294,21 +530,40 @@ def _checklist_status_for_docs(
 async def portfolio_summary(
     session: AsyncSession,
     seeker_id: uuid.UUID,
+    settings: Settings,
     visa_type: VisaType | None = None,
 ) -> DocumentPortfolioSummary:
     """Overview tallies + required-category checklist for the Documents page.
 
     Default (no ``visa_type``) is portfolio-wide. Progress is share of required
     categories that have ≥1 active file (any status except missing).
+    Also returns ``expiring_soon``: active docs whose ``expires_at`` falls within
+    the next 30 days (inclusive of today), sorted soonest-first and capped at 20.
     """
     await refresh_expired_statuses(session, seeker_id)
     stmt = list_by_seeker_stmt(seeker_id, visa_type=visa_type)
     docs = list((await session.execute(stmt)).scalars().all())
+    reviews_by_doc = await reviews_by_document(session, [d.id for d in docs])
 
     total = len(docs)
-    approved = sum(1 for d in docs if d.status == SeekerDocumentStatus.approved)
-    under_review = sum(1 for d in docs if d.status == SeekerDocumentStatus.under_review)
-    rejected = sum(1 for d in docs if d.status == SeekerDocumentStatus.rejected)
+    approved = sum(
+        1
+        for d in docs
+        if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+        == SeekerDocumentStatus.approved
+    )
+    under_review = sum(
+        1
+        for d in docs
+        if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+        == SeekerDocumentStatus.under_review
+    )
+    rejected = sum(
+        1
+        for d in docs
+        if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
+        == SeekerDocumentStatus.rejected
+    )
 
     by_category: dict[DocumentCategory, list[SeekerDocument]] = defaultdict(list)
     for doc in docs:
@@ -318,7 +573,9 @@ async def portfolio_summary(
     missing = 0
     filled = 0
     for category in REQUIRED_CHECKLIST:
-        status, document_id = _checklist_status_for_docs(by_category.get(category, []))
+        status, document_id = _checklist_status_for_docs(
+            by_category.get(category, []), reviews_by_doc
+        )
         if status == "missing":
             missing += 1
         else:
@@ -335,6 +592,11 @@ async def portfolio_summary(
     required_n = len(REQUIRED_CHECKLIST)
     progress_percent = int(round(100 * filled / required_n)) if required_n else 0
 
+    expiring_soon_docs = await _expiring_soon_docs(session, seeker_id, visa_type=visa_type)
+    expiring_soon = await build_reads(
+        session, expiring_soon_docs, settings, include_unread=True
+    )
+
     return DocumentPortfolioSummary(
         total=total,
         approved=approved,
@@ -343,7 +605,35 @@ async def portfolio_summary(
         rejected=rejected,
         progress_percent=progress_percent,
         checklist=checklist,
+        expiring_soon=expiring_soon,
     )
+
+
+EXPIRING_SOON_WINDOW_DAYS = 30
+EXPIRING_SOON_MAX_ITEMS = 20
+
+
+async def _expiring_soon_docs(
+    session: AsyncSession,
+    seeker_id: uuid.UUID,
+    *,
+    visa_type: VisaType | None = None,
+) -> list[SeekerDocument]:
+    """Active docs expiring in the next ``EXPIRING_SOON_WINDOW_DAYS`` days.
+
+    Future-only (``expires_at`` >= today), sorted soonest-first, capped at
+    ``EXPIRING_SOON_MAX_ITEMS``. Same visa scope as the rest of the summary
+    (untagged docs included when ``visa_type`` is set).
+    """
+    today = date.today()
+    cutoff = today + timedelta(days=EXPIRING_SOON_WINDOW_DAYS)
+    stmt = list_by_seeker_stmt(seeker_id, visa_type=visa_type).where(
+        SeekerDocument.expires_at.is_not(None),
+        SeekerDocument.expires_at >= today,
+        SeekerDocument.expires_at <= cutoff,
+    )
+    stmt = stmt.order_by(SeekerDocument.expires_at.asc()).limit(EXPIRING_SOON_MAX_ITEMS)
+    return list((await session.execute(stmt)).scalars().all())
 
 
 async def add_comment(
@@ -465,6 +755,9 @@ def build_read(
     *,
     comments_count: int = 0,
     has_unread_comments: bool = False,
+    status: SeekerDocumentStatus | None = None,
+    reviewed_at: datetime | None = None,
+    reviewed_by: uuid.UUID | None = None,
 ) -> SeekerDocumentRead:
     return SeekerDocumentRead(
         id=document.id,
@@ -474,11 +767,11 @@ def build_read(
         file_url=resolve_url(document.file_url, settings),
         file_size_bytes=document.file_size_bytes,
         content_type=document.content_type,
-        status=document.status,
+        status=status if status is not None else document.status,
         expires_at=document.expires_at,
         visa_type=parse_visa_type(document.visa_type),
-        reviewed_at=document.reviewed_at,
-        reviewed_by=document.reviewed_by,
+        reviewed_at=reviewed_at if reviewed_at is not None else document.reviewed_at,
+        reviewed_by=reviewed_by if reviewed_by is not None else document.reviewed_by,
         created_at=document.created_at,
         comments_count=comments_count,
         has_unread_comments=has_unread_comments,
@@ -491,6 +784,7 @@ async def build_reads(
     settings: Settings,
     *,
     include_unread: bool = False,
+    advisor_id: uuid.UUID | None = None,
 ) -> list[SeekerDocumentRead]:
     counts = await comment_counts_for_documents(session, [d.id for d in documents])
     unread = (
@@ -498,15 +792,43 @@ async def build_reads(
         if include_unread
         else {d.id: False for d in documents}
     )
-    return [
-        build_read(
-            d,
-            settings,
-            comments_count=counts.get(d.id, 0),
-            has_unread_comments=unread.get(d.id, False),
-        )
-        for d in documents
-    ]
+    reviews: dict[uuid.UUID, SeekerDocumentAdvisorReview] = {}
+    seeker_reviews: dict[uuid.UUID, list[SeekerDocumentAdvisorReview]] = {}
+    if documents:
+        if advisor_id is not None:
+            reviews = await reviews_for_advisor(session, [d.id for d in documents], advisor_id)
+        else:
+            seeker_reviews = await reviews_by_document(session, [d.id for d in documents])
+    reads: list[SeekerDocumentRead] = []
+    for d in documents:
+        if advisor_id is not None:
+            review = reviews.get(d.id)
+            reads.append(
+                build_read(
+                    d,
+                    settings,
+                    comments_count=counts.get(d.id, 0),
+                    has_unread_comments=unread.get(d.id, False),
+                    status=advisor_effective_status(d, review),
+                    reviewed_at=review.reviewed_at if review is not None else None,
+                    reviewed_by=review.advisor_id if review is not None else None,
+                )
+            )
+        else:
+            doc_reviews = seeker_reviews.get(d.id, [])
+            latest = _latest_review(doc_reviews)
+            reads.append(
+                build_read(
+                    d,
+                    settings,
+                    comments_count=counts.get(d.id, 0),
+                    has_unread_comments=unread.get(d.id, False),
+                    status=seeker_effective_status(d, doc_reviews),
+                    reviewed_at=latest.reviewed_at if latest is not None else None,
+                    reviewed_by=latest.advisor_id if latest is not None else None,
+                )
+            )
+    return reads
 
 
 async def build_read_enriched(
@@ -515,17 +837,38 @@ async def build_read_enriched(
     settings: Settings,
     *,
     include_unread: bool = False,
+    advisor_id: uuid.UUID | None = None,
 ) -> SeekerDocumentRead:
     counts = await comment_counts_for_documents(session, [document.id])
     unread = False
     if include_unread:
         flags = await unread_comment_flags(session, [document])
         unread = flags.get(document.id, False)
+    review: SeekerDocumentAdvisorReview | None = None
+    if advisor_id is not None:
+        reviews = await reviews_for_advisor(session, [document.id], advisor_id)
+        review = reviews.get(document.id)
+        return build_read(
+            document,
+            settings,
+            comments_count=counts.get(document.id, 0),
+            has_unread_comments=unread,
+            status=advisor_effective_status(document, review),
+            reviewed_at=review.reviewed_at if review is not None else None,
+            reviewed_by=review.advisor_id if review is not None else None,
+        )
+    doc_reviews = list(
+        (await reviews_by_document(session, [document.id])).get(document.id, [])
+    )
+    latest = _latest_review(doc_reviews)
     return build_read(
         document,
         settings,
         comments_count=counts.get(document.id, 0),
         has_unread_comments=unread,
+        status=seeker_effective_status(document, doc_reviews),
+        reviewed_at=latest.reviewed_at if latest is not None else None,
+        reviewed_by=latest.advisor_id if latest is not None else None,
     )
 
 
@@ -584,41 +927,60 @@ def _portfolio_has_docs_clause() -> ColumnElement[bool]:
     )
 
 
+def _advisor_approved_review_exists() -> ColumnElement[bool]:
+    return exists(
+        select(SeekerDocumentAdvisorReview.id).where(
+            SeekerDocumentAdvisorReview.document_id == SeekerDocument.id,
+            SeekerDocumentAdvisorReview.advisor_id == Booking.advisor_id,
+            SeekerDocumentAdvisorReview.is_archived.is_(False),
+            SeekerDocumentAdvisorReview.status == SeekerDocumentStatus.approved,
+        )
+    )
+
+
+def _advisor_rejected_review_exists() -> ColumnElement[bool]:
+    return exists(
+        select(SeekerDocumentAdvisorReview.id).where(
+            SeekerDocumentAdvisorReview.document_id == SeekerDocument.id,
+            SeekerDocumentAdvisorReview.advisor_id == Booking.advisor_id,
+            SeekerDocumentAdvisorReview.is_archived.is_(False),
+            SeekerDocumentAdvisorReview.status == SeekerDocumentStatus.rejected,
+        )
+    )
+
+
 def _portfolio_completed_clause() -> ColumnElement[bool]:
-    """Seeker has ≥1 doc and none under_review/rejected (all approved)."""
+    """Seeker has ≥1 doc and this booking's advisor approved every one."""
     has_open = exists(
-        select(SeekerDocument.id).where(
+        select(SeekerDocument.id)
+        .where(
             SeekerDocument.seeker_id == Booking.seeker_id,
             SeekerDocument.is_archived.is_(False),
-            SeekerDocument.status.in_(
-                (
-                    SeekerDocumentStatus.under_review,
-                    SeekerDocumentStatus.rejected,
-                    SeekerDocumentStatus.expired,
-                )
+            or_(
+                SeekerDocument.status == SeekerDocumentStatus.expired,
+                ~_advisor_approved_review_exists(),
             ),
         )
+        .correlate(Booking)
     )
     return _portfolio_has_docs_clause() & ~has_open
 
 
 def _portfolio_rejected_clause() -> ColumnElement[bool]:
-    """Seeker has ≥1 doc, none under_review, and every doc is rejected."""
-    has_under_review = exists(
-        select(SeekerDocument.id).where(
-            SeekerDocument.seeker_id == Booking.seeker_id,
-            SeekerDocument.is_archived.is_(False),
-            SeekerDocument.status == SeekerDocumentStatus.under_review,
-        )
-    )
+    """Seeker has ≥1 doc and this booking's advisor rejected every one."""
     has_non_rejected = exists(
-        select(SeekerDocument.id).where(
+        select(SeekerDocument.id)
+        .where(
             SeekerDocument.seeker_id == Booking.seeker_id,
             SeekerDocument.is_archived.is_(False),
-            SeekerDocument.status != SeekerDocumentStatus.rejected,
+            or_(
+                SeekerDocument.status == SeekerDocumentStatus.expired,
+                ~_advisor_rejected_review_exists(),
+            ),
         )
+        .correlate(Booking)
     )
-    return _portfolio_has_docs_clause() & ~has_under_review & ~has_non_rejected
+    return _portfolio_has_docs_clause() & ~has_non_rejected
 
 
 def list_customer_documents_stmt(
@@ -668,39 +1030,59 @@ async def build_customer_document_rows(
     }
     photos = await booking_service.seeker_photo_keys(session, set(seeker_ids))
 
-    doc_rows = (
-        await session.execute(
-            select(
-                SeekerDocument.seeker_id,
-                SeekerDocument.status,
-                func.count(),
-                func.max(SeekerDocument.updated_at),
+    docs = list(
+        (
+            await session.execute(
+                select(SeekerDocument).where(
+                    SeekerDocument.seeker_id.in_(seeker_ids),
+                    SeekerDocument.is_archived.is_(False),
+                )
             )
-            .where(
-                SeekerDocument.seeker_id.in_(seeker_ids),
-                SeekerDocument.is_archived.is_(False),
-            )
-            .group_by(SeekerDocument.seeker_id, SeekerDocument.status)
         )
-    ).all()
-
-    counts: dict[uuid.UUID, dict[str, int]] = defaultdict(
-        lambda: {"total": 0, "under_review": 0, "approved": 0, "rejected": 0}
+        .scalars()
+        .all()
     )
+    docs_by_seeker: dict[uuid.UUID, list[SeekerDocument]] = defaultdict(list)
+    for doc in docs:
+        docs_by_seeker[doc.seeker_id].append(doc)
+
+    advisor_ids = {b.advisor_id for b in bookings}
+    reviews_by_doc_advisor: dict[tuple[uuid.UUID, uuid.UUID], SeekerDocumentAdvisorReview] = {}
+    if docs:
+        reviews = (
+            await session.execute(
+                select(SeekerDocumentAdvisorReview).where(
+                    SeekerDocumentAdvisorReview.document_id.in_([d.id for d in docs]),
+                    SeekerDocumentAdvisorReview.advisor_id.in_(advisor_ids),
+                    SeekerDocumentAdvisorReview.is_archived.is_(False),
+                )
+            )
+        ).scalars()
+        reviews_by_doc_advisor = {
+            (review.document_id, review.advisor_id): review for review in reviews
+        }
+
+    counts: dict[tuple[uuid.UUID, uuid.UUID], dict[str, int]] = {}
     latest_doc_at: dict[uuid.UUID, datetime] = {}
-    for seeker_id, status, n, max_updated in doc_rows:
-        bucket = counts[seeker_id]
-        bucket["total"] += int(n)
-        if status == SeekerDocumentStatus.under_review:
-            bucket["under_review"] += int(n)
-        elif status == SeekerDocumentStatus.approved:
-            bucket["approved"] += int(n)
-        elif status == SeekerDocumentStatus.rejected:
-            bucket["rejected"] += int(n)
-        if max_updated is not None:
-            prev = latest_doc_at.get(seeker_id)
-            if prev is None or max_updated > prev:
-                latest_doc_at[seeker_id] = max_updated
+    for seeker_id, advisor_id in {(b.seeker_id, b.advisor_id) for b in bookings}:
+        pair = (seeker_id, advisor_id)
+        bucket = {"total": 0, "under_review": 0, "approved": 0, "rejected": 0}
+        for doc in docs_by_seeker.get(seeker_id, []):
+            bucket["total"] += 1
+            effective = advisor_effective_status(
+                doc, reviews_by_doc_advisor.get((doc.id, advisor_id))
+            )
+            if effective == SeekerDocumentStatus.under_review:
+                bucket["under_review"] += 1
+            elif effective == SeekerDocumentStatus.approved:
+                bucket["approved"] += 1
+            elif effective == SeekerDocumentStatus.rejected:
+                bucket["rejected"] += 1
+            if doc.updated_at is not None:
+                prev = latest_doc_at.get(seeker_id)
+                if prev is None or doc.updated_at > prev:
+                    latest_doc_at[seeker_id] = doc.updated_at
+        counts[pair] = bucket
 
     rows: list[CustomerDocumentsRowRead] = []
     notice_map = await booking_service.notice_hours_by_advisor(
@@ -710,7 +1092,10 @@ async def build_customer_document_rows(
         seeker = seekers.get(booking.seeker_id)
         if seeker is None:
             continue
-        tallies = counts[booking.seeker_id]
+        tallies = counts.get(
+            (booking.seeker_id, booking.advisor_id),
+            {"total": 0, "under_review": 0, "approved": 0, "rejected": 0},
+        )
         status = _row_documents_status(
             tallies["total"],
             tallies["under_review"],
@@ -743,3 +1128,36 @@ async def build_customer_document_rows(
             )
         )
     return rows
+
+
+async def notify_seeker_of_document_status_update(
+    session: AsyncSession,
+    document: SeekerDocument,
+    advisor: User,
+    status: str,
+    note: str | None = None,
+) -> None:
+    """In-app + FCM outbox for an advisor updating document status. Caller sends email separately."""
+    advisor_name = advisor.full_name or "Your advisor"
+    status_capitalized = status.capitalize()
+    
+    body = f'{advisor_name} {status} your document "{document.document_name}"'
+    if note:
+        preview = " ".join(note.split())
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        body = f"{body}: {preview}"
+    if len(body) > 1000:
+        body = body[:997] + "..."
+        
+    await notification_service.notify(
+        session,
+        user_id=document.seeker_id,
+        type=NotificationType.document_status_updated,
+        title=f"Document {status_capitalized}",
+        body=body,
+        entity_type=NotificationEntityType.seeker_document,
+        entity_id=document.id,
+        actor_id=advisor.id,
+    )
+

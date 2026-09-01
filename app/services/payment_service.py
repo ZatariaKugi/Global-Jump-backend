@@ -6,6 +6,7 @@ import csv
 import io
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 import stripe
 import structlog
@@ -17,6 +18,7 @@ from sqlalchemy.orm import aliased
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError
 from app.core.file_storage import resolve_media_url
+from app.core.money import as_float, money_sum
 from app.models.advisor_profile import AdvisorProfile
 from app.models.booking import Booking, BookingStatus, PaymentStatus
 from app.models.notification import NotificationEntityType, NotificationType
@@ -44,6 +46,8 @@ from app.services import (
 )
 
 log = structlog.get_logger()
+
+STRIPE_STANDARD_DASHBOARD_URL = "https://dashboard.stripe.com"
 
 
 async def _notify_payment(
@@ -226,7 +230,6 @@ async def create_checkout_session(
     # connected account later, after the hold window — see run_due_transfers. The
     # platform keeps commission + withheld tax on its own balance.
     checkout_session = await stripe.checkout.Session.create_async(
-        payment_method_types=["card"],
         line_items=[
             {
                 "price_data": {
@@ -244,6 +247,7 @@ async def create_checkout_session(
         success_url=f"{settings.FRONTEND_URL}/bookings/{booking_id}?payment=success",
         cancel_url=f"{settings.FRONTEND_URL}/bookings/{booking_id}?payment=cancelled",
         metadata={"booking_id": str(booking_id)},
+        managed_payments={"enabled": False},
     )
 
     txn = Transaction(
@@ -387,6 +391,8 @@ def _stripe_get(obj: object, key: str, default: object = None) -> object:
 
 async def _handle_checkout_completed(session: AsyncSession, cs: object, settings: Settings) -> None:
     session_id = str(_stripe_get(cs, "id") or "")
+    log.info("webhook_checkout_started", session_id=session_id)
+    
     txn_result = await session.execute(
         select(Transaction).where(Transaction.stripe_checkout_session_id == session_id)
     )
@@ -394,6 +400,15 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
     if txn is None:
         log.warning("webhook_checkout_no_txn", session_id=session_id)
         return
+    
+    log.info(
+        "webhook_checkout_txn_found",
+        session_id=session_id,
+        txn_id=str(txn.id),
+        current_status=txn.status.value,
+        booking_id=str(txn.booking_id),
+    )
+    
     # Idempotent against duplicate webhook delivery — Stripe may deliver the same
     # event more than once. If we've already processed this checkout, do nothing
     # (re-running would re-arm the hold and re-send the receipt).
@@ -452,10 +467,21 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
         booking.payment_status = PaymentStatus.paid
         if booking.paid_at is None:
             booking.paid_at = datetime.now(UTC)
+        if booking.status == BookingStatus.pending:
+            booking.status = BookingStatus.confirmed
+            booking.confirmed_at = datetime.now(UTC)
         session.add(booking)
 
     await session.flush()
-    log.info("payment_succeeded", booking_id=str(txn.booking_id), amount_usd=txn.amount_usd)
+    
+    log.info(
+        "payment_succeeded_db_updated",
+        booking_id=str(txn.booking_id),
+        amount_usd=txn.amount_usd,
+        txn_status=txn.status.value,
+        booking_payment_status=booking.payment_status.value if booking else None,
+        invoice_number=txn.invoice_number,
+    )
 
     if booking is not None:
         seeker = await session.get(User, booking.seeker_id)
@@ -503,6 +529,30 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
             body=f"Your client paid ${txn.amount_usd:.2f} for {booking.service_type}",
             actor_id=booking.seeker_id,
         )
+        # Notify advisor of the new booking request only after payment is confirmed
+        from app.models.notification import NotificationEntityType
+
+        await notification_service.notify(
+            session,
+            user_id=booking.advisor_id,
+            type=NotificationType.booking_requested,
+            title="New consultation request",
+            body=f"Payment received for {booking.service_type}",
+            entity_type=NotificationEntityType.booking,
+            entity_id=booking.id,
+            actor_id=booking.seeker_id,
+        )
+        if booking.status == BookingStatus.confirmed:
+            await notification_service.notify(
+                session,
+                user_id=booking.seeker_id,
+                type=NotificationType.booking_confirmed,
+                title="Booking confirmed",
+                body=f"Your {booking.service_type} session has been confirmed",
+                entity_type=NotificationEntityType.booking,
+                entity_id=booking.id,
+                actor_id=booking.advisor_id,
+            )
         await booking_meeting_service.maybe_provision_meeting(session, booking, settings)
     await _log_event(session, txn.id, TransactionEventType.receipt_sent)
     await _log_event(session, txn.id, TransactionEventType.closed)
@@ -528,6 +578,19 @@ async def _handle_checkout_expired(session: AsyncSession, cs: object) -> None:
     await _log_event(session, txn.id, TransactionEventType.closed)
     booking = await session.get(Booking, txn.booking_id)
     if booking is not None:
+        # If the booking is still pending (advisor hasn't accepted), cancel it
+        # to release the slot. If the advisor already accepted (confirmed), keep
+        # the booking so the seeker can retry payment.
+        if booking.status == BookingStatus.pending:
+            booking.status = BookingStatus.cancelled
+            booking.cancellation_reason = "Payment failed — checkout expired"
+            session.add(booking)
+            await _log_event(session, txn.id, TransactionEventType.failed)
+            log.info(
+                "booking_cancelled_payment_failed",
+                booking_id=str(booking.id),
+                session_id=session_id,
+            )
         await _notify_payment(
             session,
             txn,
@@ -536,6 +599,19 @@ async def _handle_checkout_expired(session: AsyncSession, cs: object) -> None:
             title="Checkout expired",
             body=f"Your payment for {booking.service_type} was not completed",
         )
+        # Notify advisor if they were already notified of the request
+        if booking.status == BookingStatus.cancelled:
+            from app.services import notification_service
+
+            await notification_service.notify(
+                session,
+                user_id=booking.advisor_id,
+                type=NotificationType.booking_cancelled,
+                title="Consultation request cancelled",
+                body="The consultation request was cancelled due to a failed payment",
+                entity_type=NotificationEntityType.booking,
+                entity_id=booking.id,
+            )
     await session.flush()
     log.info("checkout_expired", session_id=session_id)
 
@@ -554,9 +630,9 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
     refunded_amount_usd = (
         round(int(amount_refunded_cents) / 100, 2)
         if isinstance(amount_refunded_cents, (int, float))
-        else txn.amount_usd
+        else as_float(txn.amount_usd)
     )
-    is_full = refunded_amount_usd >= txn.amount_usd
+    is_full = refunded_amount_usd >= as_float(txn.amount_usd)
 
     # Idempotent against duplicate webhook delivery and against an admin-initiated
     # refund that already moved the row (refund_transaction sets these same fields):
@@ -564,7 +640,7 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
     # Only proceed when this event reflects *more* refunded than we've recorded
     # (e.g. a genuine partial→larger escalation from the dashboard); otherwise the
     # refund is already accounted for — don't re-notify the seeker or re-log events.
-    already_refunded = txn.refunded_amount_usd or 0.0
+    already_refunded = as_float(txn.refunded_amount_usd)
     if (
         txn.status
         in (
@@ -621,13 +697,13 @@ async def _refund_transaction_record(
     if txn.transfer_status in (TransferStatus.completed, TransferStatus.failed):
         raise AppError("The refund window has closed for this payment", code="refund_window_closed")
 
-    refund_amount = amount_usd if amount_usd is not None else txn.amount_usd
-    if refund_amount > txn.amount_usd:
+    refund_amount = as_float(amount_usd if amount_usd is not None else txn.amount_usd)
+    if refund_amount > as_float(txn.amount_usd):
         raise AppError(
             "Refund amount cannot exceed the transaction amount", code="refund_amount_too_large"
         )
-    already_refunded = txn.refunded_amount_usd or 0.0
-    if already_refunded + refund_amount > txn.amount_usd:
+    already_refunded = as_float(txn.refunded_amount_usd)
+    if already_refunded + refund_amount > as_float(txn.amount_usd):
         raise AppError(
             "Refund would exceed total transaction amount", code="refund_amount_too_large"
         )
@@ -706,16 +782,17 @@ async def auto_refund_booking_if_paid(
     actor_id: uuid.UUID,
     reason: str | None,
     settings: Settings,
-) -> None:
+) -> Decimal | None:
     """Best-effort full refund when a paid booking is rejected or cancelled.
 
     Failures are logged but do not block the booking state transition — admin can
     refund manually from the Payments screen if the window has closed.
+    Returns the refunded amount if successful, None otherwise.
     """
     if booking.payment_status != PaymentStatus.paid:
-        return
+        return None
     try:
-        await refund_booking_payment(
+        txn = await refund_booking_payment(
             session,
             booking.id,
             actor_id,
@@ -730,8 +807,19 @@ async def auto_refund_booking_if_paid(
             code=code,
             detail=str(exc),
         )
+        return None
+    except stripe.StripeError as exc:
+        # Must not abort cancel/reject — Zoom teardown and status change still need to commit.
+        log.warning(
+            "booking_auto_refund_failed",
+            booking_id=str(booking.id),
+            code="stripe_error",
+            detail=str(exc),
+        )
+        return None
     else:
         log.info("booking_auto_refunded", booking_id=str(booking.id), actor_id=str(actor_id))
+        return Decimal(str(txn.refunded_amount_usd)) if txn.refunded_amount_usd else None
 
 
 async def refund_transaction(
@@ -950,7 +1038,61 @@ async def create_connect_account(
         payouts_enabled=profile.stripe_payouts_enabled,
         onboarding_complete=profile.stripe_details_submitted and profile.stripe_charges_enabled,
         onboarding_url=account_link.url,
+        account_type="express",
     )
+
+
+async def create_stripe_dashboard_url(
+    session: AsyncSession,
+    advisor_user_id: uuid.UUID,
+    settings: Settings,
+) -> str:
+    """Return a URL the advisor can open to manage payouts in Stripe.
+
+    Express connected accounts receive a single-use Express Dashboard login link.
+    Standard (OAuth) accounts are sent to the public Stripe Dashboard — they sign
+    in with their own Stripe credentials there.
+    """
+    _init_stripe(settings)
+    profile = await _get_advisor_profile(session, advisor_user_id)
+    if not profile.stripe_account_id:
+        raise NotFoundError("No Stripe account connected")
+
+    account = await stripe.Account.retrieve_async(profile.stripe_account_id)
+    account_type = _stripe_get(account, "type", None)
+    if account_type == "express":
+        try:
+            login_link = await stripe.Account.create_login_link_async(profile.stripe_account_id)
+        except stripe.StripeError as exc:
+            raise AppError(
+                "Unable to open your Stripe dashboard. Please try again.",
+                code="stripe_dashboard_unavailable",
+            ) from exc
+        url = getattr(login_link, "url", None)
+        if not isinstance(url, str) or not url:
+            raise AppError(
+                "Unable to open your Stripe dashboard. Please try again.",
+                code="stripe_dashboard_unavailable",
+            )
+        return url
+
+    return STRIPE_STANDARD_DASHBOARD_URL
+
+
+async def disconnect_connect_account(
+    session: AsyncSession,
+    advisor_user_id: uuid.UUID,
+) -> None:
+    """Clear the advisor's linked Stripe Connect account from the platform."""
+    profile = await _get_advisor_profile(session, advisor_user_id)
+    profile.stripe_account_id = None
+    profile.stripe_charges_enabled = False
+    profile.stripe_payouts_enabled = False
+    profile.stripe_details_submitted = False
+    zoom_connection_service.sync_stripe_connect_flag(profile)
+    session.add(profile)
+    await session.commit()
+    log.info("stripe_connect_disconnected", advisor_id=str(advisor_user_id))
 
 
 async def get_connect_status(
@@ -976,11 +1118,14 @@ async def get_connect_status(
     session.add(profile)
     await session.flush()
 
+    account_type = _stripe_get(account, "type", None)
+
     return AdvisorConnectStatus(
         stripe_account_id=profile.stripe_account_id,
         charges_enabled=profile.stripe_charges_enabled,
         payouts_enabled=profile.stripe_payouts_enabled,
         onboarding_complete=profile.stripe_details_submitted and profile.stripe_charges_enabled,
+        account_type=account_type if isinstance(account_type, str) else None,
     )
 
 
@@ -991,18 +1136,16 @@ async def get_advisor_earnings(
     result = await session.execute(list_for_advisor_stmt(advisor_user_id))
     txns = list(result.scalars().all())
 
-    total_earned = sum(
-        (t.advisor_payout_usd for t in txns if t.status == TransactionStatus.succeeded),
-        0.0,
+    total_earned = money_sum(
+        t.advisor_payout_usd for t in txns if t.status == TransactionStatus.succeeded
     )
-    total_commission = sum(
-        (t.commission_usd for t in txns if t.status == TransactionStatus.succeeded),
-        0.0,
+    total_commission = money_sum(
+        t.commission_usd for t in txns if t.status == TransactionStatus.succeeded
     )
 
     return {
-        "total_earned_usd": round(float(total_earned), 2),
-        "total_commission_paid_usd": round(float(total_commission), 2),
+        "total_earned_usd": round(total_earned, 2),
+        "total_commission_paid_usd": round(total_commission, 2),
         "transactions": txns,
     }
 
@@ -1139,29 +1282,14 @@ async def build_invoice(
         from_address = getattr(settings, "INVOICE_FROM_ADDRESS", None)
         line_items = [
             InvoiceLineItem(
-                description="Platform Charges",
+                description=booking.service_type,
                 quantity=1,
-                unit_price_usd=txn.commission_usd,
-                total_usd=txn.commission_usd,
-            ),
-            InvoiceLineItem(
-                description="Consultant Fee",
-                quantity=1,
-                unit_price_usd=txn.advisor_payout_usd,
-                total_usd=txn.advisor_payout_usd,
-            ),
-        ]
-        if txn.tax_usd and txn.tax_usd > 0:
-            line_items.append(
-                InvoiceLineItem(
-                    description="Tax",
-                    quantity=1,
-                    unit_price_usd=txn.tax_usd,
-                    total_usd=txn.tax_usd,
-                )
+                unit_price_usd=txn.amount_usd,
+                total_usd=txn.amount_usd,
             )
-        subtotal = round(txn.commission_usd + txn.advisor_payout_usd, 2)
-        tax = txn.tax_usd
+        ]
+        subtotal = txn.amount_usd
+        tax = 0.0
         total = txn.amount_usd
 
     return InvoiceRead(
@@ -1263,8 +1391,6 @@ async def seeker_payment_read(
         ),
         service_type=booking.service_type,
         created_at=txn.created_at,
-        platform_fee_usd=txn.commission_usd,
-        consultant_fee_usd=txn.advisor_payout_usd,
         amount_usd=txn.amount_usd,
         total_amount=txn.amount_usd,
         status=txn.status,
@@ -1285,8 +1411,6 @@ _SEEKER_CSV_HEADERS = (
     "Advisor Email",
     "Services",
     "Date",
-    "Platform Fee",
-    "Consultant Fee",
     "Total Amount",
     "Status",
 )
@@ -1326,8 +1450,6 @@ async def export_seeker_history_csv(
                 row.advisor_email or "",
                 row.service_type,
                 row.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                f"{row.platform_fee_usd:.2f}",
-                f"{row.consultant_fee_usd:.2f}",
                 f"{row.total_amount:.2f}",
                 row.display_status,
             ]
@@ -1357,25 +1479,26 @@ async def seeker_payment_summary(
     stmt = stmt.order_by(Transaction.created_at.desc())
 
     rows = list((await session.execute(stmt)).scalars().all())
-    total_paid = 0.0
-    pending_amount = 0.0
-    refund_amount = 0.0
+    total_paid = Decimal("0")
+    pending_amount = Decimal("0")
+    refund_amount = Decimal("0")
     for t in rows:
+        amount = Decimal(str(t.amount_usd))
         if t.status in (TransactionStatus.succeeded, TransactionStatus.partially_refunded):
-            total_paid += t.amount_usd
+            total_paid += amount
         if t.status == TransactionStatus.pending:
-            pending_amount += t.amount_usd
+            pending_amount += amount
         if t.status in (TransactionStatus.refunded, TransactionStatus.partially_refunded):
             if t.refunded_amount_usd is not None:
-                refund_amount += t.refunded_amount_usd
+                refund_amount += Decimal(str(t.refunded_amount_usd))
             elif t.status == TransactionStatus.refunded:
-                refund_amount += t.amount_usd
+                refund_amount += amount
     last = rows[0] if rows else None
     return SeekerPaymentSummaryRead(
-        total_paid_usd=round(total_paid, 2),
-        pending_amount_usd=round(pending_amount, 2),
-        refund_amount_usd=round(refund_amount, 2),
-        last_transaction_usd=round(last.amount_usd, 2) if last else None,
+        total_paid_usd=float(round(total_paid, 2)),
+        pending_amount_usd=float(round(pending_amount, 2)),
+        refund_amount_usd=float(round(refund_amount, 2)),
+        last_transaction_usd=float(round(Decimal(str(last.amount_usd)), 2)) if last else None,
     )
 
 

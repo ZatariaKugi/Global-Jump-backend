@@ -22,7 +22,7 @@ from app.models.visa_type import VisaType
 from app.schemas.assessment import AdvisorMatchRead
 from app.services import advisor_matching_service, advisor_profile_service, review_service
 from app.services.advisor_profile_service import build_match_reasons
-from app.services.ai_advisor_match_service import SeekerMatchCase
+from app.services.ai_advisor_match_service import AiMatchFailure, SeekerMatchCase
 
 PROFILE_CONTEXT = "profile"
 
@@ -139,14 +139,14 @@ async def refresh_for_seeker(
     *,
     settings: Settings | None = None,
     use_ai: bool = True,
-) -> list[SeekerAdvisorRecommendation]:
+) -> tuple[list[SeekerAdvisorRecommendation], AiMatchFailure | None, bool]:
     """Recompute hybrid matches from profile intent and persist them."""
     case = await advisor_matching_service.build_profile_match_case(session, seeker_id)
     if case is None:
         await clear_for_seeker(session, seeker_id)
-        return []
+        return [], None, False
 
-    ranked, _total = await advisor_matching_service.match_from_context(
+    ranked, _total, ai_failure = await advisor_matching_service.match_from_context(
         session,
         case,
         limit=500,
@@ -155,7 +155,8 @@ async def refresh_for_seeker(
         settings=settings,
         use_ai=use_ai,
     )
-    return await replace_from_matches(session, case, ranked, actor_id=seeker_id)
+    rows = await replace_from_matches(session, case, ranked, actor_id=seeker_id)
+    return rows, ai_failure, use_ai
 
 
 async def ensure_for_seeker(
@@ -165,8 +166,11 @@ async def ensure_for_seeker(
     destination: str,
     visa_type: str,
     settings: Settings | None = None,
-) -> list[SeekerAdvisorRecommendation]:
-    """Return saved profile rows for the current intent, refreshing when missing/stale."""
+) -> tuple[list[SeekerAdvisorRecommendation], AiMatchFailure | None, bool]:
+    """Return saved profile rows for the current intent, refreshing when missing/stale.
+
+    The third value is True when a live refresh (and optional AI re-rank) ran.
+    """
     existing = await list_for_seeker(
         session,
         seeker_id,
@@ -174,9 +178,10 @@ async def ensure_for_seeker(
         visa_type=visa_type,
     )
     if existing:
-        return existing
+        return existing, None, False
 
-    return await refresh_for_seeker(session, seeker_id, settings=settings)
+    rows, ai_failure, attempted = await refresh_for_seeker(session, seeker_id, settings=settings)
+    return rows, ai_failure, attempted
 
 
 async def as_match_reads(
@@ -233,6 +238,8 @@ async def as_match_reads(
                 match_reasons=rec.match_reasons,
                 rule_score=rec.rule_score,
                 ai_score=rec.ai_score,
+                visa_specializations=[s.specialization for s in (profile.visa_specializations or [])] if profile is not None else None,
+                country_expertise=[c.country_code for c in (profile.country_expertise or [])] if profile is not None else None,
             )
         )
     return reads
@@ -246,19 +253,25 @@ async def matches_for_dashboard(
     visa_type: VisaType | None = None,
     country: str | None = None,
     limit: int = 10,
-) -> list[AdvisorMatchRead]:
+) -> tuple[list[AdvisorMatchRead], AiMatchFailure | None, bool]:
     """Dashboard ``matched_advisors`` from ``seeker_advisor_recommendations``.
 
     Refreshes the profile cache on a full miss. Query ``visa_type`` / ``country``
     filter saved rows; they never pull AI Assessment matches.
+
+    The third value is True when a live refresh (and optional AI re-rank) ran.
     """
+    ai_failure: AiMatchFailure | None = None
+    ai_attempted = False
     existing = await list_for_seeker(session, seeker_id)
     if not existing:
-        existing = await refresh_for_seeker(session, seeker_id, settings=settings)
+        existing, ai_failure, ai_attempted = await refresh_for_seeker(
+            session, seeker_id, settings=settings
+        )
     recs = existing
     if country is not None:
         dest = country.upper()
         recs = [r for r in recs if r.destination_country == dest]
     if visa_type is not None:
         recs = [r for r in recs if r.visa_type == visa_type.value]
-    return await as_match_reads(session, recs[:limit], settings)
+    return await as_match_reads(session, recs[:limit], settings), ai_failure, ai_attempted

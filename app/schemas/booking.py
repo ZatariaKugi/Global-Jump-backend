@@ -28,6 +28,13 @@ class BookingCreate(BaseModel):
     service_type: AdvisorServiceType
     scheduled_start: datetime
     seeker_note: str | None = Field(default=None, max_length=1000)
+    timezone: str | None = Field(
+        default=None,
+        description=(
+            "IANA timezone of the user (e.g. 'Asia/Karachi'). If scheduled_start "
+            "is naive, it is treated as local to this timezone and converted to UTC."
+        ),
+    )
 
 
 class AdvisorBookingCreate(BaseModel):
@@ -66,6 +73,7 @@ class ClientRead(BaseModel):
     status: BookingStatus | None = None
     # From the latest booking — drives Clients-table bookmark / red-dot.
     is_important: bool = False
+    is_unread: bool = False
 
 
 class BookingReschedule(BaseModel):
@@ -111,10 +119,12 @@ class BookingRead(BaseModel):
     scheduled_end: datetime
     status: BookingStatus
     payment_status: PaymentStatus
+    completed_at: datetime | None = None
     cancellation_reason: str | None
     seeker_note: str | None
     deal_later_at: datetime | None
     is_important: bool
+    is_unread: bool = False
     interpreter_name: str | None
     interpreter_contact: str | None
     interpreter_language: str | None

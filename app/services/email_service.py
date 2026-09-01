@@ -15,7 +15,9 @@ import io
 import pathlib
 from collections.abc import Coroutine
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from aiosmtplib.errors import SMTPException
 from fastapi import UploadFile
@@ -32,6 +34,27 @@ logger = get_logger(__name__)
 
 # Keep strong refs until background sends finish (asyncio only weak-refs tasks).
 _background_email_tasks: set[asyncio.Task[None]] = set()
+
+
+def _format_user_time(
+    utc_dt: datetime,
+    user_timezone: str | None,
+    fmt: str = "%A, %d %B %Y at %I:%M %p",
+) -> str:
+    """Format a UTC datetime in the user's local timezone.
+
+    Falls back to UTC if user_timezone is None or invalid.
+    Uses 12-hour format with AM/PM for user-friendly display.
+    """
+    if user_timezone:
+        try:
+            tz = ZoneInfo(user_timezone)
+            local_dt = utc_dt.astimezone(tz)
+            return local_dt.strftime(fmt)
+        except (ValueError, KeyError):
+            pass
+    # Fallback to UTC with 12-hour format
+    return utc_dt.astimezone(UTC).strftime(fmt)
 
 
 def schedule_email(coro: Coroutine[Any, Any, None]) -> None:
@@ -554,6 +577,7 @@ async def send_booking_confirmation_email(
     price_usd: float,
     notice_hours: int,
     settings: Settings,
+    user_timezone: str | None = None,
 ) -> None:
     """Booking confirmation with a ``booking.ics`` calendar attachment."""
     ctx = {
@@ -561,7 +585,7 @@ async def send_booking_confirmation_email(
         "full_name": full_name or to,
         "other_party": other_party,
         "service_type": service_type,
-        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "start_str": _format_user_time(start_utc, user_timezone),
         "duration_minutes": duration_minutes,
         "price_usd": f"{price_usd:.2f}",
         "notice_hours": notice_hours,
@@ -640,6 +664,7 @@ async def send_booking_meeting_email(
     passcode: str | None,
     is_host: bool,
     settings: Settings,
+    user_timezone: str | None = None,
 ) -> None:
     """Send Zoom join (seeker) or start (advisor host) link after meeting is provisioned."""
     ctx = {
@@ -647,7 +672,7 @@ async def send_booking_meeting_email(
         "full_name": full_name or to,
         "other_party": other_party,
         "service_type": service_type,
-        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "start_str": _format_user_time(start_utc, user_timezone),
         "duration_minutes": duration_minutes,
         "meeting_url": meeting_url,
         "passcode": passcode,
@@ -706,6 +731,7 @@ async def send_new_consultation_request_email(
     service_type: str,
     start_utc: datetime,
     settings: Settings,
+    user_timezone: str | None = None,
 ) -> None:
     """Notify an advisor that a new consultation request is awaiting accept/reject."""
     ctx = {
@@ -713,7 +739,7 @@ async def send_new_consultation_request_email(
         "full_name": full_name or to,
         "other_party": other_party,
         "service_type": service_type,
-        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "start_str": _format_user_time(start_utc, user_timezone),
         "year": datetime.now(UTC).year,
     }
 
@@ -763,6 +789,7 @@ async def send_booking_rejected_email(
     start_utc: datetime,
     reason: str | None,
     settings: Settings,
+    user_timezone: str | None = None,
 ) -> None:
     """Notify a seeker that their consultation request was declined."""
     ctx: dict[str, object] = {
@@ -770,7 +797,7 @@ async def send_booking_rejected_email(
         "full_name": full_name or to,
         "other_party": other_party,
         "service_type": service_type,
-        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "start_str": _format_user_time(start_utc, user_timezone),
         "reason": reason,
         "year": datetime.now(UTC).year,
     }
@@ -824,6 +851,7 @@ async def send_booking_rescheduled_email(
     price_usd: float,
     notice_hours: int,
     settings: Settings,
+    user_timezone: str | None = None,
 ) -> None:
     """Notify a party that a consultation was rescheduled (updated ``booking.ics`` attached)."""
     ctx = {
@@ -831,7 +859,7 @@ async def send_booking_rescheduled_email(
         "full_name": full_name or to,
         "other_party": other_party,
         "service_type": service_type,
-        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "start_str": _format_user_time(start_utc, user_timezone),
         "duration_minutes": duration_minutes,
         "price_usd": f"{price_usd:.2f}",
         "notice_hours": notice_hours,
@@ -909,6 +937,8 @@ async def send_booking_cancelled_email(
     reason: str | None,
     cancelled_by: str | None = None,
     settings: Settings,
+    user_timezone: str | None = None,
+    refund_amount_usd: Decimal | None = None,
 ) -> None:
     """Notify a party that a consultation was cancelled."""
     ctx: dict[str, object] = {
@@ -916,9 +946,10 @@ async def send_booking_cancelled_email(
         "full_name": full_name or to,
         "other_party": other_party,
         "service_type": service_type,
-        "start_str": start_utc.astimezone(UTC).strftime("%A, %d %B %Y at %H:%M"),
+        "start_str": _format_user_time(start_utc, user_timezone),
         "reason": reason,
         "cancelled_by": cancelled_by,
+        "refund_amount_usd": refund_amount_usd,
         "year": datetime.now(UTC).year,
     }
 
@@ -1129,6 +1160,201 @@ async def send_booking_note_added_email(
     except (ConnectionErrors, OSError, SMTPException) as exc:
         logger.warning(
             "booking_note_added_failed_smtp_unavailable",
+            to=to,
+            booking_id=booking_id,
+            error=str(exc),
+        )
+
+
+async def send_document_comment_email(
+    to: str,
+    full_name: str,
+    advisor_name: str,
+    document_name: str,
+    *,
+    comment_preview: str,
+    document_id: str,
+    settings: Settings,
+) -> None:
+    """Notify the seeker that an advisor commented on a portfolio document."""
+    documents_url = f"{settings.FRONTEND_URL.rstrip('/')}/seeker/documents?comment={document_id}"
+    preview = " ".join(comment_preview.split())
+    if len(preview) > 120:
+        preview = preview[:117] + "..."
+    ctx: dict[str, object] = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "advisor_name": advisor_name,
+        "document_name": document_name,
+        "preview": preview,
+        "documents_url": documents_url,
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info(
+            "document_comment_issued [no smtp — logged]",
+            to=to,
+            document_id=document_id,
+        )
+        return
+
+    message = _build_message(
+        subject=f"New comment on your document – {settings.EMAILS_FROM_NAME}",
+        recipients=[to],
+        body=_render("document_comment.html", ctx, settings),
+        subtype=MessageType.html,
+        alternative_body=_render("document_comment.txt", ctx, settings),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            "List-Unsubscribe": f"<mailto:{settings.EMAILS_FROM}?subject=unsubscribe>",
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
+        return
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("document_comment_sent", to=to, document_id=document_id)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "document_comment_failed_smtp_unavailable",
+            to=to,
+            document_id=document_id,
+            error=str(exc),
+        )
+
+
+async def send_document_status_email(
+    to: str,
+    full_name: str,
+    advisor_name: str,
+    document_name: str,
+    *,
+    status: str,
+    note: str | None,
+    document_id: str,
+    settings: Settings,
+) -> None:
+    """Notify the seeker that an advisor updated their document's status."""
+    documents_url = f"{settings.FRONTEND_URL.rstrip('/')}/seeker/documents"
+    
+    status_capitalized = status.capitalize()
+    if status == "approved":
+        subject = f"Document approved — {settings.EMAILS_FROM_NAME}"
+    elif status == "rejected":
+        subject = f"Document rejected — {settings.EMAILS_FROM_NAME}"
+    else:
+        subject = f"Document status updated — {settings.EMAILS_FROM_NAME}"
+
+    preview = None
+    if note:
+        preview = " ".join(note.split())
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+            
+    ctx: dict[str, object] = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "advisor_name": advisor_name,
+        "document_name": document_name,
+        "status": status,
+        "status_capitalized": status_capitalized,
+        "note": preview,
+        "documents_url": documents_url,
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info(
+            "document_status_email_issued [no smtp — logged]",
+            to=to,
+            document_id=document_id,
+        )
+        return
+
+    message = _build_message(
+        subject=subject,
+        recipients=[to],
+        body=_render("document_status_updated.html", ctx, settings),
+        subtype=MessageType.html,
+        alternative_body=_render("document_status_updated.txt", ctx, settings),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
+        return
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("document_status_email_sent", to=to, document_id=document_id)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "document_status_email_failed_smtp_unavailable",
+            to=to,
+            document_id=document_id,
+            error=str(exc),
+        )
+
+
+async def send_document_requested_email(
+    to: str,
+    full_name: str,
+    advisor_name: str,
+    description: str | None,
+    *,
+    booking_id: str,
+    settings: Settings,
+) -> None:
+    """Notify the seeker that an advisor requested a document for a booking."""
+    booking_url = f"{settings.FRONTEND_URL.rstrip('/')}/bookings/{booking_id}"
+
+    ctx: dict[str, object] = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "advisor_name": advisor_name,
+        "description": description,
+        "booking_url": booking_url,
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info(
+            "document_requested_email_issued [no smtp — logged]",
+            to=to,
+            booking_id=booking_id,
+        )
+        return
+
+    message = _build_message(
+        subject=f"Document requested — {settings.EMAILS_FROM_NAME}",
+        recipients=[to],
+        body=_render("document_requested.html", ctx, settings),
+        subtype=MessageType.html,
+        alternative_body=_render("document_requested.txt", ctx, settings),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
+        return
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("document_requested_email_sent", to=to, booking_id=booking_id)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "document_requested_email_failed_smtp_unavailable",
             to=to,
             booking_id=booking_id,
             error=str(exc),

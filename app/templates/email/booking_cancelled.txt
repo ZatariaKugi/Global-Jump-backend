@@ -7,6 +7,10 @@ The following consultation has been cancelled{% if cancelled_by %} by {{ cancell
   Was scheduled:  {{ start_str }} (UTC)
 {% if reason %}  Reason:         {{ reason }}
 {% endif %}
+{% if refund_amount_usd is not none %}
+A refund of ${{ "%.2f"|format(refund_amount_usd) }} has been issued to your original payment method.
+It may take 5-10 business days to appear on your statement.
+{% endif %}
 You can book a new consultation any time from your {{ app_name }} dashboard.
 
 — The {{ app_name }} Team

@@ -8,7 +8,7 @@ zero-fills chart buckets and maps the already-limited activity rows.
 
 from __future__ import annotations
 
-from collections import defaultdict
+import asyncio
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -39,6 +39,12 @@ _GROSS_STATUSES = (
     TransactionStatus.succeeded,
     TransactionStatus.partially_refunded,
     TransactionStatus.refunded,
+)
+
+# Paid rows only — fully refunded charges are excluded from the platform/advisor split.
+_REVENUE_BREAKDOWN_STATUSES = (
+    TransactionStatus.succeeded,
+    TransactionStatus.partially_refunded,
 )
 
 _HOME_ACTIVITY_LIMIT = 6
@@ -133,23 +139,6 @@ def _trend_from_counts(
     return _monthly_points_from_counts(counts, since, all_time=days is None)
 
 
-def _bucket_service_type(service_type: str) -> str:
-    """Case-insensitive substring match, checked in this order (a value could
-    contain both — "review" wins since document-review is more specific):
-      contains "review"  -> "Document Review"
-      contains "consult" -> "Advisor"
-      otherwise           -> "Platform"
-    None of today's literal service_type values collide, but this ordering
-    is deliberate for future values like "consultation_with_review".
-    """
-    s = service_type.lower()
-    if "review" in s:
-        return "Document Review"
-    if "consult" in s:
-        return "Advisor"
-    return "Platform"
-
-
 # ── Dashboard summary ────────────────────────────────────────────────────────
 
 
@@ -157,8 +146,21 @@ async def get_dashboard_summary(
     session: AsyncSession, days: int | None = None
 ) -> DashboardSummaryRead:
     since = _dashboard_since(days)
-    stats = await _user_stat_counts(session, since)
-    revenue_today_usd = await _revenue_today_usd(session)
+    (
+        stats,
+        revenue_today_usd,
+        user_registration_trend,
+        ai_assessment_volume,
+        revenue_breakdown,
+        recent_activities,
+    ) = await asyncio.gather(
+        _user_stat_counts(session, since),
+        _revenue_today_usd(session),
+        _user_registration_trend(session, since, days),
+        _ai_assessment_volume(session, since, days),
+        _revenue_breakdown(session, since),
+        get_recent_activities(session, days, limit=_HOME_ACTIVITY_LIMIT),
+    )
     return DashboardSummaryRead(
         window_days=days,
         total_users=stats["total_users"],
@@ -168,10 +170,10 @@ async def get_dashboard_summary(
         verified_advisors=stats["verified_advisors"],
         active_advisors=stats["active_advisors"],
         revenue_today_usd=revenue_today_usd,
-        user_registration_trend=await _user_registration_trend(session, since, days),
-        ai_assessment_volume=await _ai_assessment_volume(session, since, days),
-        revenue_breakdown=await _revenue_breakdown(session, since),
-        recent_activities=await get_recent_activities(session, days, limit=_HOME_ACTIVITY_LIMIT),
+        user_registration_trend=user_registration_trend,
+        ai_assessment_volume=ai_assessment_volume,
+        revenue_breakdown=revenue_breakdown,
+        recent_activities=recent_activities,
     )
 
 
@@ -180,8 +182,9 @@ async def _user_stat_counts(session: AsyncSession, since: datetime | None) -> di
     seeker = User.role == UserRole.seeker
     advisor = User.role == UserRole.advisor
     approved = User.verification_status == VerificationStatus.approved
+    non_admin = User.role != UserRole.admin
     stmt = select(
-        func.count().label("total_users"),
+        func.coalesce(func.sum(case((non_admin, 1), else_=0)), 0).label("total_users"),
         func.coalesce(func.sum(case((seeker, 1), else_=0)), 0).label("total_seekers"),
         func.coalesce(
             func.sum(case((seeker & User.email_verified_at.is_not(None), 1), else_=0)),
@@ -232,11 +235,14 @@ async def _grouped_timestamp_counts(
     since: datetime | None,
     *,
     daily: bool,
+    where: Any | None = None,
 ) -> dict[str, int]:
     parts = _period_parts(column, daily=daily)
     stmt = select(*parts, func.count())
     if since is not None:
         stmt = stmt.where(column >= since)
+    if where is not None:
+        stmt = stmt.where(where)
     stmt = stmt.group_by(*parts)
     counts: dict[str, int] = {}
     for *bucket, count in (await session.execute(stmt)).all():
@@ -247,10 +253,15 @@ async def _grouped_timestamp_counts(
 async def _user_registration_trend(
     session: AsyncSession, since: datetime | None, days: int | None
 ) -> list[MonthlyCountPoint]:
-    """ALL users regardless of role (seeker+advisor combined) — the mockup
-    shows one line with no role split."""
+    """Non-admin users (seeker+advisor combined) — the mockup shows one line
+    with no role split. Admins are excluded to stay consistent with the stat
+    cards (which count total_users as non-admin)."""
     counts = await _grouped_timestamp_counts(
-        session, User.created_at, since, daily=days == 7 and since is not None
+        session,
+        User.created_at,
+        since,
+        daily=days == 7 and since is not None,
+        where=User.role != UserRole.admin,
     )
     return _trend_from_counts(counts, since, days)
 
@@ -270,17 +281,21 @@ async def _ai_assessment_volume(
 async def _revenue_breakdown(
     session: AsyncSession, since: datetime | None
 ) -> list[RevenueBreakdownSliceRead]:
-    stmt = (
-        select(Booking.service_type, func.coalesce(func.sum(Transaction.amount_usd), 0.0))
-        .join(Booking, Booking.id == Transaction.booking_id)
-        .where(Transaction.status.in_(_GROSS_STATUSES))
-        .group_by(Booking.service_type)
-    )
+    """Platform vs advisor share of gross booking revenue (commission+tax vs payout)."""
+    stmt = select(
+        func.coalesce(
+            func.sum(Transaction.commission_usd + Transaction.tax_usd),
+            0.0,
+        ),
+        func.coalesce(func.sum(Transaction.advisor_payout_usd), 0.0),
+    ).where(Transaction.status.in_(_REVENUE_BREAKDOWN_STATUSES))
     if since is not None:
         stmt = stmt.where(Transaction.created_at >= since)
-    totals: dict[str, float] = defaultdict(float)
-    for service_type, amount_usd in (await session.execute(stmt)).all():
-        totals[_bucket_service_type(service_type)] += float(amount_usd)
+    platform_total, advisor_total = (await session.execute(stmt)).one()
+    totals = {
+        "Platform": float(platform_total),
+        "Advisors": float(advisor_total),
+    }
     grand_total = sum(totals.values())
     if grand_total <= 0:
         return []
@@ -290,8 +305,8 @@ async def _revenue_breakdown(
             amount_usd=round(amount, 2),
             pct=round(100.0 * amount / grand_total, 2),
         )
-        for label, amount in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
-        if amount > 0  # omit empty buckets — no 0% wedge, matches how a real donut renders
+        for label, amount in (("Platform", totals["Platform"]), ("Advisors", totals["Advisors"]))
+        if amount > 0
     ]
 
 

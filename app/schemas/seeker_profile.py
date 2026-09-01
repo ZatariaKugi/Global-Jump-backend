@@ -6,13 +6,56 @@ import uuid
 from datetime import date, datetime
 from typing import Annotated
 
-from pydantic import AfterValidator, BaseModel, Field, field_validator
+from pydantic import (
+    AfterValidator,
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from app.core.countries import SUPPORTED_COUNTRY_CODES, country_code, is_supported_country
-from app.core.visa_types import OptionalVisaType, RequiredVisaType
+from app.core.visa_types import OptionalVisaType, RequiredVisaType, parse_visa_type
 from app.models.seeker_profile import EducationLevel, EmploymentStatus
+from app.schemas.assessment import AdvisorMatchRead, AiMatchStatusRead
 
 CountryCode = Annotated[str, Field(min_length=2, max_length=2)]
+LanguageName = Annotated[str, Field(min_length=1, max_length=100)]
+ServiceTypeSlug = Annotated[str, Field(min_length=1, max_length=100)]
+
+
+def _expand_comma_separated_list(value: object) -> object:
+    """Accept a string, or a list that may contain comma-joined items.
+
+    FE sometimes sends ``["English, Spanish"]`` or ``"English, Spanish"`` —
+    normalize to ``["English", "Spanish"]``.
+    """
+    if value is None:
+        return value
+    if isinstance(value, str):
+        return [p.strip() for p in value.split(",") if p.strip()]
+    if isinstance(value, list):
+        out: list[object] = []
+        seen: set[str] = set()
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                parts = [p.strip() for p in item.split(",") if p.strip()]
+            else:
+                parts = [item]
+            for part in parts:
+                key = str(part).strip().casefold()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append(part.strip() if isinstance(part, str) else part)
+        return out
+    return value
+
 
 
 def _require_supported_destination(value: str) -> str:
@@ -23,6 +66,25 @@ def _require_supported_destination(value: str) -> str:
             f"{', '.join(SUPPORTED_COUNTRY_CODES)}"
         )
     return code
+
+
+def _resolve_destination_code(value: str) -> str:
+    code = country_code(value)
+    if code is None:
+        raise ValueError(f"Unrecognized country: {value!r}")
+    if not is_supported_country(code):
+        raise ValueError(
+            f"Unsupported destination {value!r}; must be one of "
+            f"{', '.join(SUPPORTED_COUNTRY_CODES)}"
+        )
+    return code
+
+
+def _resolve_visa_slug(value: str) -> str:
+    parsed = parse_visa_type(value)
+    if parsed is None:
+        raise ValueError(f"Unrecognized visa type: {value!r}")
+    return parsed.value
 
 
 SupportedDestinationCode = Annotated[
@@ -37,6 +99,8 @@ class PriorVisa(BaseModel):
 
 
 class SeekerProfileUpdate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
     date_of_birth: date | None = None
     nationality: CountryCode | None = None
     country_of_residence: CountryCode | None = None
@@ -44,14 +108,31 @@ class SeekerProfileUpdate(BaseModel):
     banner_url: str | None = None
     phone: str | None = Field(default=None, max_length=40)
     timezone: str | None = Field(default=None, max_length=50)
+    preferred_languages: list[LanguageName] | None = None
+    # Legacy singular field still sent by the current profile editor.
     preferred_language: str | None = Field(default=None, max_length=100)
     about: str | None = Field(default=None, max_length=2000)
+    # Multi-value intent (preferred). Singular fields kept as legacy aliases.
+    intended_visa_types: list[RequiredVisaType] | None = None
     intended_visa_type: OptionalVisaType = None
+    intended_destinations: list[str] | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "intended_destinations",
+            "intendedDestinations",
+            "destination_country_ids",
+            "destinationCountryIds",
+            "countries",  # same table as GET intended_destinations
+        ),
+    )
     intended_destination: SupportedDestinationCode | None = None
     passport_number: str | None = Field(default=None, min_length=5, max_length=20)
     passport_expiry: date | None = None
     countries_visited: list[CountryCode] | None = None
     prior_visas: list[PriorVisa] | None = None
+    needed_services: list[ServiceTypeSlug] | None = None
+    # Alias accepted from onboarding FE drafts.
+    service_ids: list[ServiceTypeSlug] | None = None
     education_level: EducationLevel | None = None
     employment_status: EmploymentStatus | None = None
     employer_name: str | None = Field(default=None, max_length=255)
@@ -59,63 +140,186 @@ class SeekerProfileUpdate(BaseModel):
     has_bank_statements: bool | None = None
     email_notifications: bool | None = None
 
+    @model_validator(mode="after")
+    def _normalize_multi_fields(self) -> SeekerProfileUpdate:
+        if self.preferred_languages is None and self.preferred_language is not None:
+            parts = [p.strip() for p in self.preferred_language.split(",")]
+            self.preferred_languages = [p for p in parts if p]
+        elif self.preferred_languages is not None:
+            # Expand any remaining comma-joined entries inside the list.
+            expanded = _expand_comma_separated_list(self.preferred_languages)
+            self.preferred_languages = (
+                list(expanded) if isinstance(expanded, list) else self.preferred_languages
+            )
+
+        if self.intended_visa_types is None and self.intended_visa_type is not None:
+            self.intended_visa_types = [self.intended_visa_type]
+        if self.intended_destinations is None and self.intended_destination is not None:
+            self.intended_destinations = [self.intended_destination]
+
+        # Prefer service_ids when needed_services omitted or empty (FE onboarding draft).
+        if not self.needed_services and self.service_ids:
+            self.needed_services = list(self.service_ids)
+
+        # Keep singular mirrors in sync with the first multi value when arrays are set.
+        if self.intended_visa_types is not None:
+            self.intended_visa_type = (
+                self.intended_visa_types[0] if self.intended_visa_types else None
+            )
+        if self.intended_destinations is not None:
+            self.intended_destination = (
+                self.intended_destinations[0] if self.intended_destinations else None
+            )
+        return self
+
+    @field_validator("intended_destinations", mode="before")
+    @classmethod
+    def _coerce_destinations(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return [stripped] if stripped else []
+        return value
+
+    @field_validator("intended_destinations")
+    @classmethod
+    def _resolve_destinations(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            code = _resolve_destination_code(str(item))
+            if code in seen:
+                continue
+            seen.add(code)
+            resolved.append(code)
+        return resolved
+
+    @field_validator("intended_visa_types", mode="before")
+    @classmethod
+    def _coerce_visa_types(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return [stripped] if stripped else []
+        return value
+
+    @field_validator("preferred_languages", "needed_services", "service_ids", mode="before")
+    @classmethod
+    def _coerce_string_lists(cls, value: object) -> object:
+        return _expand_comma_separated_list(value)
+
 
 class OnboardingSubmit(BaseModel):
     """Single-shot payload POSTed by the frontend at the final onboarding wizard step.
 
-    The frontend collects data across all wizard steps in browser storage and
-    POSTs this once at the end.  Fields map to wizard screens:
+    Multi-value fields (preferred):
 
-      Step 1 – visa intent         → intended_visa_type
-      Step 2 – destination country → intended_destination (accepts a full country name or a
-                                      2-letter code; resolved to the ISO code server-side)
-      Step 3 – finance             → annual_income_band
-      Step 4 – travel history      → countries_visited (self-reported band, e.g. "1-2
-                                      countries" — not a list of actual countries)
-      Step 5 – AI assessment       → matching_opportunities (categories selected on the
-                                      "Matching you with suitable opportunities" screen);
-                                      AI suggestions are generated from steps 1-5 and
-                                      returned in the response
-      Steps 5/6 (optional, user may skip) → employment_status, education_level, nationality
-                                      (nationality accepts a full country name or a 2-letter
-                                      code, same as intended_destination)
+      intended_visa_types / intended_visa_type
+      intended_destinations / intended_destination
+      preferred_languages / preferred_language
+      services / service_ids / needed_services
+
+    Singular fields remain accepted for backward compatibility and are expanded
+    into one-item lists when the plural form is omitted.
     """
 
-    # Step 1
-    intended_visa_type: RequiredVisaType
-    # Step 2 — full country name (e.g. "Japan") or 2-letter code; normalised to the code below
-    intended_destination: str = Field(min_length=2, max_length=100)
-    # Step 3
+    intended_visa_types: list[RequiredVisaType] = Field(default_factory=list, max_length=20)
+    intended_visa_type: RequiredVisaType | None = None
+    intended_destinations: list[str] = Field(default_factory=list, max_length=20)
+    intended_destination: str | None = Field(default=None, min_length=2, max_length=100)
     annual_income_band: str = Field(min_length=1, max_length=50)
-    # Step 4 — self-reported travel-history band, free text (e.g. "Traveled to 1-2 countries",
-    # "Never traveled outside my home country"); not linked to the profile's actual
-    # list of visited countries, which is set separately via PATCH /users/me/profile
     countries_visited: str = Field(default="", max_length=100)
-    # Step 5 — opportunity categories selected on the AI assessment "matching" screen,
-    # e.g. ["visa_type", "interest", "finance", "travel_history", "documentation"]
-    matching_opportunities: list[Annotated[str, Field(min_length=1, max_length=100)]] = Field(
-        default_factory=list, max_length=20
-    )
-    # Steps 5-6 (optional — user may skip) — full country name (e.g. "Pakistan") or 2-letter
-    # code; normalised to the code below
+    preferred_languages: list[LanguageName] = Field(default_factory=list, max_length=20)
+    preferred_language: str | None = Field(default=None, max_length=100)
+    services: list[ServiceTypeSlug] = Field(default_factory=list, max_length=20)
+    service_ids: list[ServiceTypeSlug] = Field(default_factory=list, max_length=20)
     nationality: str | None = Field(default=None, min_length=2, max_length=100)
     country_of_residence: str | None = Field(default=None, min_length=2, max_length=100)
     education_level: EducationLevel | None = None
     employment_status: EmploymentStatus | None = None
     employer_name: str | None = Field(default=None, max_length=255)
 
+    @model_validator(mode="after")
+    def _normalize_onboarding_lists(self) -> OnboardingSubmit:
+        if not self.preferred_languages and self.preferred_language:
+            # Support both a single value and a legacy comma-joined string.
+            parts = [p.strip() for p in self.preferred_language.split(",")]
+            self.preferred_languages = [p for p in parts if p]
+        elif self.preferred_languages:
+            expanded = _expand_comma_separated_list(self.preferred_languages)
+            self.preferred_languages = (
+                list(expanded) if isinstance(expanded, list) else self.preferred_languages
+            )
+
+        if not self.intended_visa_types and self.intended_visa_type is not None:
+            self.intended_visa_types = [self.intended_visa_type]
+        if not self.intended_destinations and self.intended_destination:
+            self.intended_destinations = [self.intended_destination]
+        # FE sends service_ids; keep services in sync even when services=[] was defaulted.
+        if not self.services and self.service_ids:
+            self.services = list(self.service_ids)
+        elif not self.service_ids and self.services:
+            self.service_ids = list(self.services)
+
+        if not self.intended_visa_types:
+            raise ValueError("At least one intended visa type is required")
+        if not self.intended_destinations:
+            raise ValueError("At least one intended destination is required")
+
+        # Primary mirrors for legacy columns / matching primary case.
+        self.intended_visa_type = self.intended_visa_types[0]
+        self.intended_destination = self.intended_destinations[0]
+
+        return self
+
+    @field_validator("intended_destinations", mode="before")
+    @classmethod
+    def _coerce_destinations(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return [stripped] if stripped else []
+        return value
+
+    @field_validator("intended_destinations")
+    @classmethod
+    def _resolve_destinations(cls, value: list[str]) -> list[str]:
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            code = _resolve_destination_code(item)
+            if code in seen:
+                continue
+            seen.add(code)
+            resolved.append(code)
+        return resolved
+
     @field_validator("intended_destination")
     @classmethod
-    def _resolve_intended_destination(cls, value: str) -> str:
-        code = country_code(value)
-        if code is None:
-            raise ValueError(f"Unrecognized country: {value!r}")
-        if not is_supported_country(code):
-            raise ValueError(
-                f"Unsupported destination {value!r}; must be one of "
-                f"{', '.join(SUPPORTED_COUNTRY_CODES)}"
-            )
-        return code
+    def _resolve_intended_destination(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _resolve_destination_code(value)
+
+    @field_validator("intended_visa_types", mode="before")
+    @classmethod
+    def _coerce_visa_types(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return [stripped] if stripped else []
+        return value
+
+    @field_validator("intended_visa_types")
+    @classmethod
+    def _resolve_visa_types(cls, value: list[object]) -> list[str]:
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            slug = _resolve_visa_slug(str(item))
+            if slug in seen:
+                continue
+            seen.add(slug)
+            resolved.append(slug)
+        return resolved
 
     @field_validator("nationality")
     @classmethod
@@ -137,25 +341,37 @@ class OnboardingSubmit(BaseModel):
             raise ValueError(f"Unrecognized country: {value!r}")
         return code
 
+    @field_validator(
+        "preferred_languages",
+        "services",
+        "service_ids",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_string_list(cls, value: object) -> object:
+        """Accept a bare string, comma-joined string, or list with joined items."""
+        return _expand_comma_separated_list(value)
+
 
 class SeekerProfileRead(BaseModel):
     id: uuid.UUID
     user_id: uuid.UUID
+    email: EmailStr | None = None
     date_of_birth: date | None
     nationality: str | None
-    country_of_residence: str | None
     profile_photo_url: str | None
     banner_url: str | None
     phone: str | None
     timezone: str | None
-    preferred_language: str | None
+    preferred_languages: list[str] = Field(default_factory=list)
     about: str | None
-    intended_visa_type: OptionalVisaType
-    intended_destination: str | None
+    intended_visa_types: list[str] = Field(default_factory=list)
+    intended_destinations: list[str] = Field(default_factory=list)
     passport_number_masked: str | None = None
     passport_expiry: date | None
     countries_visited: list[str]
     prior_visas: list[PriorVisa]
+    service_ids: list[str] = Field(default_factory=list)
     education_level: EducationLevel | None
     employment_status: EmploymentStatus | None
     employer_name: str | None
@@ -164,9 +380,10 @@ class SeekerProfileRead(BaseModel):
     email_notifications: bool
     created_at: datetime
     updated_at: datetime
+    ai_match: AiMatchStatusRead | None = None
 
 
 class OnboardingCompleteRead(SeekerProfileRead):
-    """Onboarding response — the profile plus Step 5 AI-generated suggestions."""
+    """Onboarding response — saved profile plus matched advisors."""
 
-    ai_suggestions: list[str] = Field(default_factory=list)
+    matched_advisors: list[AdvisorMatchRead] = Field(default_factory=list)

@@ -1,30 +1,31 @@
 """AI advisor matching — ranked shortlist for seekers (PRD §3.4.3).
 
 Hybrid pipeline:
-1. Hard gate — approved/active advisors with destination-country expertise.
-   Visa-only matches (same visa, different country) are excluded.
-2. Rule score — country + visa + language + availability + experience + price
-   (+ rating on visa).
+1. Hard gate — approved/active advisors with destination-country expertise
+   AND matching visa specialization. Country-only or visa-only matches are
+   excluded.
+2. Rule score — destination 25 + visa 25 + language 15 + services 15 +
+   experience 10 + rating 10 (admin-configurable; defaults sum to 100).
 3. AI re-rank — OpenAI reorders the top rule-scored pool and blends scores.
-   If OpenAI is unavailable, pure rule ranking is kept.
-
-Ranking preference among eligible advisors:
-1. Country + visa (best combo)
-2. Country only (still eligible, lower score)
+   When ``use_ai=True`` and OpenAI fails, rule/weight-based ranking is kept and
+   failure metadata is returned for the API layer.
 """
 
 from __future__ import annotations
 
-import re
 import uuid
+from collections.abc import Sequence
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.core.visa_types import parse_visa_type
-from app.models.advisor_availability import AdvisorWeeklySlot
-from app.models.advisor_profile import AdvisorProfile
+from app.models.advisor_profile import (
+    AdvisorCountryExpertise,
+    AdvisorProfile,
+    AdvisorVisaSpecialization,
+)
 from app.models.assessment import Assessment, AssessmentStatus
 from app.models.seeker_profile import SeekerProfile
 from app.models.user import User, UserRole, VerificationStatus
@@ -34,23 +35,31 @@ from app.services.advisor_profile_service import starting_price_usd
 from app.services.advisor_search_service import apply_integrations_ready_filter
 from app.services.ai_advisor_match_service import (
     AI_CANDIDATE_POOL,
+    AiMatchFailure,
     SeekerMatchCase,
     blend_scores,
     case_from_assessment,
 )
 from app.services.matching_weights_service import DEFAULT_CONFIG, MatchingWeightConfig
+from app.services.seeker_profile_service import (
+    intended_destination_codes,
+    intended_visa_type_values,
+    needed_service_types,
+    preferred_language_names,
+)
 
 DEFAULT_LIMIT = 5
-
-# Soft bonuses beyond the admin weight config (kept small so country+visa still leads).
-_EXPERIENCE_BONUS_MAX = 8.0
-_PRICE_BONUS_MAX = 6.0
 
 
 def has_country_expertise(profile: AdvisorProfile, destination: str) -> bool:
     """True when the advisor lists the seeker's destination country."""
     countries = {c.country_code.upper() for c in (profile.country_expertise or [])}
     return destination.upper() in countries
+
+
+def has_any_country_expertise(profile: AdvisorProfile, destinations: Sequence[str]) -> bool:
+    """True when the advisor covers any of the seeker's intended destinations."""
+    return any(has_country_expertise(profile, dest) for dest in destinations if dest)
 
 
 def has_visa_specialization(profile: AdvisorProfile, visa_type: str) -> bool:
@@ -64,112 +73,108 @@ def has_visa_specialization(profile: AdvisorProfile, visa_type: str) -> bool:
     return target is not None and target in specializations
 
 
+def has_any_visa_specialization(profile: AdvisorProfile, visa_types: Sequence[str]) -> bool:
+    """True when the advisor specializes in any of the seeker's intended visas."""
+    return any(has_visa_specialization(profile, visa) for visa in visa_types if visa)
+
+
 def _language_points(
     profile: AdvisorProfile,
-    preferred_language: str | None,
+    preferred_languages: list[str] | None,
     weight: float,
 ) -> float:
-    """PRD language factor: prefer real preference match over 'has any language'."""
+    """Full language weight only when a seeker language is in the advisor's list.
+
+    No half credit: missing seeker preference, missing advisor languages, or
+    no overlap all score ``0``.
+    """
+    prefs = [p.strip().casefold() for p in (preferred_languages or []) if p and p.strip()]
+    if not prefs:
+        return 0.0
     if not profile.languages:
         return 0.0
-    if not preferred_language or not preferred_language.strip():
-        # Seeker preference unknown — small credit for having languages configured.
-        return weight * 0.5
 
-    pref = preferred_language.strip().lower()
-    advisor_langs = {lang.language.strip().lower() for lang in profile.languages if lang.language}
-    if pref in advisor_langs:
-        return weight
-    # Soft contains match ("en" / "english").
-    if any(pref in lang or lang in pref for lang in advisor_langs):
+    advisor_langs = {
+        lang.language.strip().casefold()
+        for lang in profile.languages
+        if lang.language and lang.language.strip()
+    }
+    if any(pref in advisor_langs for pref in prefs):
         return weight
     return 0.0
 
 
-def _experience_points(years: int | None) -> float:
-    """Bounded experience bonus — more years help, but never dominate country/visa."""
+def _services_points(
+    profile: AdvisorProfile,
+    needed_services: list[str] | None,
+    weight: float,
+) -> float:
+    """Full services weight when any needed service_type is offered by the advisor."""
+    needed = [s.strip().lower() for s in (needed_services or []) if s and s.strip()]
+    if not needed:
+        return weight * 0.5
+    offered = {
+        row.service_type.strip().lower()
+        for row in (profile.offered_services or [])
+        if row.service_type
+    }
+    if not offered:
+        return 0.0
+    if any(service in offered for service in needed):
+        return weight
+    return 0.0
+
+
+def _experience_points(years: int | None, weight: float) -> float:
+    """Scale experience into the configured weight bucket."""
     if years is None or years <= 0:
         return 0.0
-    # 0–5y: ramp to half; 5–15y: ramp to full; 15+: cap.
     if years >= 15:
-        return _EXPERIENCE_BONUS_MAX
+        return weight
     if years >= 5:
-        return _EXPERIENCE_BONUS_MAX * (0.5 + 0.5 * min((years - 5) / 10.0, 1.0))
-    return _EXPERIENCE_BONUS_MAX * 0.5 * (years / 5.0)
+        return weight * (0.5 + 0.5 * min((years - 5) / 10.0, 1.0))
+    return weight * 0.5 * (years / 5.0)
 
 
-def _income_midpoint(band: str | None) -> float | None:
-    """Parse a rough USD midpoint from bands like ``$50,000–$100,000`` / ``100000-250000``."""
-    if not band:
-        return None
-    nums = [int(n.replace(",", "")) for n in re.findall(r"\d[\d,]*", band)]
-    if not nums:
-        return None
-    if len(nums) == 1:
-        return float(nums[0])
-    return (nums[0] + nums[1]) / 2.0
-
-
-def _price_points(starting_price: float | None, income_band: str | None) -> float:
-    """Soft price fit vs seeker income band — missing data yields a small neutral credit."""
-    if starting_price is None:
-        return _PRICE_BONUS_MAX * 0.25
-    mid = _income_midpoint(income_band)
-    if mid is None or mid <= 0:
-        # No income context — prefer mid-range consultation prices.
-        if 50 <= starting_price <= 300:
-            return _PRICE_BONUS_MAX * 0.7
-        if starting_price < 50 or starting_price <= 500:
-            return _PRICE_BONUS_MAX * 0.4
+def _rating_points(average_rating: float | None, weight: float) -> float:
+    """Scale verified platform rating (0–5) into the rating weight."""
+    if average_rating is None or average_rating <= 0:
         return 0.0
-    # Rough affordability: consultation price as a tiny fraction of annual income.
-    ratio = starting_price / mid
-    if ratio <= 0.002:
-        return _PRICE_BONUS_MAX
-    if ratio <= 0.005:
-        return _PRICE_BONUS_MAX * 0.75
-    if ratio <= 0.01:
-        return _PRICE_BONUS_MAX * 0.45
-    if ratio <= 0.02:
-        return _PRICE_BONUS_MAX * 0.2
-    return 0.0
+    return weight * min(average_rating / 5.0, 1.0)
 
 
 def score_advisor_for_assessment(
     profile: AdvisorProfile,
-    destination: str,
-    visa_type: str,
+    destination: str | Sequence[str],
+    visa_type: str | Sequence[str],
     average_rating: float | None,
     *,
     weights: MatchingWeightConfig = DEFAULT_CONFIG,
-    has_availability: bool = False,
-    preferred_language: str | None = None,
-    annual_income_band: str | None = None,
+    preferred_languages: list[str] | None = None,
+    needed_services: list[str] | None = None,
 ) -> float:
     """Weighted match score for recommendations.
 
-    Returns ``0`` when destination country is missing from the advisor's expertise
-    (visa-only matches are never recommended).
+    Returns ``0`` when the advisor lacks destination-country expertise or the
+    seeker's visa specialization (both are hard gates). Accepts a single
+    destination/visa or sequences (any-overlap hard gates).
     """
-    if not has_country_expertise(profile, destination):
+    destinations = (
+        [destination]
+        if isinstance(destination, str)
+        else [d for d in destination if d]
+    )
+    visas = [visa_type] if isinstance(visa_type, str) else [v for v in visa_type if v]
+    if not has_any_country_expertise(profile, destinations):
+        return 0.0
+    if not has_any_visa_specialization(profile, visas):
         return 0.0
 
-    score = float(weights.country)
-    score += _language_points(profile, preferred_language, weights.language)
-
-    if has_availability:
-        score += weights.availability
-
-    # Visa points only on top of a country match (best combo).
-    if has_visa_specialization(profile, visa_type):
-        setting = weights.setting
-        if average_rating is not None:
-            score += setting * (0.7 + 0.3 * (average_rating / 5.0))
-        else:
-            score += setting * 0.7
-
-    score += _experience_points(profile.years_of_experience)
-    score += _price_points(starting_price_usd(profile), annual_income_band)
+    score = float(weights.country) + float(weights.visa)
+    score += _language_points(profile, preferred_languages, weights.language)
+    score += _services_points(profile, needed_services, weights.services)
+    score += _experience_points(profile.years_of_experience, weights.experience)
+    score += _rating_points(average_rating, weights.rating)
 
     return round(min(score, 100.0), 2)
 
@@ -189,13 +194,28 @@ async def match_context_from_profile(
 async def match_context_for_seeker(
     session: AsyncSession, seeker_id: uuid.UUID
 ) -> tuple[str | None, str | None]:
-    """Destination + visa from profile intent only.
-
-    Kept as an alias of ``match_context_from_profile`` so assessment country/visa
-    never overrides Find Advisor, bookmarks, or the profile recommendation cache.
-    Assessment matches stay on ``advisor_leads`` (written once on complete).
-    """
+    """Destination + visa from profile intent only."""
     return await match_context_from_profile(session, seeker_id)
+
+
+def _soft_fields_from_profile(profile: SeekerProfile | None) -> dict[str, object]:
+    if profile is None:
+        return {
+            "preferred_languages": (),
+            "needed_services": (),
+            "timezone": None,
+            "nationality": None,
+            "country_of_residence": None,
+            "annual_income_band": None,
+        }
+    return {
+        "preferred_languages": tuple(preferred_language_names(profile)),
+        "needed_services": tuple(needed_service_types(profile)),
+        "timezone": profile.timezone,
+        "nationality": profile.nationality,
+        "country_of_residence": profile.country_of_residence,
+        "annual_income_band": profile.annual_income_band,
+    }
 
 
 async def build_profile_match_case(
@@ -212,23 +232,31 @@ async def build_profile_match_case(
     if profile is None:
         return None
 
-    dest = (destination or profile.intended_destination or "").upper() or None
-    visa = visa_type or profile.intended_visa_type
-    if not dest or not visa:
+    destinations = (
+        [destination.upper()]
+        if destination
+        else intended_destination_codes(profile)
+    )
+    visas = [visa_type] if visa_type else intended_visa_type_values(profile)
+    if not destinations or not visas:
         return None
 
+    soft = _soft_fields_from_profile(profile)
     return SeekerMatchCase(
-        destination_country=dest,
-        visa_type=visa,
+        destination_country=destinations[0],
+        visa_type=visas[0],
+        destination_countries=tuple(destinations),
+        visa_types=tuple(visas),
         seeker_id=seeker_id,
         assessment_id=None,
         eligibility_tier=None,
         eligibility_score=None,
-        preferred_language=profile.preferred_language,
-        timezone=profile.timezone,
-        nationality=profile.nationality,
-        country_of_residence=profile.country_of_residence,
-        annual_income_band=profile.annual_income_band,
+        preferred_languages=soft["preferred_languages"],  # type: ignore[arg-type]
+        needed_services=soft["needed_services"],  # type: ignore[arg-type]
+        timezone=soft["timezone"],  # type: ignore[arg-type]
+        nationality=soft["nationality"],  # type: ignore[arg-type]
+        country_of_residence=soft["country_of_residence"],  # type: ignore[arg-type]
+        annual_income_band=soft["annual_income_band"],  # type: ignore[arg-type]
         context_source="profile",
     )
 
@@ -257,28 +285,31 @@ async def build_seeker_match_case(
         )
     ).scalar_one_or_none()
 
-    soft = {
-        "preferred_language": profile.preferred_language if profile else None,
-        "timezone": profile.timezone if profile else None,
-        "nationality": profile.nationality if profile else None,
-        "country_of_residence": profile.country_of_residence if profile else None,
-        "annual_income_band": profile.annual_income_band if profile else None,
-    }
+    soft = _soft_fields_from_profile(profile)
 
     dest = (destination or "").upper() or None
     visa = visa_type
     if assessment is not None and dest is None and visa is None:
-        return case_from_assessment(assessment, **soft)
+        return case_from_assessment(
+            assessment,
+            preferred_languages=soft["preferred_languages"],  # type: ignore[arg-type]
+            needed_services=soft["needed_services"],  # type: ignore[arg-type]
+            timezone=soft["timezone"],  # type: ignore[arg-type]
+            nationality=soft["nationality"],  # type: ignore[arg-type]
+            country_of_residence=soft["country_of_residence"],  # type: ignore[arg-type]
+            annual_income_band=soft["annual_income_band"],  # type: ignore[arg-type]
+        )
 
     if dest is None:
         if assessment is not None:
             dest = assessment.destination_country.upper()
         elif profile and profile.intended_destination:
             dest = profile.intended_destination.upper()
+
     if visa is None:
         if assessment is not None:
             visa = assessment.visa_type
-        elif profile:
+        elif profile and profile.intended_visa_type:
             visa = profile.intended_visa_type
 
     if not dest or not visa:
@@ -287,9 +318,17 @@ async def build_seeker_match_case(
     if (
         assessment is not None
         and dest == assessment.destination_country.upper()
-        and visa == (assessment.visa_type)
+        and visa == assessment.visa_type
     ):
-        return case_from_assessment(assessment, **soft)
+        return case_from_assessment(
+            assessment,
+            preferred_languages=soft["preferred_languages"],  # type: ignore[arg-type]
+            needed_services=soft["needed_services"],  # type: ignore[arg-type]
+            timezone=soft["timezone"],  # type: ignore[arg-type]
+            nationality=soft["nationality"],  # type: ignore[arg-type]
+            country_of_residence=soft["country_of_residence"],  # type: ignore[arg-type]
+            annual_income_band=soft["annual_income_band"],  # type: ignore[arg-type]
+        )
 
     return SeekerMatchCase(
         destination_country=dest,
@@ -298,8 +337,13 @@ async def build_seeker_match_case(
         assessment_id=None,
         eligibility_tier=None,
         eligibility_score=None,
+        preferred_languages=soft["preferred_languages"],  # type: ignore[arg-type]
+        needed_services=soft["needed_services"],  # type: ignore[arg-type]
+        timezone=soft["timezone"],  # type: ignore[arg-type]
+        nationality=soft["nationality"],  # type: ignore[arg-type]
+        country_of_residence=soft["country_of_residence"],  # type: ignore[arg-type]
+        annual_income_band=soft["annual_income_band"],  # type: ignore[arg-type]
         context_source="profile",
-        **soft,
     )
 
 
@@ -310,15 +354,17 @@ async def _seeker_soft_context(session: AsyncSession, seeker_id: uuid.UUID) -> S
     ).scalar_one_or_none()
     if profile is None:
         return SeekerMatchCase(destination_country="", visa_type="")
+    soft = _soft_fields_from_profile(profile)
     return SeekerMatchCase(
         destination_country="",
         visa_type="",
         seeker_id=seeker_id,
-        preferred_language=profile.preferred_language,
-        timezone=profile.timezone,
-        nationality=profile.nationality,
-        country_of_residence=profile.country_of_residence,
-        annual_income_band=profile.annual_income_band,
+        preferred_languages=soft["preferred_languages"],  # type: ignore[arg-type]
+        needed_services=soft["needed_services"],  # type: ignore[arg-type]
+        timezone=soft["timezone"],  # type: ignore[arg-type]
+        nationality=soft["nationality"],  # type: ignore[arg-type]
+        country_of_residence=soft["country_of_residence"],  # type: ignore[arg-type]
+        annual_income_band=soft["annual_income_band"],  # type: ignore[arg-type]
         context_source="profile",
     )
 
@@ -330,15 +376,13 @@ def match_percentage(
     average_rating: float | None,
     *,
     weights: MatchingWeightConfig = DEFAULT_CONFIG,
-    has_availability: bool = False,
-    preferred_language: str | None = None,
-    annual_income_band: str | None = None,
+    preferred_languages: list[str] | None = None,
+    needed_services: list[str] | None = None,
 ) -> int | None:
     """0–100 match for seeker-facing advisor cards; ``None`` without destination/visa.
 
-    Returns ``0`` (not a recommendation) when the advisor lacks destination-country
-    expertise — including visa-only overlaps. Card % uses the rule engine only
-    when AI blend is not applied.
+    Returns ``0`` when the advisor lacks destination-country expertise or the
+    seeker's visa specialization.
     """
     if profile is None or not destination or not visa_type:
         return None
@@ -350,9 +394,8 @@ def match_percentage(
                 visa_type,
                 average_rating,
                 weights=weights,
-                has_availability=has_availability,
-                preferred_language=preferred_language,
-                annual_income_band=annual_income_band,
+                preferred_languages=preferred_languages,
+                needed_services=needed_services,
             )
         )
     )
@@ -384,7 +427,6 @@ def _apply_ai_blend(
             )
         )
 
-    # Preserve rule order for anyone outside the AI pool / omitted by the model.
     rest = [
         m.model_copy(update={"rule_score": m.match_score, "ai_score": None, "match_reasons": None})
         for m in rule_ranked
@@ -393,6 +435,19 @@ def _apply_ai_blend(
     blended.sort(key=lambda m: (m.match_score, m.average_rating or 0), reverse=True)
     rest.sort(key=lambda m: (m.match_score, m.average_rating or 0), reverse=True)
     return blended + rest
+
+
+def _rule_only_matches(matches: list[AdvisorMatchRead]) -> list[AdvisorMatchRead]:
+    return [
+        m.model_copy(
+            update={
+                "rule_score": m.match_score,
+                "ai_score": None,
+                "match_reasons": None,
+            }
+        )
+        for m in matches
+    ]
 
 
 async def match_from_context(
@@ -405,21 +460,30 @@ async def match_from_context(
     positive_only: bool = True,
     settings: Settings | None = None,
     use_ai: bool = True,
-) -> tuple[list[AdvisorMatchRead], int]:
-    """Rank advisors for a seeker case with rule scoring + optional OpenAI blend.
-
-    When ``candidates`` is provided (e.g. Find Advisor search filters), only that
-    set is scored. Otherwise all approved, integration-ready advisors are loaded.
-    """
+) -> tuple[list[AdvisorMatchRead], int, AiMatchFailure | None]:
+    """Rank advisors for a seeker case with rule scoring + optional OpenAI blend."""
     weights = await matching_weights_service.get_config(session)
 
     if candidates is None:
+        destinations = list(case.destinations_for_gate())
+        visas = list(case.visas_for_gate())
         stmt = (
             select(User, AdvisorProfile)
             .join(AdvisorProfile, AdvisorProfile.user_id == User.id)
+            .join(
+                AdvisorCountryExpertise,
+                AdvisorCountryExpertise.profile_id == AdvisorProfile.id,
+            )
+            .join(
+                AdvisorVisaSpecialization,
+                AdvisorVisaSpecialization.profile_id == AdvisorProfile.id,
+            )
             .where(User.role == UserRole.advisor)
             .where(User.is_active.is_(True))
             .where(User.verification_status == VerificationStatus.approved)
+            .where(AdvisorCountryExpertise.country_code.in_(destinations))
+            .where(AdvisorVisaSpecialization.specialization.in_(visas))
+            .distinct()
         )
         stmt = apply_integrations_ready_filter(stmt)
         rows = [(user, profile) for user, profile in (await session.execute(stmt)).all()]
@@ -429,32 +493,25 @@ async def match_from_context(
     advisor_ids = [user.id for user, _ in rows]
     ratings = await review_service.rating_summaries(session, advisor_ids)
 
-    available: set[uuid.UUID] = set()
-    if advisor_ids:
-        slot_rows = (
-            await session.execute(
-                select(AdvisorWeeklySlot.advisor_id)
-                .where(AdvisorWeeklySlot.advisor_id.in_(advisor_ids))
-                .distinct()
-            )
-        ).all()
-        available = {row[0] for row in slot_rows}
+    gate_destinations = list(case.destinations_for_gate())
+    gate_visas = list(case.visas_for_gate())
 
     matches: list[AdvisorMatchRead] = []
     for user, profile in rows:
-        if not has_country_expertise(profile, case.destination_country):
+        if not has_any_country_expertise(profile, gate_destinations):
+            continue
+        if not has_any_visa_specialization(profile, gate_visas):
             continue
 
         rating = ratings[user.id][0] if user.id in ratings else None
         score = score_advisor_for_assessment(
             profile,
-            case.destination_country,
-            case.visa_type,
+            gate_destinations,
+            gate_visas,
             rating,
             weights=weights,
-            has_availability=user.id in available,
-            preferred_language=case.preferred_language,
-            annual_income_band=case.annual_income_band,
+            preferred_languages=list(case.preferred_languages),
+            needed_services=list(case.needed_services),
         )
         matches.append(
             AdvisorMatchRead(
@@ -471,6 +528,10 @@ async def match_from_context(
                 rule_score=None,
                 ai_score=None,
                 match_reasons=None,
+                visa_specializations=[
+                    s.specialization for s in (profile.visa_specializations or [])
+                ],
+                country_expertise=[c.country_code for c in (profile.country_expertise or [])],
             )
         )
 
@@ -478,21 +539,25 @@ async def match_from_context(
         matches = [m for m in matches if m.match_score > 0]
     matches.sort(key=lambda m: (m.match_score, m.average_rating or 0), reverse=True)
 
+    ai_failure: AiMatchFailure | None = None
     if use_ai and matches:
         cfg = settings or get_settings()
-        ai_items = await ai_advisor_match_service.rerank_advisors(
+        outcome = await ai_advisor_match_service.rerank_advisors(
             case,
             matches[:AI_CANDIDATE_POOL],
             cfg,
         )
-        if ai_items is not None:
-            matches = _apply_ai_blend(matches, ai_items)
+        if outcome.failure is not None:
+            ai_failure = outcome.failure
+            matches = _rule_only_matches(matches)
+        else:
+            matches = _apply_ai_blend(matches, outcome.items)
 
     total = len(matches)
     if limit <= 0:
-        return [], total
+        return [], total, ai_failure
     page = matches[offset : offset + limit]
-    return page, total
+    return page, total, ai_failure
 
 
 async def match(
@@ -504,12 +569,13 @@ async def match(
     positive_only: bool = True,
     settings: Settings | None = None,
     use_ai: bool = True,
-) -> tuple[list[AdvisorMatchRead], int]:
-    """Rank advisors for a completed assessment (hybrid rule + optional AI)."""
+) -> tuple[list[AdvisorMatchRead], int, AiMatchFailure | None]:
+    """Rank advisors for a completed assessment (assessment-scoped soft fields)."""
     soft = await _seeker_soft_context(session, assessment.user_id)
     case = case_from_assessment(
         assessment,
-        preferred_language=soft.preferred_language,
+        preferred_languages=soft.preferred_languages,
+        needed_services=soft.needed_services,
         timezone=soft.timezone,
         nationality=soft.nationality,
         country_of_residence=soft.country_of_residence,

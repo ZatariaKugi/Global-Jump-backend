@@ -22,6 +22,7 @@ from app.models.advisor_availability import (
 from app.models.booking import Booking, BookingStatus
 from app.schemas.availability import OverrideInput, WeeklySlotInput
 
+# Statuses that occupy the slot for other seekers/advisors.
 ACTIVE_BOOKING_STATUSES = (BookingStatus.pending, BookingStatus.confirmed)
 
 

@@ -25,13 +25,16 @@ from pydantic import BaseModel
 from app.core.config import Settings
 from app.core.openai_client import get_openai_client
 from app.models.assessment import Assessment, AssessmentQuestion, AssessmentQuestionOption
-from app.schemas.seeker_profile import OnboardingSubmit
 
 log = structlog.get_logger()
 
 _MAX_ITEMS = 5
 _MAX_ITEM_CHARS = 500  # assessment_insights.text column limit
 _MAX_SUMMARY_CHARS = 2000  # assessments.ai_summary column limit
+# Shown in strengths/weaknesses when OpenAI is missing or the call fails.
+AI_INSIGHTS_UNAVAILABLE_MESSAGE = (
+    "AI insights are temporarily unavailable. Please try again later."
+)
 # Strengths are only credible from categories the deterministic engine scored
 # well. The model tags each strength with its category; anything below this
 # score (or with an unrecognizable category) is dropped server-side, because
@@ -258,6 +261,7 @@ async def generate_insights(
             return None
         response = await client.chat.completions.create(
             model=settings.OPENAI_MODEL,
+            temperature=0,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": _build_user_prompt(assessment, answered, policy)},
@@ -285,103 +289,3 @@ async def generate_insights(
         missing_requirements=_clamp(raw.missing_requirements),
         summary=raw.summary[:_MAX_SUMMARY_CHARS],
     )
-
-
-# ── Onboarding Step 5 suggestions (PRD onboarding wizard) ───────────────────
-#
-# Lightweight, standalone from the assessment insights above: no deterministic
-# score/tier exists yet at onboarding time, so this has nothing to ground
-# against — just a rough, generative nudge from the wizard fields collected
-# in Steps 1-4 (and Steps 5-6 if the applicant filled them in).
-
-_ONBOARDING_SYSTEM_PROMPT = """\
-You are a visa readiness assistant for GlobleJump, a platform that connects visa
-seekers with immigration advisors. You are given the destination country, intended
-visa type, and other details a user just entered while signing up — before they
-have taken any formal eligibility assessment.
-
-Rules:
-- Base every suggestion only on the details provided. Never invent facts, documents,
-  or circumstances that do not appear in the input.
-- Do not give legal advice, cite laws or regulations, or guarantee any visa outcome.
-- Return 3 to 5 short, practical, encouraging suggestions (each under 200
-  characters) for next steps the applicant could take to strengthen their
-  application for that destination and visa type — e.g. documents to gather,
-  information worth having ready, or things to research next.
-- Respond only with JSON matching the required schema.
-"""
-
-_ONBOARDING_RESPONSE_FORMAT = ResponseFormatJSONSchema(
-    type="json_schema",
-    json_schema=JSONSchema(
-        name="onboarding_suggestions",
-        strict=True,
-        schema={
-            "type": "object",
-            "properties": {
-                "suggestions": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["suggestions"],
-            "additionalProperties": False,
-        },
-    ),
-)
-
-
-class _RawOnboardingSuggestions(BaseModel):
-    suggestions: list[str]
-
-
-def _build_onboarding_prompt(data: OnboardingSubmit) -> str:
-    lines = [
-        f"Intended visa type: {data.intended_visa_type}",
-        f"Intended destination country: {data.intended_destination}",
-        f"Annual income band: {data.annual_income_band}",
-        "Travel history: " + (data.countries_visited or "not specified"),
-    ]
-    if data.matching_opportunities:
-        categories = ", ".join(data.matching_opportunities)
-        lines.append(f"Opportunity categories the applicant wants matched: {categories}")
-    if data.nationality:
-        lines.append(f"Nationality: {data.nationality}")
-    if data.education_level:
-        lines.append(f"Education level: {data.education_level.value}")
-    if data.employment_status:
-        lines.append(f"Employment status: {data.employment_status.value}")
-    return "\n".join(lines)
-
-
-async def generate_onboarding_suggestions(data: OnboardingSubmit, settings: Settings) -> list[str]:
-    """Generate Step 5 AI suggestions from onboarding wizard data.
-
-    Degrades gracefully like generate_insights: any failure (no API key,
-    timeout, malformed response) logs and returns an empty list — it never
-    blocks onboarding completion.
-    """
-    if not settings.OPENAI_API_KEY:
-        log.debug("onboarding_suggestions_skipped", reason="not_configured")
-        return []
-
-    try:
-        client = get_openai_client(settings)
-        if client is None:
-            return []
-        response = await client.chat.completions.create(
-            model=settings.OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": _ONBOARDING_SYSTEM_PROMPT},
-                {"role": "user", "content": _build_onboarding_prompt(data)},
-            ],
-            response_format=_ONBOARDING_RESPONSE_FORMAT,
-            max_completion_tokens=800,
-        )
-        content = response.choices[0].message.content
-        if content is None:
-            raise ValueError("empty completion content")
-        raw = _RawOnboardingSuggestions.model_validate(json.loads(content))
-    except Exception as exc:  # noqa: BLE001 — degrade gracefully, never 500
-        log.warning("onboarding_suggestions_failed", model=settings.OPENAI_MODEL, error=str(exc))
-        return []
-
-    log.info("onboarding_suggestions_generated", model=settings.OPENAI_MODEL)
-    return _clamp(raw.suggestions)

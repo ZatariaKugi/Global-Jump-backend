@@ -1,8 +1,7 @@
 """Admin-configurable advisor matching weights (AI Engine Management).
 
-Singleton row — UI sliders for country / language / availability / setting.
-Language and availability contribute when profile data exists; otherwise 0.
-``setting_weight`` maps to visa-type specialization match (UI "Setting").
+Singleton row — sliders for destination / visa / language / services /
+experience / rating. Values should sum to 100.
 """
 
 from __future__ import annotations
@@ -18,7 +17,9 @@ class AdvisorMatchingWeights(BaseModel):
 
     __tablename__ = "advisor_matching_weights"
 
-    country_weight: Mapped[float] = mapped_column(Float, nullable=False, default=40.0)
-    language_weight: Mapped[float] = mapped_column(Float, nullable=False, default=20.0)
-    availability_weight: Mapped[float] = mapped_column(Float, nullable=False, default=20.0)
-    setting_weight: Mapped[float] = mapped_column(Float, nullable=False, default=20.0)
+    country_weight: Mapped[float] = mapped_column(Float, nullable=False, default=25.0)
+    visa_weight: Mapped[float] = mapped_column(Float, nullable=False, default=25.0)
+    language_weight: Mapped[float] = mapped_column(Float, nullable=False, default=15.0)
+    services_weight: Mapped[float] = mapped_column(Float, nullable=False, default=15.0)
+    experience_weight: Mapped[float] = mapped_column(Float, nullable=False, default=10.0)
+    rating_weight: Mapped[float] = mapped_column(Float, nullable=False, default=10.0)

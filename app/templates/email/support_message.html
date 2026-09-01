@@ -1,0 +1,25 @@
+{% extends "_base.html" %}
+{% from "_macros.html" import headline, quote %}
+
+{% block title %}New support message — {{ app_name }}{% endblock %}
+
+{% block content %}
+  {{ headline("New support message") }}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    You have received a new support message from <strong>{{ sender_name }}</strong>.
+  </p>
+  <table class="details" role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;margin:8px 0 20px;text-align:left;border:1px solid #EAEAEA;border-radius:12px;overflow:hidden;">
+    <tr>
+      <td class="label" style="width:38%;padding:12px 16px;font-size:14px;line-height:20px;border-bottom:1px solid #F0F0F0;color:#9E9E9E;font-weight:500;background:#FAFBFC;">Name</td>
+      <td style="padding:12px 16px;font-size:14px;line-height:20px;border-bottom:1px solid #F0F0F0;color:#2D2D2E;">{{ sender_name }}</td>
+    </tr>
+    <tr>
+      <td class="label" style="width:38%;padding:12px 16px;font-size:14px;line-height:20px;border-bottom:1px solid #F0F0F0;color:#9E9E9E;font-weight:500;background:#FAFBFC;">Email</td>
+      <td style="padding:12px 16px;font-size:14px;line-height:20px;border-bottom:1px solid #F0F0F0;color:#2D2D2E;"><a href="mailto:{{ sender_email }}" style="color:#003897;">{{ sender_email }}</a></td>
+    </tr>
+  </table>
+  {{ quote(message) }}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    Reply directly to <a href="mailto:{{ sender_email }}" style="color:#003897;">{{ sender_email }}</a> to respond to this message.
+  </p>
+{% endblock %}

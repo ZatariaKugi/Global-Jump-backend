@@ -32,8 +32,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("startup", environment=settings.ENVIRONMENT.value)
     init_tracing(app, settings, engine=engine)
     push_service.init_firebase(settings)
-    scheduler = create_scheduler(settings)
-    scheduler.start()
+    # scheduler = create_scheduler(settings)
+    # scheduler.start()
     logger.info(
         "scheduler_started",
         sweep_seconds=settings.TRANSFER_SWEEP_SECONDS,
@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         push_enabled=settings.push_enabled,
     )
     yield
-    scheduler.shutdown(wait=False)
+    # scheduler.shutdown(wait=False)
     await engine.dispose()
     logger.info("shutdown")
 

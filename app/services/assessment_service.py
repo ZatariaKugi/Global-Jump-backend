@@ -314,8 +314,8 @@ async def submit_answers(
             process_notes=[n.text for n in published.process_notes],
         )
 
-    # Best-effort AI narrative — None (unconfigured/failed) leaves AI fields
-    # empty; unanswered questions still become deterministic missing requirements.
+    # Best-effort AI narrative — on failure, surface a graceful message in
+    # strengths/weaknesses so the results UI is not an empty shell.
     payload = await ai_insight_service.generate_insights(
         assessment, answered_pairs, settings, policy_ref
     )
@@ -336,6 +336,18 @@ async def submit_answers(
                         display_order=order,
                     )
                 )
+    else:
+        unavailable = ai_insight_service.AI_INSIGHTS_UNAVAILABLE_MESSAGE
+        assessment.ai_summary = unavailable
+        for kind in (InsightKind.strength, InsightKind.weakness):
+            insight_rows.append(
+                AssessmentInsight(
+                    assessment_id=assessment.id,
+                    kind=kind,
+                    text=unavailable,
+                    display_order=0,
+                )
+            )
 
     # Always surface skipped applicable questions as missing requirements so the
     # result cannot look "complete" when the seeker left questions unanswered.
@@ -356,12 +368,8 @@ async def submit_answers(
     await session.flush()
     await session.refresh(assessment)
 
-    from app.services import advisor_lead_service
-
-    # Assessment matches go to advisor_leads only. Never refresh or clear
-    # seeker_advisor_recommendations, and never copy country/visa onto profile intent.
-    await advisor_lead_service.generate_for_assessment(session, assessment)
-
+    # Advisor matching is deferred to GET /assessments/{id}/matched-advisors
+    # so this endpoint only scores eligibility and returns insights.
     return assessment
 
 

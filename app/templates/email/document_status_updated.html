@@ -1,0 +1,19 @@
+{% extends "_base.html" %}
+{% from "_macros.html" import headline, details_open, details_row, details_close, quote, cta %}
+
+{% block title %}Document status updated — {{ app_name }}{% endblock %}
+
+{% block content %}
+  {{ headline("Document status updated") }}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    Hi {{ full_name }}, {{ advisor_name }} has {{ status }} your document.
+  </p>
+  {{ details_open() }}
+  {{ details_row("Document", document_name) }}
+  {{ details_row("Status", status_capitalized) }}
+  {{ details_close() }}
+  {% if note %}
+    {{ quote(note) }}
+  {% endif %}
+  {{ cta(documents_url, "View Document") }}
+{% endblock %}

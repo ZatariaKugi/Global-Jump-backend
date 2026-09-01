@@ -46,6 +46,19 @@ async def _sweep_expired_pending_bookings(settings: Settings) -> None:
             logger.exception("booking_expiry_sweep_failed")
 
 
+async def _sweep_stale_unpaid_bookings(settings: Settings) -> None:
+    """Cancel pending+unpaid bookings older than STALE_UNPAID_BOOKING_MINUTES."""
+    async with async_session_factory() as session:
+        try:
+            count = await booking_service.expire_stale_unpaid_bookings(session, settings)
+            await session.commit()
+            if count:
+                logger.info("stale_unpaid_sweep_completed", expired=count)
+        except Exception:  # noqa: BLE001 — a sweep failure must not kill the scheduler
+            await session.rollback()
+            logger.exception("stale_unpaid_sweep_failed")
+
+
 async def _sweep_due_pushes(settings: Settings) -> None:
     """One push-outbox pass. Opens its own session and commits/rolls back explicitly."""
     async with async_session_factory() as session:
@@ -93,6 +106,16 @@ def create_scheduler(settings: Settings) -> AsyncIOScheduler:
         seconds=settings.BOOKING_EXPIRY_SWEEP_SECONDS,
         args=[settings],
         id="booking_expiry_sweep",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=settings.BOOKING_EXPIRY_SWEEP_SECONDS,
+    )
+    scheduler.add_job(
+        _sweep_stale_unpaid_bookings,
+        trigger="interval",
+        seconds=settings.BOOKING_EXPIRY_SWEEP_SECONDS,
+        args=[settings],
+        id="stale_unpaid_sweep",
         coalesce=True,
         max_instances=1,
         misfire_grace_time=settings.BOOKING_EXPIRY_SWEEP_SECONDS,

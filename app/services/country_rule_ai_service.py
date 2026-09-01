@@ -193,6 +193,7 @@ async def draft_policy(
       
         response = await client.responses.create(
             model=model,
+            temperature=0,
             tools=[{"type": "web_search"}],
             input=[
                 {"role": "system", "content": _SYSTEM_PROMPT},

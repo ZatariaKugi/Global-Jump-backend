@@ -57,6 +57,9 @@ class SeekerDocumentUpdate(BaseModel):
     File replace: ``POST /uploads`` (``category=seeker_document``) first, then
     send ``file_key`` + ``file_name`` + ``file_size_bytes`` here. Status returns
     to ``under_review``; comments on this id are kept.
+
+    Expired documents: send a new future ``expires_at`` in the same PATCH as the
+    file replace, or PATCH ``expires_at`` afterward once the new file is uploaded.
     """
 
     document_name: str | None = Field(default=None, min_length=1)
@@ -85,6 +88,14 @@ class SeekerDocumentUpdate(BaseModel):
 
 class SeekerDocumentStatusUpdate(BaseModel):
     status: SeekerDocumentStatus
+    note: str | None = None
+
+
+class AdvisorDocumentReviewUpdate(BaseModel):
+    """Advisor PATCH body — omit ``status`` to open/preview without changing review state."""
+
+    status: SeekerDocumentStatus | None = None
+    note: str | None = None
 
 
 class SeekerDocumentRead(BaseModel):
@@ -122,6 +133,10 @@ class DocumentPortfolioSummary(BaseModel):
     rejected: int
     progress_percent: int
     checklist: list[DocumentChecklistItem]
+    # Upcoming Expires sidebar data: docs whose expires_at falls within the next
+    # 30 days (inclusive of today), excluding already-expired docs. Sorted
+    # soonest-first, capped at ~20. Always present (empty list when none).
+    expiring_soon: list[SeekerDocumentRead] = Field(default_factory=list)
 
 
 class CustomerDocumentsRowRead(BaseModel):

@@ -57,12 +57,21 @@ from app.models.payout_request import PayoutRequest
 from app.models.regulatory_update import RegulatoryUpdate
 from app.models.review import Review
 from app.models.seeker_advisor_recommendation import SeekerAdvisorRecommendation
-from app.models.seeker_document import SeekerDocument, SeekerDocumentComment
+from app.models.seeker_document import (
+    SeekerDocument,
+    SeekerDocumentAdvisorReview,
+    SeekerDocumentComment,
+)
 from app.models.seeker_profile import (
     SeekerCountryVisited,
+    SeekerIntendedDestination,
+    SeekerIntendedVisaType,
+    SeekerNeededService,
+    SeekerPreferredLanguage,
     SeekerPriorVisa,
     SeekerProfile,
 )
+from app.models.support_message import SupportMessage
 from app.models.support_ticket import SupportTicket
 from app.models.ticket_message import TicketMessage, TicketMessageAttachment
 from app.models.token import RefreshToken, UserToken
@@ -82,6 +91,10 @@ __all__ = [
     "SeekerProfile",
     "SeekerCountryVisited",
     "SeekerPriorVisa",
+    "SeekerPreferredLanguage",
+    "SeekerNeededService",
+    "SeekerIntendedDestination",
+    "SeekerIntendedVisaType",
     "AdvisorProfile",
     "AdvisorVisaSpecialization",
     "AdvisorCountryExpertise",
@@ -109,6 +122,7 @@ __all__ = [
     "BookingDocumentRequest",
     "SeekerAdvisorRecommendation",
     "SeekerDocument",
+    "SeekerDocumentAdvisorReview",
     "SeekerDocumentComment",
     "EligibilityRule",
     "RegulatoryUpdate",
@@ -130,6 +144,7 @@ __all__ = [
     "Transaction",
     "TransactionEvent",
     "PayoutRequest",
+    "SupportMessage",
     "SupportTicket",
     "TicketMessage",
     "TicketMessageAttachment",

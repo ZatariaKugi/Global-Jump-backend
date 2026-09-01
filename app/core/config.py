@@ -130,6 +130,9 @@ class Settings(BaseSettings):
     # Pending bookings whose scheduled_start passed without advisor acceptance are
     # cancelled (and paid ones refunded) on this interval.
     BOOKING_EXPIRY_SWEEP_SECONDS: int = 300
+    # Safety net: cancel pending+unpaid bookings older than this (minutes) to
+    # release slots when checkout.session.expired webhooks are missed.
+    STALE_UNPAID_BOOKING_MINUTES: int = 60
     INVOICE_FROM_ADDRESS: str | None = None  # optional platform address on invoices
     INVOICE_FROM_PHONE: str | None = None  # optional platform phone on invoices
 

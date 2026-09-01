@@ -10,6 +10,7 @@ from fastapi import Depends, Query
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.schemas.assessment import AiMatchStatusRead
 from app.schemas.response import Meta, PageMeta
 from app.schemas.seeker_document import ClientSeekerBrief
 
@@ -63,6 +64,7 @@ def page_meta(
     request_id: str | None = None,
     *,
     seeker: ClientSeekerBrief | None = None,
+    ai_match: AiMatchStatusRead | None = None,
 ) -> Meta:
     pages = ceil(total / params.page_size) if total else 0
     return Meta(
@@ -74,4 +76,5 @@ def page_meta(
             pages=pages,
         ),
         seeker=seeker,
+        ai_match=ai_match,
     )

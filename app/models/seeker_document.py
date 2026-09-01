@@ -6,7 +6,7 @@ import uuid
 from datetime import date, datetime
 from enum import StrEnum
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -55,6 +55,26 @@ class SeekerDocument(BaseModel):
     comments_last_read_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class SeekerDocumentAdvisorReview(BaseModel):
+    """Per-advisor review decision on a seeker document."""
+
+    __tablename__ = "seeker_document_advisor_reviews"
+    __table_args__ = (UniqueConstraint("document_id", "advisor_id", name="uq_doc_advisor_review"),)
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("seeker_documents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    advisor_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[SeekerDocumentStatus] = mapped_column(
+        SAEnum(SeekerDocumentStatus, name="seeker_document_status", create_type=False),
+        nullable=False,
+    )
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(2000), nullable=True)
 
 
 class SeekerDocumentComment(BaseModel):

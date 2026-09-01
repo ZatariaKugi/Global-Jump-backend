@@ -43,12 +43,14 @@ from app.services import (
     seeker_recommendation_service,
     visa_journey_service,
 )
+from app.services.ai_advisor_match_service import ai_match_status
 
 MATCHED_ADVISORS_LIMIT = 10
 
 # Chart labels for the four seeker-facing timeline bars (Review is not shown).
+# ``assessment`` key is kept for API stability — label is profile recommendations.
 _STAGE_LABELS: dict[JourneyStepKey, str] = {
-    JourneyStepKey.assessment: "Assessment",
+    JourneyStepKey.assessment: "AI Recommendation",
     JourneyStepKey.advisor: "Advisor",
     JourneyStepKey.documentation: "Documents",
     JourneyStepKey.submission: "Submission",
@@ -116,7 +118,7 @@ async def _documents_uploaded(
 def _build_stages(
     statuses: dict[JourneyStepKey, JourneyStepStatus], doc_progress: int
 ) -> list[JourneyStageRead]:
-    """Dashboard timeline bars — Assessment → Advisor → Documents → Submission."""
+    """Dashboard timeline bars — Profile recs → Advisor → Documents → Submission."""
     keys = tuple(
         key
         for key in visa_journey_service.VISIBLE_STEP_KEYS
@@ -206,7 +208,7 @@ async def get_dashboard(
     )
 
     state = await visa_journey_service.compute_state(
-        session, seeker_id, visa_type=visa_type, country=country
+        session, seeker_id, settings, visa_type=visa_type, country=country
     )
     doc_progress = visa_journey_service.documentation_progress(state.summary)
     journey_progress = visa_journey_service.overall_progress(state.statuses, doc_progress)
@@ -215,7 +217,7 @@ async def get_dashboard(
     )
     application_state = visa_journey_service.application_status_state(state.statuses)
 
-    matched = await seeker_recommendation_service.matches_for_dashboard(
+    matched, ai_failure, ai_attempted = await seeker_recommendation_service.matches_for_dashboard(
         session,
         seeker_id,
         settings,
@@ -255,7 +257,7 @@ async def get_dashboard(
             country_name=country_name(country),
             journey_progress_percent=journey_progress,
             documents_uploaded=documents_uploaded,
-            documents_progress_percent=state.summary.progress_percent,
+            documents_progress_percent=doc_progress,
             application_status=application_state,
             application_status_percent=application_percent,
         ),
@@ -263,4 +265,5 @@ async def get_dashboard(
         eligibility_breakdown=breakdown,
         matched_advisors=matched,
         assessment_id=assessment.id if assessment is not None else None,
+        ai_match=ai_match_status(ai_failure, attempted=ai_attempted),
     )

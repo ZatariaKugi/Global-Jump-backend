@@ -116,8 +116,6 @@ class SeekerPaymentRead(BaseModel):
     advisor_photo_url: str | None
     service_type: str
     created_at: datetime
-    platform_fee_usd: float
-    consultant_fee_usd: float
     amount_usd: float
     total_amount: float  # same as amount_usd — grand total charged (FE column name)
     status: TransactionStatus
@@ -151,6 +149,13 @@ class AdvisorConnectStatus(BaseModel):
     payouts_enabled: bool = False
     onboarding_complete: bool
     onboarding_url: str | None = None
+    account_type: str | None = None
+
+
+class StripeDashboardLink(BaseModel):
+    """``POST /advisors/me/stripe-connect/dashboard`` — open the advisor's Stripe dashboard."""
+
+    dashboard_url: str
 
 
 class AdvisorEarnings(BaseModel):

@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from app.core.visa_types import OptionalVisaType
 from app.models.assessment import EligibilityTier
-from app.schemas.assessment import AdvisorMatchRead
+from app.schemas.assessment import AdvisorMatchRead, AiMatchStatusRead
 from app.schemas.booking import BookingRead
 from app.schemas.visa_journey import JourneyStepKey, JourneyStepStatus
 
@@ -50,10 +50,10 @@ class SeekerDashboardStats(BaseModel):
 
 
 class JourneyStageRead(BaseModel):
-    """One bar on the Visa Journey Timeline chart (Assessment → Advisor →
-    Documents → Submission). ``progress_percent`` is derived from step status
-    (completed=100, in_progress=50, pending=0) except documentation, which uses
-    the real document-checklist percent. Review is not exposed here.
+    """One bar on the Visa Journey Timeline chart (Profile Based Recommendation →
+    Advisor → Documents → Submission). ``progress_percent`` is derived from step
+    status (completed=100, in_progress=50, pending=0) except documentation,
+    which uses the real document-checklist percent. Review is not exposed here.
     """
 
     key: JourneyStepKey
@@ -84,3 +84,4 @@ class SeekerDashboardRead(BaseModel):
     eligibility_breakdown: EligibilityBreakdownRead | None
     matched_advisors: list[AdvisorMatchRead]
     assessment_id: uuid.UUID | None
+    ai_match: AiMatchStatusRead | None = None

@@ -1,0 +1,18 @@
+{% extends "_base.html" %}
+{% from "_macros.html" import headline, details_open, details_row, details_close, quote, cta %}
+
+{% block title %}Document requested — {{ app_name }}{% endblock %}
+
+{% block content %}
+  {{ headline("Document requested") }}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    Hi {{ full_name }}, {{ advisor_name }} has requested a document for your upcoming consultation.
+  </p>
+  {{ details_open() }}
+  {{ details_row("Advisor", advisor_name) }}
+  {{ details_close() }}
+  {% if description %}
+    {{ quote(description) }}
+  {% endif %}
+  {{ cta(booking_url, "View Request") }}
+{% endblock %}

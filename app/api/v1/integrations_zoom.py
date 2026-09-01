@@ -96,17 +96,23 @@ async def connect_my_zoom(
 
 @advisor_router.delete(
     "/me/integrations/zoom",
-    status_code=204,
+    response_model=ResponseEnvelope[None],
     dependencies=[Depends(require_role(UserRole.advisor))],
 )
 async def disconnect_my_zoom(
     current_user: CurrentUser,
     session: SessionDep,
     settings: SettingsDep,
-) -> None:
-    """Disconnect Zoom: revoke grant (best-effort) and delete stored tokens."""
-    zoom_oauth_service.require_zoom_configured(settings)
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[None]:
+    """Disconnect Zoom: revoke grant (best-effort) and delete stored tokens.
+
+    Returns a JSON envelope (not 204) so browsers/axios never treat an empty
+    CORS response as a network failure.
+    """
+    # Local cleanup must work even if Zoom OAuth env vars were removed later.
     await zoom_connection_service.disconnect(session, current_user.id, settings)
+    return ResponseEnvelope[None](data=None, meta=Meta(request_id=request_id))
 
 
 @router.get("/callback")
