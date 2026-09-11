@@ -15,8 +15,8 @@ from app.core.config import get_settings
 from app.models.advisor_profile import (
     AdvisorCountryExpertise,
     AdvisorLanguage,
+    AdvisorOfferedService,
     AdvisorProfile,
-    AdvisorService,
     AdvisorVisaSpecialization,
 )
 from app.models.review import ModerationStatus, Review
@@ -41,10 +41,11 @@ class AdvisorSearchFilters:
 
 
 def _min_price_subquery() -> ScalarSelect[Any]:
-    """Correlated scalar subquery: cheapest service offered by the advisor."""
+    """Correlated scalar subquery: cheapest priced service the advisor offers."""
     return (
-        select(func.min(AdvisorService.price_usd))
-        .where(AdvisorService.profile_id == AdvisorProfile.id)
+        select(func.min(AdvisorOfferedService.price_usd))
+        .where(AdvisorOfferedService.profile_id == AdvisorProfile.id)
+        .where(AdvisorOfferedService.price_usd.is_not(None))
         .correlate(AdvisorProfile)
         .scalar_subquery()
     )
@@ -168,11 +169,14 @@ def build_search_stmt(filters: AdvisorSearchFilters) -> Select[tuple[User]]:
         )
 
     if filters.min_price is not None or filters.max_price is not None:
-        price_clauses = [AdvisorService.profile_id == AdvisorProfile.id]
+        price_clauses = [
+            AdvisorOfferedService.profile_id == AdvisorProfile.id,
+            AdvisorOfferedService.price_usd.is_not(None),
+        ]
         if filters.min_price is not None:
-            price_clauses.append(AdvisorService.price_usd >= filters.min_price)
+            price_clauses.append(AdvisorOfferedService.price_usd >= filters.min_price)
         if filters.max_price is not None:
-            price_clauses.append(AdvisorService.price_usd <= filters.max_price)
+            price_clauses.append(AdvisorOfferedService.price_usd <= filters.max_price)
         stmt = stmt.where(exists().where(*price_clauses))
 
     if filters.min_rating is not None:

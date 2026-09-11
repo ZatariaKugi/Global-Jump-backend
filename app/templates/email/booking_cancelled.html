@@ -9,7 +9,7 @@
     Hi {{ full_name }}, your consultation has been cancelled{% if cancelled_by %} by {{ cancelled_by }}{% endif %}.
   </p>
   {{ details_open() }}
-  {{ details_row("Service", service_type) }}
+  {{ details_row("Service", name) }}
   {{ details_row("With", other_party) }}
   {{ details_row("Was scheduled", start_str ~ " UTC") }}
   {% if reason %}

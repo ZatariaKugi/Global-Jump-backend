@@ -3,25 +3,21 @@
 from __future__ import annotations
 
 import uuid
-from enum import StrEnum
 
-from sqlalchemy import Boolean, Float, ForeignKey, Integer, String
+from sqlalchemy import (
+    Boolean,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 from app.db.base_model import BaseModel
-
-
-class AdvisorServiceType(StrEnum):
-    """Service categories from the Global Jump advisor onboarding wizard."""
-
-    household_goods_transport = "household_goods_transport"
-    pet_transport = "pet_transport"
-    recruiter = "recruiter"
-    career_coach = "career_coach"
-    immigration_specialist = "immigration_specialist"
-    resume_writer = "resume_writer"
-    realtor = "realtor"
 
 
 class AdvisorVisaSpecialization(Base):
@@ -68,14 +64,24 @@ class AdvisorLanguage(Base):
 
 
 class AdvisorOfferedService(Base):
-    """One row per service category — either advisor-owned or a global admin catalog entry.
+    """A global service catalog row or an advisor's priced offering.
 
-    ``profile_id`` is null for admin-managed global catalog rows (no owning advisor).
-    ``price_usd`` is optional — set a price to make the offering bookable.
-    ``duration_minutes`` defaults to 30 when the service is selected.
+    Global rows have ``profile_id`` null and use their own ``id`` as the stable
+    service ID. Advisor rows reference that global row through ``service_id``.
+    Names are display values; all relationships use UUIDs.
     """
 
     __tablename__ = "advisor_offered_services"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "service_id", name="uq_offered_service_profile_service"),
+        Index(
+            "uq_offered_service_catalog_name",
+            "name",
+            unique=True,
+            postgresql_where=text("profile_id IS NULL"),
+            sqlite_where=text("profile_id IS NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     profile_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -83,27 +89,26 @@ class AdvisorOfferedService(Base):
         nullable=True,
         index=True,
     )
-    service_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    service_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("advisor_offered_services.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
     price_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     duration_minutes: Mapped[int] = mapped_column(
         Integer, nullable=False, default=30, server_default="30"
     )
 
-
-class AdvisorService(Base):
-    """One row per bookable service offering (duration + price) an advisor provides."""
-
-    __tablename__ = "advisor_services"
-
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    profile_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("advisor_profiles.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
+    catalog_service: Mapped[AdvisorOfferedService | None] = relationship(
+        "AdvisorOfferedService",
+        remote_side="AdvisorOfferedService.id",
+        foreign_keys=[service_id],
+        uselist=False,
+        lazy="joined",
     )
-    service_type: Mapped[str] = mapped_column(String(100), nullable=False)
-    duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
-    price_usd: Mapped[float] = mapped_column(Float, nullable=False)
+
+
 
 
 class AdvisorProfile(BaseModel):
@@ -152,9 +157,6 @@ class AdvisorProfile(BaseModel):
     )
     offered_services: Mapped[list[AdvisorOfferedService]] = relationship(
         "AdvisorOfferedService", cascade="all, delete-orphan", lazy="selectin"
-    )
-    services: Mapped[list[AdvisorService]] = relationship(
-        "AdvisorService", cascade="all, delete-orphan", lazy="selectin"
     )
 
     # Booking policy (PRD §3.6: cancellation policy configured per advisor)

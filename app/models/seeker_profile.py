@@ -75,7 +75,7 @@ class SeekerPreferredLanguage(Base):
 
 
 class SeekerNeededService(Base):
-    """One row per service type the seeker selected during onboarding."""
+    """One row per catalog service the seeker selected during onboarding."""
 
     __tablename__ = "seeker_needed_services"
 
@@ -85,7 +85,11 @@ class SeekerNeededService(Base):
         nullable=False,
         index=True,
     )
-    service_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    service_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("advisor_offered_services.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
 
 
 class SeekerIntendedDestination(Base):

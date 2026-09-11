@@ -241,7 +241,7 @@ async def build_list_reads(
                 average_rating=avg,
                 years_of_experience=profile.years_of_experience if profile else None,
                 offered_services=(
-                    advisor_profile_service.offered_service_types(profile) if profile else []
+                    advisor_profile_service.offered_service_ids(profile) if profile else []
                 ),
                 starting_price_usd=advisor_profile_service.starting_price_usd(profile),
                 match_percentage=match_percentage,

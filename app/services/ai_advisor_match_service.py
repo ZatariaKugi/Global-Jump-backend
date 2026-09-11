@@ -499,9 +499,9 @@ async def rerank_seekers(
     )
     services = sorted(
         {
-            row.service_type
+            row.name
             for row in (profile.offered_services or [])
-            if row.service_type
+            if row.name
         }
     )
 

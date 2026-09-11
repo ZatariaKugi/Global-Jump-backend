@@ -62,6 +62,27 @@ class SupportTicket(BaseModel):
         DateTime(timezone=True), nullable=True
     )
 
+    # Optional link to the booking this ticket is about (category=booking).
+    # ON DELETE SET NULL: keep the ticket if the booking row is later removed;
+    # the snapshot columns below preserve the context regardless.
+    booking_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Booking context snapshot — copied at create time so the FE never has to
+    # join bookings and history survives booking mutations/deletion.
+    booking_reference: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    related_user_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    related_user_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    session_scheduled_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    service_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("advisor_offered_services.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
     # Admin assignee (independent of resolved_by).
     assigned_to: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True

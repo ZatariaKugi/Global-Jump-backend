@@ -235,7 +235,7 @@ async def create_checkout_session(
                 "price_data": {
                     "currency": "usd",
                     "product_data": {
-                        "name": f"{booking.service_type} with {advisor_name}",
+                        "name": f"{booking.name} with {advisor_name}",
                         "description": f"{booking.duration_minutes}-minute session",
                     },
                     "unit_amount": int(booking.price_usd * 100),
@@ -492,7 +492,7 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
                     seeker.email,
                     seeker.full_name or seeker.email,
                     advisor.full_name if advisor and advisor.full_name else "Advisor",
-                    service_type=booking.service_type,
+                    name=booking.name,
                     amount_usd=txn.amount_usd,
                     invoice_number=f"{txn.invoice_number:08d}",
                     settings=settings,
@@ -504,7 +504,7 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
                     advisor.email,
                     advisor.full_name or advisor.email,
                     seeker.full_name if seeker and seeker.full_name else "A client",
-                    service_type=booking.service_type,
+                    name=booking.name,
                     amount_usd=txn.amount_usd,
                     payout_usd=txn.advisor_payout_usd,
                     invoice_number=f"{txn.invoice_number:08d}",
@@ -517,7 +517,7 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
             recipient_id=booking.seeker_id,
             type=NotificationType.payment_succeeded,
             title="Payment received",
-            body=f"${txn.amount_usd:.2f} paid for {booking.service_type}",
+            body=f"${txn.amount_usd:.2f} paid for {booking.name}",
             actor_id=booking.seeker_id,
         )
         await _notify_payment(
@@ -526,7 +526,7 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
             recipient_id=booking.advisor_id,
             type=NotificationType.payment_succeeded,
             title="Consultation paid",
-            body=f"Your client paid ${txn.amount_usd:.2f} for {booking.service_type}",
+            body=f"Your client paid ${txn.amount_usd:.2f} for {booking.name}",
             actor_id=booking.seeker_id,
         )
         # Notify advisor of the new booking request only after payment is confirmed
@@ -537,7 +537,7 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
             user_id=booking.advisor_id,
             type=NotificationType.booking_requested,
             title="New consultation request",
-            body=f"Payment received for {booking.service_type}",
+            body=f"Payment received for {booking.name}",
             entity_type=NotificationEntityType.booking,
             entity_id=booking.id,
             actor_id=booking.seeker_id,
@@ -548,7 +548,7 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
                 user_id=booking.seeker_id,
                 type=NotificationType.booking_confirmed,
                 title="Booking confirmed",
-                body=f"Your {booking.service_type} session has been confirmed",
+                body=f"Your {booking.name} session has been confirmed",
                 entity_type=NotificationEntityType.booking,
                 entity_id=booking.id,
                 actor_id=booking.advisor_id,
@@ -597,7 +597,7 @@ async def _handle_checkout_expired(session: AsyncSession, cs: object) -> None:
             recipient_id=booking.seeker_id,
             type=NotificationType.payment_failed,
             title="Checkout expired",
-            body=f"Your payment for {booking.service_type} was not completed",
+            body=f"Your payment for {booking.name} was not completed",
         )
         # Notify advisor if they were already notified of the request
         if booking.status == BookingStatus.cancelled:
@@ -673,7 +673,7 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
             recipient_id=booking.seeker_id,
             type=NotificationType.payment_refunded,
             title="Payment refunded",
-            body=f"${refunded_amount_usd:.2f} refunded for {booking.service_type}",
+            body=f"${refunded_amount_usd:.2f} refunded for {booking.name}",
         )
 
     await session.flush()
@@ -745,7 +745,7 @@ async def _refund_transaction_record(
             recipient_id=booking.seeker_id,
             type=NotificationType.payment_refunded,
             title="Payment refunded",
-            body=f"${refund_amount:.2f} refunded for {booking.service_type}",
+            body=f"${refund_amount:.2f} refunded for {booking.name}",
             actor_id=initiated_by,
         )
 
@@ -1154,12 +1154,12 @@ def list_for_advisor_stmt(
     advisor_id: uuid.UUID,
     *,
     q: str | None = None,
-    service_types: list[str] | None = None,
+    service_ids: list[uuid.UUID] | None = None,
 ) -> Select[tuple[Transaction]]:
     """Non-archived transactions for an advisor's bookings (earnings / payments lists).
 
     ``q`` searches seeker name / email and the human-readable appointment id
-    (accepts the ``#0000000`` display form or a bare number); ``service_types``
+    (accepts the ``#0000000`` display form or a bare number); ``service_ids``
     filters on the booking's snapshotted service type.
     """
     stmt = (
@@ -1180,8 +1180,8 @@ def list_for_advisor_stmt(
         if digits.isdigit():
             conditions.append(cast(Booking.appointment_number, String).like(f"%{digits}%"))
         stmt = stmt.where(or_(*conditions))
-    if service_types:
-        stmt = stmt.where(Booking.service_type.in_(service_types))
+    if service_ids:
+        stmt = stmt.where(Booking.service_id.in_(service_ids))
     return stmt.order_by(Transaction.created_at.desc())
 
 
@@ -1267,7 +1267,7 @@ async def build_invoice(
             from_address = country_name(code) or code
         line_items = [
             InvoiceLineItem(
-                description=booking.service_type,
+                description=booking.name,
                 quantity=1,
                 unit_price_usd=txn.amount_usd,
                 total_usd=txn.amount_usd,
@@ -1282,7 +1282,7 @@ async def build_invoice(
         from_address = getattr(settings, "INVOICE_FROM_ADDRESS", None)
         line_items = [
             InvoiceLineItem(
-                description=booking.service_type,
+                description=booking.name,
                 quantity=1,
                 unit_price_usd=txn.amount_usd,
                 total_usd=txn.amount_usd,
@@ -1323,7 +1323,7 @@ def list_for_seeker_stmt(
     seeker_id: uuid.UUID,
     *,
     q: str | None = None,
-    service_types: list[str] | None = None,
+    service_ids: list[uuid.UUID] | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
     sort: str = "-created_at",
@@ -1342,12 +1342,12 @@ def list_for_seeker_stmt(
             or_(
                 User.full_name.ilike(pattern),
                 User.email.ilike(pattern),
-                Booking.service_type.ilike(pattern),
+                Booking.name.ilike(pattern),
                 cast(Transaction.invoice_number, String).ilike(pattern),
             )
         )
-    if service_types:
-        stmt = stmt.where(Booking.service_type.in_(service_types))
+    if service_ids:
+        stmt = stmt.where(Booking.service_id.in_(service_ids))
     if date_from is not None:
         start = datetime(date_from.year, date_from.month, date_from.day, tzinfo=UTC)
         stmt = stmt.where(Transaction.created_at >= start)
@@ -1389,7 +1389,8 @@ async def seeker_payment_read(
         advisor_photo_url=resolve_media_url(
             advisor_profile.profile_photo_url if advisor_profile else None, settings
         ),
-        service_type=booking.service_type,
+        service_id=booking.service_id,
+        name=booking.name,
         created_at=txn.created_at,
         amount_usd=txn.amount_usd,
         total_amount=txn.amount_usd,
@@ -1422,7 +1423,7 @@ async def export_seeker_history_csv(
     settings: Settings,
     *,
     q: str | None = None,
-    service_types: list[str] | None = None,
+    service_ids: list[uuid.UUID] | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
     sort: str = "-created_at",
@@ -1431,7 +1432,7 @@ async def export_seeker_history_csv(
     stmt = list_for_seeker_stmt(
         seeker_id,
         q=q,
-        service_types=service_types,
+        service_ids=service_ids,
         date_from=date_from,
         date_to=date_to,
         sort=sort,
@@ -1448,7 +1449,7 @@ async def export_seeker_history_csv(
                 row.invoice_id or "",
                 row.advisor_name or "",
                 row.advisor_email or "",
-                row.service_type,
+                row.name,
                 row.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
                 f"{row.total_amount:.2f}",
                 row.display_status,
@@ -1632,7 +1633,8 @@ async def finance_read(
         advisor_id=booking.advisor_id,
         advisor_name=advisor.full_name if advisor else None,
         advisor_email=advisor.email if advisor else None,
-        service_type=booking.service_type,
+        service_id=booking.service_id,
+        name=booking.name,
         scheduled_start=booking.scheduled_start,
         invoice_id=format_invoice_id(txn.invoice_number),
         display_id=_build_display_id(txn),
@@ -1682,7 +1684,8 @@ async def advisor_earnings_payment_read(
         seeker_id=booking.seeker_id,
         seeker_name=seeker.full_name if seeker else None,
         seeker_email=seeker.email if seeker else None,
-        service_type=booking.service_type,
+        service_id=booking.service_id,
+        name=booking.name,
         scheduled_start=booking.scheduled_start,
         appointment_id=format_appointment_id(booking.appointment_number),
         invoice_id=format_invoice_id(txn.invoice_number),
@@ -1710,7 +1713,7 @@ async def resend_receipt(session: AsyncSession, txn: Transaction, settings: Sett
             seeker.email,
             seeker.full_name or "",
             (advisor.full_name if advisor and advisor.full_name else "Advisor"),
-            service_type=booking.service_type,
+            name=booking.name,
             amount_usd=txn.amount_usd,
             invoice_number=format_invoice_id(txn.invoice_number) or f"{txn.invoice_number:08d}",
             settings=settings,

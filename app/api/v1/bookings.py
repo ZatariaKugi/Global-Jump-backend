@@ -17,7 +17,6 @@ from app.core.exceptions import PermissionDeniedError
 from app.core.file_storage import resolve_url
 from app.core.logging import get_logger
 from app.db.session import SessionDep
-from app.models.advisor_profile import AdvisorServiceType
 from app.models.booking import Booking, BookingStatus
 from app.models.booking_note import BookingNote, BookingNoteAttachment
 from app.models.user import User, UserRole
@@ -151,7 +150,7 @@ async def _send_confirmations(session: SessionDep, booking: Booking, settings: S
                 recipient.full_name or recipient.email,
                 (other.full_name or other.email) if other else "your counterpart",
                 booking_id=str(booking.id),
-                service_type=booking.service_type,
+                name=booking.name,
                 start_utc=as_utc(booking.scheduled_start),
                 end_utc=as_utc(booking.scheduled_end),
                 duration_minutes=booking.duration_minutes,
@@ -178,7 +177,7 @@ async def _send_reschedule_notifications(
                 recipient.full_name or recipient.email,
                 (other.full_name or other.email) if other else "your counterpart",
                 booking_id=str(booking.id),
-                service_type=booking.service_type,
+                name=booking.name,
                 start_utc=as_utc(booking.scheduled_start),
                 end_utc=as_utc(booking.scheduled_end),
                 duration_minutes=booking.duration_minutes,
@@ -213,7 +212,7 @@ async def _send_cancellation_notifications(
                 recipient.full_name or recipient.email,
                 (other.full_name or other.email) if other else "your counterpart",
                 booking_id=str(booking.id),
-                service_type=booking.service_type,
+                name=booking.name,
                 start_utc=as_utc(booking.scheduled_start),
                 reason=booking.cancellation_reason,
                 cancelled_by=cancelled_by,
@@ -237,7 +236,7 @@ async def _send_rejection_notification(
             seeker.full_name or seeker.email,
             (advisor.full_name or advisor.email) if advisor else "the advisor",
             booking_id=str(booking.id),
-            service_type=booking.service_type,
+            name=booking.name,
             start_utc=as_utc(booking.scheduled_start),
             reason=booking.cancellation_reason,
             settings=settings,
@@ -265,7 +264,7 @@ async def _send_note_added_notification(
             author.full_name or author.email,
             recipient.full_name or recipient.email,
             booking_id=str(booking.id),
-            service_type=booking.service_type,
+            name=booking.name,
             preview=preview,
             has_attachments=bool(note.attachments),
             settings=settings,
@@ -287,7 +286,11 @@ async def create_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings,
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
             viewer_id=current_user.id,
             viewer_role=current_user.role,
         ),
@@ -306,13 +309,13 @@ async def list_my_bookings(
     seeker_id: uuid.UUID | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
-    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
+    service_id: Annotated[list[uuid.UUID] | None, Query()] = None,
     q: Annotated[
         str | None,
         Query(
             max_length=100,
             description=(
-                "Search appointment ID, service_type, and counterpart name/email "
+                "Search appointment ID, name, and counterpart name/email "
                 "(advisor→client when advisor; advisor when seeker)"
             ),
         ),
@@ -329,9 +332,16 @@ async def list_my_bookings(
     (null outside the scheduled window).
     """
     role = current_user.role
-    types = [t.value for t in service_type] if service_type else None
     stmt = booking_service.list_for_user_stmt(
-        current_user.id, role, status, seeker_id, date_from, date_to, types, q, sort
+        current_user.id,
+        role,
+        status,
+        seeker_id,
+        date_from,
+        date_to,
+        service_id,
+        q,
+        sort,
     )
     bookings, total = await paginate(session, stmt, params)
 
@@ -417,7 +427,11 @@ async def get_next_upcoming_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead | None](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings,
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
             viewer_id=current_user.id,
             viewer_role=current_user.role,
         ),
@@ -437,7 +451,11 @@ async def get_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings,
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
             viewer_id=current_user.id,
             viewer_role=current_user.role,
         ),
@@ -475,7 +493,11 @@ async def accept_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings,
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
             viewer_id=current_user.id,
             viewer_role=current_user.role,
         ),
@@ -498,7 +520,11 @@ async def reject_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings,
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
             viewer_id=current_user.id,
             viewer_role=current_user.role,
         ),
@@ -520,7 +546,11 @@ async def deal_later_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings,
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
             viewer_id=current_user.id,
             viewer_role=current_user.role,
         ),
@@ -589,7 +619,11 @@ async def update_booking_important(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings,
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
             viewer_id=current_user.id,
             viewer_role=current_user.role,
         ),
@@ -613,7 +647,11 @@ async def update_booking_interpreter(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings,
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
             viewer_id=current_user.id,
             viewer_role=current_user.role,
         ),
@@ -645,9 +683,13 @@ async def cancel_booking(
     log.info("cancel_booking_start", booking_id=str(booking_id))
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
     log.info("cancel_booking_after_get", booking_id=str(booking.id))
-    booking, refund_amount = await booking_service.cancel(session, booking, current_user.id, data.reason, settings)
+    booking, refund_amount = await booking_service.cancel(
+        session, booking, current_user.id, data.reason, settings
+    )
     log.info("cancel_booking_after_cancel", booking_id=str(booking.id))
-    await _send_cancellation_notifications(session, booking, current_user.id, settings, refund_amount)
+    await _send_cancellation_notifications(
+        session, booking, current_user.id, settings, refund_amount
+    )
     log.info("cancel_booking_after_notifications", booking_id=str(booking.id))
     seeker, advisor = await _party_names(session, booking)
     log.info("cancel_booking_after_parties", booking_id=str(booking.id))
@@ -684,7 +726,11 @@ async def reschedule_booking(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings,
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
             viewer_id=current_user.id,
             viewer_role=current_user.role,
         ),
@@ -702,7 +748,11 @@ async def _booking_action_read(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings,
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
             viewer_id=current_user.id,
             viewer_role=current_user.role,
         ),
@@ -749,7 +799,11 @@ async def mark_booking_no_show(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings,
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
             viewer_id=current_user.id,
             viewer_role=current_user.role,
         ),

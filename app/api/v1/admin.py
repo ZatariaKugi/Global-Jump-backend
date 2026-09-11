@@ -8,6 +8,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
+from sqlalchemy import select
 
 from app.api.deps import CurrentPrincipal, RequestIdDep, SettingsDep, require_role
 from app.api.pagination import PaginationDep, page_meta, paginate
@@ -15,6 +16,7 @@ from app.core.file_storage import resolve_url
 from app.core.visa_types import OptionalVisaType
 from app.db.session import SessionDep
 from app.models.advisor_credential import CredentialStatus
+from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import AssessmentQuestion
 from app.models.assessment_threshold import AssessmentThreshold
 from app.models.booking import BookingStatus
@@ -171,7 +173,7 @@ async def update_advisor_verification(
     Rejection emails include an optional ``reason``.
     """
     from app.core.exceptions import NotFoundError
-    from app.services import advisor_credential_service
+    from app.services import advisor_credential_service, seeker_recommendation_service
     from app.services.email_service import (
         schedule_email,
         send_advisor_pending_email,
@@ -184,6 +186,7 @@ async def update_advisor_verification(
         raise NotFoundError("Advisor not found")
 
     previous_status = advisor.verification_status
+    was_active = advisor.is_active
     advisor.verification_status = body.status
     if body.status == VerificationStatus.approved:
         advisor.is_active = True
@@ -220,8 +223,18 @@ async def update_advisor_verification(
 
     if (
         body.status == VerificationStatus.approved
-        and previous_status != VerificationStatus.approved
+        and (previous_status != VerificationStatus.approved or not was_active)
     ):
+        advisor_profile = await session.scalar(
+            select(AdvisorProfile).where(AdvisorProfile.user_id == advisor.id)
+        )
+        if advisor_profile is not None:
+            await seeker_recommendation_service.notify_seekers_about_new_advisor(
+                session,
+                advisor,
+                advisor_profile,
+                settings=settings,
+            )
         schedule_email(
             send_advisor_welcome_email(
                 advisor.email,
@@ -1896,7 +1909,10 @@ async def list_country_rules(
     status: RulePublishStatus | None = None,
     sort: str | None = Query(
         default=None,
-        description="Only ``newest`` is honored (created_at desc); omitted/unknown keep country/visa/version order",
+        description=(
+            "Only ``newest`` is honored (created_at desc); omitted/unknown keep "
+            "country/visa/version order"
+        ),
     ),
 ) -> ResponseEnvelope[list[CountryRuleRead]]:
     stmt = country_rule_service.list_rules_stmt(

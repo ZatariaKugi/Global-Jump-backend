@@ -46,7 +46,8 @@ class NextUpcomingRead(BaseModel):
     appointment_id: str
     seeker_id: uuid.UUID
     seeker_name: str | None
-    service_type: str
+    service_id: uuid.UUID | None
+    name: str
     status: str
     scheduled_start: datetime
     scheduled_end: datetime

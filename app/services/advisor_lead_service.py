@@ -300,14 +300,8 @@ async def dismiss(session: AsyncSession, lead: AdvisorLead, actor_id: uuid.UUID)
     return lead
 
 
-async def latest_booking_for_pair(
-    session: AsyncSession, seeker_id: uuid.UUID, advisor_id: uuid.UUID
-) -> Booking | None:
-    """Most recent booking between this seeker and advisor, if any."""
-    result = await session.execute(
-        select(Booking)
-        .where(Booking.seeker_id == seeker_id, Booking.advisor_id == advisor_id)
-        .order_by(Booking.created_at.desc())
-        .limit(1)
-    )
-    return result.scalars().first()
+async def booking_for_lead(session: AsyncSession, lead: AdvisorLead) -> Booking | None:
+    """Return only the booking explicitly linked to this lead."""
+    if lead.booking_id is None:
+        return None
+    return await session.get(Booking, lead.booking_id)

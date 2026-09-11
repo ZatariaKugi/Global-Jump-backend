@@ -46,9 +46,16 @@ class Booking(BaseModel):
     # Human-readable Appointment ID shown in the Consultations list (e.g. "3520145678").
     appointment_number: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
 
-    # Service snapshot — copied from the advisor's offering at booking time so
+    # Stable reference to the global service catalog row. Nullable for legacy rows.
+    service_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("advisor_offered_services.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Service name snapshot — copied at booking time so
     # later price/duration changes don't rewrite history.
-    service_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
     duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
     price_usd: Mapped[float] = mapped_column(Float, nullable=False)
 
@@ -89,11 +96,9 @@ class Booking(BaseModel):
         DateTime(timezone=True), nullable=True
     )
 
-
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
 
     meeting_platform: Mapped[str | None] = mapped_column(String(100), nullable=True)
     meeting_id: Mapped[str | None] = mapped_column(String(100), nullable=True)

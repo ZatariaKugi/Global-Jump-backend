@@ -9,7 +9,7 @@
     Hi {{ full_name }}, your consultation is booked. A calendar invite is attached to this email.
   </p>
   {{ details_open() }}
-  {{ details_row("Service", service_type) }}
+  {{ details_row("Service", name) }}
   {{ details_row("With", other_party) }}
   {{ details_row("When", start_str ~ " UTC") }}
   {{ details_row("Duration", duration_minutes ~ " minutes") }}

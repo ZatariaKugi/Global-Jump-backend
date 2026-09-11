@@ -10,7 +10,7 @@
     {% if is_host %}Use the host link below to start the meeting.{% else %}Use the link below to join when it's time.{% endif %}
   </p>
   {{ details_open() }}
-  {{ details_row("Service", service_type) }}
+  {{ details_row("Service", name) }}
   {{ details_row("With", other_party) }}
   {{ details_row("When", start_str ~ " UTC") }}
   {{ details_row("Duration", duration_minutes ~ " minutes") }}

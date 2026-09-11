@@ -26,9 +26,10 @@ from app.core.file_storage import delete_file, resolve_url
 from app.core.visa_types import OptionalVisaType, visa_type_name
 from app.db.session import SessionDep
 from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
-from app.models.advisor_profile import AdvisorProfile, AdvisorServiceType
+from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import Assessment
 from app.models.booking import Booking, BookingStatus
+from app.models.notification import NotificationType
 from app.models.regulatory_update import RegulatoryUpdate
 from app.models.seeker_document import SeekerDocumentStatus
 from app.models.user import User, UserRole, VerificationStatus
@@ -88,11 +89,11 @@ from app.services import (
     bookmark_service,
     conversation_service,
     email_service,
+    notification_service,
     payment_service,
     payout_service,
     review_service,
     seeker_document_service,
-    seeker_profile_service,
     seeker_recommendation_service,
 )
 from app.services.advisor_search_service import AdvisorSearchFilters, SortOption
@@ -492,48 +493,40 @@ async def complete_advisor_onboarding(
             session, current_user.full_name
         )
 
-    resolved_types = await seeker_profile_service.resolve_service_types(
-        session, list(data.service_types)
-    )
-
-    priced_by_type: dict[str, OfferedServiceItemInput] = {}
+    priced_by_id: dict[uuid.UUID, OfferedServiceItemInput] = {}
     if data.services is not None:
         for item in data.services:
-            resolved = await seeker_profile_service.resolve_service_types(
-                session, [item.service_type]
-            )
-            service_type = resolved[0] if resolved else item.service_type
-            priced_by_type[service_type.casefold()] = OfferedServiceItemInput(
-                service_type=service_type,
+            priced_by_id[item.service_id] = OfferedServiceItemInput(
+                service_id=item.service_id,
                 price_usd=item.price_usd,
                 duration_minutes=item.duration_minutes,
             )
     else:
-        # Keep prices already saved via PUT /offered_services when POST only sends types.
+        # Keep prices already saved via PUT /offered_services when POST only sends IDs.
         for row in profile.offered_services or []:
-            priced_by_type[row.service_type.casefold()] = OfferedServiceItemInput(
-                service_type=row.service_type,
+            service_id = row.service_id or row.id
+            priced_by_id[service_id] = OfferedServiceItemInput(
+                service_id=service_id,
                 price_usd=row.price_usd,
                 duration_minutes=row.duration_minutes or 30,
             )
 
     offered_items: list[OfferedServiceItemInput] = []
-    seen: set[str] = set()
-    for service_type in resolved_types:
-        key = service_type.casefold()
-        if key in seen:
+    seen: set[uuid.UUID] = set()
+    for service_id in data.service_ids:
+        if service_id in seen:
             continue
-        seen.add(key)
-        existing = priced_by_type.get(key)
+        seen.add(service_id)
+        existing = priced_by_id.get(service_id)
         offered_items.append(
             existing
             if existing is not None
-            else OfferedServiceItemInput(service_type=service_type)
+            else OfferedServiceItemInput(service_id=service_id)
         )
     if data.services is not None:
-        for key, item in priced_by_type.items():
-            if key not in seen:
-                seen.add(key)
+        for service_id, item in priced_by_id.items():
+            if service_id not in seen:
+                seen.add(service_id)
                 offered_items.append(item)
 
     update_fields: dict[str, object] = {
@@ -551,7 +544,7 @@ async def complete_advisor_onboarding(
     update = AdvisorProfileUpdate(**update_fields)
     profile = await advisor_profile_service.update(session, profile, update)
 
-    if data.service_types or data.services is not None:
+    if data.service_ids or data.services is not None:
         await advisor_offered_service_service.replace_for_advisor(
             session,
             current_user.id,
@@ -985,9 +978,7 @@ async def delete_credential(
 async def _build_lead_read(session: SessionDep, lead: AdvisorLead) -> AdvisorLeadRead:
     seeker = await session.get(User, lead.seeker_id)
     assessment = await session.get(Assessment, lead.assessment_id)
-    booking = await advisor_lead_service.latest_booking_for_pair(
-        session, lead.seeker_id, lead.advisor_id
-    )
+    booking = await advisor_lead_service.booking_for_lead(session, lead)
     return AdvisorLeadRead(
         id=lead.id,
         seeker_id=lead.seeker_id,
@@ -1067,12 +1058,33 @@ async def contact_my_lead(
     lead_id: uuid.UUID,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorLeadRead]:
     """Record that the advisor reached out to this lead (status marker only —
     in-app chat requires an actual booking per PRD §3.7.1)."""
     lead = await advisor_lead_service.get_for_advisor(session, lead_id, current_user.id)
     lead = await advisor_lead_service.mark_contacted(session, lead, current_user.id)
+    seeker = await session.get(User, lead.seeker_id)
+    if seeker is not None:
+        advisor_name = current_user.full_name or current_user.email
+        await notification_service.notify(
+            session,
+            user_id=seeker.id,
+            type=NotificationType.lead_contacted,
+            title="An advisor has contacted you",
+            body=f"{advisor_name} has contacted you about your advisor match.",
+            entity_id=lead.id,
+            actor_id=current_user.id,
+        )
+        email_service.schedule_email(
+            email_service.send_lead_contacted_email(
+                seeker.email,
+                seeker.full_name or seeker.email,
+                advisor_name,
+                settings,
+            )
+        )
     return ResponseEnvelope[AdvisorLeadRead](
         data=await _build_lead_read(session, lead), meta=Meta(request_id=request_id)
     )
@@ -1140,7 +1152,7 @@ async def list_my_clients(
     settings: SettingsDep,
     request_id: RequestIdDep,
     q: Annotated[str | None, Query(max_length=100)] = None,
-    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
+    service_id: Annotated[list[uuid.UUID] | None, Query()] = None,
     status: BookingStatus | None = None,
 ) -> ResponseEnvelope[list[ClientRead]]:
     """Seekers with at least one prior booking — Clients table + calendar picker.
@@ -1150,10 +1162,11 @@ async def list_my_clients(
     ``consultation_type``, ``status``, ``is_important``) come from the latest
     booking; ``match_score`` from the latest non-dismissed lead when present.
 
-    ``service_type`` / ``status`` filter on that latest booking.
+    ``name`` / ``status`` filter on that latest booking.
     """
-    types = [t.value for t in service_type] if service_type else None
-    stmt = booking_service.list_clients_stmt(current_user.id, q, service_types=types, status=status)
+    stmt = booking_service.list_clients_stmt(
+        current_user.id, q, service_ids=service_id, status=status
+    )
     clients, total = await paginate(session, stmt, params)
     data = await booking_service.build_client_reads(session, current_user.id, clients, settings)
     return ResponseEnvelope[list[ClientRead]](
@@ -1174,7 +1187,7 @@ async def list_customer_documents(
     settings: SettingsDep,
     request_id: RequestIdDep,
     q: Annotated[str | None, Query(max_length=100)] = None,
-    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
+    service_id: Annotated[list[uuid.UUID] | None, Query()] = None,
     documents_status: CustomerDocumentsRowStatus | None = None,
     sort: Annotated[BookingSort, Query()] = "-scheduled_start",
 ) -> ResponseEnvelope[list[CustomerDocumentsRowRead]]:
@@ -1185,11 +1198,10 @@ async def list_customer_documents(
     ``GET /me/clients/{seeker_id}/documents`` for the review UI and
     ``GET /bookings/{booking_id}/details`` for Booking detail.
     """
-    types = [t.value for t in service_type] if service_type else None
     stmt = seeker_document_service.list_customer_documents_stmt(
         current_user.id,
         q=q,
-        service_types=types,
+        service_ids=service_id,
         documents_status=documents_status,
         sort=sort,
     )
@@ -1411,11 +1423,10 @@ async def list_my_payments(
         str | None,
         Query(max_length=100, description="Search seeker name / email or appointment id"),
     ] = None,
-    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
+    service_id: Annotated[list[uuid.UUID] | None, Query()] = None,
 ) -> ResponseEnvelope[list[TransactionAdvisorRead]]:
     """Earnings / customer-payments history — one row per transaction on this advisor's bookings."""
-    types = [t.value for t in service_type] if service_type else None
-    stmt = payment_service.list_for_advisor_stmt(current_user.id, q=q, service_types=types)
+    stmt = payment_service.list_for_advisor_stmt(current_user.id, q=q, service_ids=service_id)
     txns, total = await paginate(session, stmt, params)
 
     data = []

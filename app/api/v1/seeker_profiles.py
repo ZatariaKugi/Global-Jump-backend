@@ -93,7 +93,7 @@ async def complete_onboarding(
         destination=data.intended_destination,
         visa=data.intended_visa_type,
         languages=data.preferred_languages,
-        services=data.services,
+        service_ids=data.service_ids,
     )
     try:
         log.info("onboarding_require_seeker", user_id=user_id)
@@ -119,8 +119,8 @@ async def complete_onboarding(
             employment_status=data.employment_status,
             employer_name=data.employer_name,
             preferred_languages=data.preferred_languages,
-            needed_services=data.services or data.service_ids,
-            service_ids=data.service_ids or data.services,
+            needed_services=data.service_ids,
+            service_ids=data.service_ids,
         )
 
         log.info("onboarding_save_profile", user_id=user_id, profile_id=str(profile.id))

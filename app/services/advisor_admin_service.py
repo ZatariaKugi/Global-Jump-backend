@@ -161,10 +161,20 @@ async def build_list_read(
                 avg_rating=avg,
                 review_count=review_count,
                 earnings=earnings_by_advisor.get(a.id, 0.0),
+                is_bookable=_has_priced_service(profile),
                 created_at=a.created_at,
             )
         )
     return out
+
+
+def _has_priced_service(profile: AdvisorProfile | None) -> bool:
+    """True when at least one offered service carries a price."""
+    if profile is None:
+        return False
+    return any(
+        s.price_usd is not None and s.price_usd > 0 for s in (profile.offered_services or [])
+    )
 
 
 async def get_advisor_detail(

@@ -19,7 +19,6 @@ from app.models.advisor_profile import (
     AdvisorLanguage,
     AdvisorOfferedService,
     AdvisorProfile,
-    AdvisorService,
     AdvisorVisaSpecialization,
 )
 from app.models.assessment import (
@@ -100,7 +99,6 @@ __all__ = [
     "AdvisorCountryExpertise",
     "AdvisorLanguage",
     "AdvisorOfferedService",
-    "AdvisorService",
     "AdvisorCredential",
     "AdvisorBookmark",
     "AdvisorLead",

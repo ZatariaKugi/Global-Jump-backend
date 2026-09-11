@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
+from app.api.deps import RequestIdDep, SettingsDep
 from app.db.session import SessionDep
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.support_message import SupportMessageCreate, SupportMessageRead

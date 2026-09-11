@@ -2,7 +2,7 @@ Hi {{ full_name }},
 
 Unfortunately your consultation request could not be accepted.
 
-  Service:         {{ service_type }}
+  Service:         {{ name }}
   With:            {{ other_party }}
   Requested time:  {{ start_str }} (UTC)
 {% if reason %}  Reason:          {{ reason }}

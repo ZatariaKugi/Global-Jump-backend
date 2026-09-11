@@ -14,11 +14,32 @@ from app.db.session import SessionDep
 from app.models.ticket_message import TicketMessageAttachment
 from app.models.user import User
 from app.schemas.response import Meta, ResponseEnvelope
-from app.schemas.support_ticket import TicketRead
+from app.schemas.support_ticket import TicketRead, TicketSelfCreate
 from app.schemas.ticket_message import TicketMessageRead, TicketMessageSend
 from app.services import support_ticket_service, ticket_message_service
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
+
+
+@router.post("", status_code=201, response_model=ResponseEnvelope[TicketRead])
+async def create_my_ticket(
+    body: TicketSelfCreate,
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[TicketRead]:
+    """Open a support ticket as the current seeker/advisor.
+
+    ``category=booking`` requires ``booking_id`` (must belong to the caller as
+    seeker or advisor on that booking); its session context is snapshotted onto
+    the ticket. The ``description`` becomes the opening thread message.
+    """
+    ticket = await support_ticket_service.create_for_user(session, body, current_user)
+    return ResponseEnvelope[TicketRead](
+        data=await support_ticket_service.ticket_read(session, ticket, settings),
+        meta=Meta(request_id=request_id),
+    )
 
 
 @router.get("", response_model=ResponseEnvelope[list[TicketRead]])
@@ -28,10 +49,28 @@ async def list_my_tickets(
     session: SessionDep,
     settings: SettingsDep,
     request_id: RequestIdDep,
+    status: str | None = None,
+    search: str | None = None,
 ) -> ResponseEnvelope[list[TicketRead]]:
-    stmt = support_ticket_service.list_for_user_stmt(current_user.id)
+    """List the current user's tickets.
+
+    ``status``: ``open`` | ``in_progress`` | ``resolved`` | ``closed`` (FE
+    aliases accepted). ``search`` matches ticket number / subject / description.
+    """
+    from app.core.exceptions import AppError
+
+    try:
+        status_filter = support_ticket_service.coerce_status_filter(status)
+    except ValueError as exc:
+        raise AppError(str(exc), code="invalid_status") from exc
+
+    stmt = support_ticket_service.list_for_user_stmt(
+        current_user.id, status=status_filter, search=search
+    )
     tickets, total = await paginate(session, stmt, params)
-    data = await support_ticket_service.build_list_reads(session, tickets, settings)
+    data = await support_ticket_service.build_list_reads(
+        session, tickets, settings, include_internal=False
+    )
     return ResponseEnvelope[list[TicketRead]](data=data, meta=page_meta(params, total, request_id))
 
 
@@ -45,7 +84,9 @@ async def get_my_ticket(
 ) -> ResponseEnvelope[TicketRead]:
     ticket = await support_ticket_service.get_for_user(session, ticket_id, current_user.id)
     return ResponseEnvelope[TicketRead](
-        data=await support_ticket_service.ticket_read(session, ticket, settings),
+        data=await support_ticket_service.ticket_read(
+            session, ticket, settings, include_internal=False
+        ),
         meta=Meta(request_id=request_id),
     )
 
@@ -89,6 +130,7 @@ async def send_my_ticket_message(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[TicketMessageRead]:
     ticket = await support_ticket_service.get_for_user(session, ticket_id, current_user.id)
+    support_ticket_service.assert_repliable(ticket)
 
     attachments: list[TicketMessageAttachment] = []
     expected_prefix = f"ticket_attachment/{current_user.id}/"

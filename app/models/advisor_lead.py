@@ -32,6 +32,9 @@ class AdvisorLead(BaseModel):
     assessment_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("assessments.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    booking_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     match_score: Mapped[float] = mapped_column(Float, nullable=False)
     match_reasons: Mapped[str] = mapped_column(String(1000), nullable=False)

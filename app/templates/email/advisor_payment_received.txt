@@ -4,7 +4,7 @@ Hi {{ full_name }},
 scheduled per your payout settings.
 
   Invoice:      #{{ invoice_number }}
-  Service:      {{ service_type }}
+  Service:      {{ name }}
   Client:       {{ seeker_name }}
   Amount paid:  ${{ amount_usd }}
   Your payout:  ${{ payout_usd }}

@@ -8,7 +8,6 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, computed_field
 
-from app.models.advisor_profile import AdvisorServiceType
 from app.models.booking import BookingStatus, PaymentStatus
 from app.schemas.booking_document_request import DocumentRequestRead
 from app.schemas.booking_note import BookingNoteRead
@@ -25,7 +24,7 @@ BookingSort = Literal[
 
 class BookingCreate(BaseModel):
     advisor_id: uuid.UUID
-    service_type: AdvisorServiceType
+    service_id: uuid.UUID
     scheduled_start: datetime
     seeker_note: str | None = Field(default=None, max_length=1000)
     timezone: str | None = Field(
@@ -36,21 +35,19 @@ class BookingCreate(BaseModel):
         ),
     )
 
-
 class AdvisorBookingCreate(BaseModel):
     """Advisor books a consultation directly for one of their existing clients.
 
-    Unlike the seeker-initiated flow, the advisor picks any service type they
-    *offer* (``offered_services``) rather than a priced ``AdvisorService``, and
+    Unlike the seeker-initiated flow, the advisor picks any service they
+    *offer* (``offered_services``) rather than a priced service, and
     supplies the slot length directly — advisor-created bookings carry no price.
     """
 
     seeker_id: uuid.UUID
-    service_type: AdvisorServiceType
+    service_id: uuid.UUID
     scheduled_start: datetime
     duration_minutes: int = Field(ge=15, le=480)
     seeker_note: str | None = Field(default=None, max_length=1000)
-
 
 class ClientRead(BaseModel):
     """Advisor Clients table / picker row.
@@ -109,7 +106,8 @@ class BookingRead(BaseModel):
     advisor_name: str | None
     advisor_email: str | None
     advisor_profile_photo_url: str | None
-    service_type: str
+    service_id: uuid.UUID | None = None
+    name: str
     duration_minutes: int
     # ``price_usd`` is the total charge; fee split uses PLATFORM_COMMISSION_RATE.
     advisor_fee_usd: float
@@ -153,7 +151,7 @@ class AdminBookingPickerRead(BaseModel):
     seeker_name: str | None
     advisor_name: str | None
     scheduled_start: datetime
-    service_type: str
+    name: str
     status: BookingStatus
 
 
@@ -177,7 +175,7 @@ class BookingHistoryRead(BaseModel):
     seeker_name: str | None
     seeker_email: str | None
     advisor_name: str | None
-    service_type: str
+    name: str
     scheduled_start: datetime
     scheduled_end: datetime
     status: BookingStatus
@@ -218,7 +216,7 @@ class BookingDetailsRead(BaseModel):
 
     appointment_id: str
     seeker_name: str | None
-    service_type: str
+    name: str
     scheduled_start: datetime
     duration_minutes: int
     amount_paid: float

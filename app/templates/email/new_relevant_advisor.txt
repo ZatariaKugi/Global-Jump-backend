@@ -1,0 +1,7 @@
+Hello {{ full_name }},
+
+{{ advisor_name }} is now available and matches your visa journey profile.
+
+View your recommendations: {{ dashboard_url }}
+
+— {{ app_name }}

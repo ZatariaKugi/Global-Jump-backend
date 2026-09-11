@@ -8,7 +8,6 @@ from app.api.v1 import (
     admin,
     admin_profile,
     advisor_offered_services,
-    advisor_services,
     advisors,
     assessments,
     auth,
@@ -40,7 +39,6 @@ api_router.include_router(users.router)
 api_router.include_router(seeker_profiles.router)
 api_router.include_router(availability.router)  # before advisors: /me/availability vs /{id}
 api_router.include_router(advisors.router)
-api_router.include_router(advisor_services.router)
 api_router.include_router(advisor_offered_services.router)
 api_router.include_router(bookings.router)
 api_router.include_router(bookmarks.router)

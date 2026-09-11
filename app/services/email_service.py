@@ -129,10 +129,8 @@ def _brand_defaults(settings: Settings) -> dict[str, object]:
         "year": datetime.now(UTC).year,
         "frontend_url": frontend,
         "support_email": "help@globaljump.com",
-        "faq_url": f"{frontend}/faqs",
-        "how_it_works_url": f"{frontend}/how-it-works",
-        "terms_url": f"{frontend}/terms",
-        "privacy_url": f"{frontend}/privacy",
+        "faq_url": f"{frontend}/#faqs",
+        "how_it_works_url": f"{frontend}/#how-it-works",
         "account_settings_url": f"{frontend}/settings",
         "social_facebook_url": "https://www.facebook.com/globaljump",
         "social_instagram_url": "https://www.instagram.com/globaljump",
@@ -483,7 +481,7 @@ async def send_payment_receipt_email(
     full_name: str,
     advisor_name: str,
     *,
-    service_type: str,
+    name: str,
     amount_usd: float,
     invoice_number: str,
     settings: Settings,
@@ -492,7 +490,7 @@ async def send_payment_receipt_email(
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
         "advisor_name": advisor_name,
-        "service_type": service_type,
+        "name": name,
         "amount_usd": f"{amount_usd:.2f}",
         "invoice_number": invoice_number,
         "year": datetime.now(UTC).year,
@@ -570,7 +568,7 @@ async def send_booking_confirmation_email(
     other_party: str,
     *,
     booking_id: str,
-    service_type: str,
+    name: str,
     start_utc: datetime,
     end_utc: datetime,
     duration_minutes: int,
@@ -584,7 +582,7 @@ async def send_booking_confirmation_email(
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
         "other_party": other_party,
-        "service_type": service_type,
+        "name": name,
         "start_str": _format_user_time(start_utc, user_timezone),
         "duration_minutes": duration_minutes,
         "price_usd": f"{price_usd:.2f}",
@@ -603,7 +601,7 @@ async def send_booking_confirmation_email(
 
     ics_content = build_ics(
         uid=f"{booking_id}@globlejump",
-        summary=f"{settings.EMAILS_FROM_NAME} consultation: {service_type}",
+        summary=f"{settings.EMAILS_FROM_NAME} consultation: {name}",
         description=f"Consultation with {other_party}",
         start_utc=start_utc,
         end_utc=end_utc,
@@ -657,7 +655,7 @@ async def send_booking_meeting_email(
     full_name: str,
     other_party: str,
     *,
-    service_type: str,
+    name: str,
     start_utc: datetime,
     duration_minutes: int,
     meeting_url: str,
@@ -671,7 +669,7 @@ async def send_booking_meeting_email(
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
         "other_party": other_party,
-        "service_type": service_type,
+        "name": name,
         "start_str": _format_user_time(start_utc, user_timezone),
         "duration_minutes": duration_minutes,
         "meeting_url": meeting_url,
@@ -728,7 +726,7 @@ async def send_new_consultation_request_email(
     other_party: str,
     *,
     booking_id: str,
-    service_type: str,
+    name: str,
     start_utc: datetime,
     settings: Settings,
     user_timezone: str | None = None,
@@ -738,7 +736,7 @@ async def send_new_consultation_request_email(
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
         "other_party": other_party,
-        "service_type": service_type,
+        "name": name,
         "start_str": _format_user_time(start_utc, user_timezone),
         "year": datetime.now(UTC).year,
     }
@@ -785,7 +783,7 @@ async def send_booking_rejected_email(
     other_party: str,
     *,
     booking_id: str,
-    service_type: str,
+    name: str,
     start_utc: datetime,
     reason: str | None,
     settings: Settings,
@@ -796,7 +794,7 @@ async def send_booking_rejected_email(
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
         "other_party": other_party,
-        "service_type": service_type,
+        "name": name,
         "start_str": _format_user_time(start_utc, user_timezone),
         "reason": reason,
         "year": datetime.now(UTC).year,
@@ -844,7 +842,7 @@ async def send_booking_rescheduled_email(
     other_party: str,
     *,
     booking_id: str,
-    service_type: str,
+    name: str,
     start_utc: datetime,
     end_utc: datetime,
     duration_minutes: int,
@@ -858,7 +856,7 @@ async def send_booking_rescheduled_email(
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
         "other_party": other_party,
-        "service_type": service_type,
+        "name": name,
         "start_str": _format_user_time(start_utc, user_timezone),
         "duration_minutes": duration_minutes,
         "price_usd": f"{price_usd:.2f}",
@@ -877,7 +875,7 @@ async def send_booking_rescheduled_email(
 
     ics_content = build_ics(
         uid=f"{booking_id}@globlejump",
-        summary=f"{settings.EMAILS_FROM_NAME} consultation: {service_type}",
+        summary=f"{settings.EMAILS_FROM_NAME} consultation: {name}",
         description=f"Consultation with {other_party}",
         start_utc=start_utc,
         end_utc=end_utc,
@@ -932,7 +930,7 @@ async def send_booking_cancelled_email(
     other_party: str,
     *,
     booking_id: str,
-    service_type: str,
+    name: str,
     start_utc: datetime,
     reason: str | None,
     cancelled_by: str | None = None,
@@ -945,7 +943,7 @@ async def send_booking_cancelled_email(
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
         "other_party": other_party,
-        "service_type": service_type,
+        "name": name,
         "start_str": _format_user_time(start_utc, user_timezone),
         "reason": reason,
         "cancelled_by": cancelled_by,
@@ -994,7 +992,7 @@ async def send_advisor_payment_notification_email(
     full_name: str,
     seeker_name: str,
     *,
-    service_type: str,
+    name: str,
     amount_usd: float,
     payout_usd: float,
     invoice_number: str,
@@ -1005,7 +1003,7 @@ async def send_advisor_payment_notification_email(
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
         "seeker_name": seeker_name,
-        "service_type": service_type,
+        "name": name,
         "amount_usd": f"{amount_usd:.2f}",
         "payout_usd": f"{payout_usd:.2f}",
         "invoice_number": invoice_number,
@@ -1070,14 +1068,14 @@ async def send_new_message_email(
 
     if not settings.SMTP_HOST:
         logger.info(
-            "new_message_email_issued [no smtp — logged]",
+            "new_message_email_issued [no smtp - logged]",
             to=to,
             conversation_id=conversation_id,
         )
         return
 
     message = _build_message(
-        subject=f"New message from {sender_name} – {settings.EMAILS_FROM_NAME}",
+        subject=f"New message from {sender_name} - {settings.EMAILS_FROM_NAME}",
         recipients=[to],
         body=_render("new_message.html", ctx, settings),
         subtype=MessageType.html,
@@ -1105,6 +1103,103 @@ async def send_new_message_email(
         )
 
 
+async def send_new_relevant_advisor_email(
+    to: str,
+    full_name: str,
+    advisor_name: str,
+    settings: Settings,
+) -> None:
+    """Notify a seeker that a newly approved advisor matches their profile."""
+    ctx = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "advisor_name": advisor_name,
+        "dashboard_url": f"{settings.FRONTEND_URL}/seeker/dashboard",
+        "year": datetime.now(UTC).year,
+    }
+    if not settings.SMTP_HOST:
+        logger.info(
+            "new_relevant_advisor_issued [no smtp — logged]",
+            to=to,
+            advisor_name=advisor_name,
+        )
+        return
+
+    message = _build_message(
+        subject=f"A new advisor matches your {settings.EMAILS_FROM_NAME} profile",
+        recipients=[to],
+        body=_render("new_relevant_advisor.html", ctx, settings),
+        subtype=MessageType.html,
+        alternative_body=_render("new_relevant_advisor.txt", ctx, settings),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            "List-Unsubscribe": f"<mailto:{settings.EMAILS_FROM}?subject=unsubscribe>",
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
+        return
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("new_relevant_advisor_email_sent", to=to, advisor_name=advisor_name)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "new_relevant_advisor_email_failed_smtp_unavailable",
+            to=to,
+            error=str(exc),
+        )
+
+
+async def send_lead_contacted_email(
+    to: str,
+    full_name: str,
+    advisor_name: str,
+    settings: Settings,
+) -> None:
+    """Tell a seeker that a matched advisor marked their lead as contacted."""
+    ctx = {
+        "app_name": settings.EMAILS_FROM_NAME,
+        "full_name": full_name or to,
+        "advisor_name": advisor_name,
+        "leads_url": f"{settings.FRONTEND_URL}/seeker/find-advisor",
+        "year": datetime.now(UTC).year,
+    }
+
+    if not settings.SMTP_HOST:
+        logger.info("lead_contacted_email_issued [no smtp — logged]", to=to)
+        return
+
+    message = _build_message(
+        subject=f"An advisor has contacted you – {settings.EMAILS_FROM_NAME}",
+        recipients=[to],
+        body=_render("lead_contacted.html", ctx, settings),
+        subtype=MessageType.html,
+        alternative_body=_render("lead_contacted.txt", ctx, settings),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
+        return
+
+    try:
+        fm = FastMail(_make_connection(settings))
+        await fm.send_message(message)
+        logger.info("lead_contacted_email_sent", to=to, advisor_name=advisor_name)
+    except (ConnectionErrors, OSError, SMTPException) as exc:
+        logger.warning(
+            "lead_contacted_email_failed_smtp_unavailable",
+            to=to,
+            advisor_name=advisor_name,
+            error=str(exc),
+        )
+
+
 async def send_booking_note_added_email(
     to: str,
     full_name: str,
@@ -1112,7 +1207,7 @@ async def send_booking_note_added_email(
     other_party: str,
     *,
     booking_id: str,
-    service_type: str,
+    name: str,
     preview: str | None,
     has_attachments: bool,
     settings: Settings,
@@ -1123,7 +1218,7 @@ async def send_booking_note_added_email(
         "full_name": full_name or to,
         "author_name": author_name,
         "other_party": other_party,
-        "service_type": service_type,
+        "name": name,
         "preview": preview,
         "has_attachments": has_attachments,
         "year": datetime.now(UTC).year,
@@ -1359,3 +1454,4 @@ async def send_document_requested_email(
             booking_id=booking_id,
             error=str(exc),
         )
+

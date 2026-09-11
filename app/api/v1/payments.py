@@ -13,7 +13,6 @@ from app.api.deps import CurrentUser, RequestIdDep, SettingsDep
 from app.api.pagination import PaginationDep, page_meta, paginate
 from app.core.exceptions import PermissionDeniedError
 from app.db.session import SessionDep
-from app.models.advisor_profile import AdvisorServiceType
 from app.models.transaction import Transaction
 from app.models.user import UserRole
 from app.schemas.payment import (
@@ -47,15 +46,13 @@ def _require_seeker(current_user: CurrentUser) -> None:
 
 def _history_filters(
     *,
-    service_type: list[AdvisorServiceType] | None,
+    service_id: list[uuid.UUID] | None,
     visa_type: list[str] | None,
     period: PaymentPeriod | None,
     date_from: date | None,
     date_to: date | None,
 ) -> tuple[list[str] | None, date | None, date | None]:
-    types = [t.value for t in service_type] if service_type else None
-    if not types and visa_type:
-        types = visa_type
+    ids = service_id
 
     resolved_from = date_from
     resolved_to = date_to
@@ -63,7 +60,7 @@ def _history_filters(
         days = int(period.rstrip("d"))
         resolved_to = datetime.now(UTC).date()
         resolved_from = resolved_to - timedelta(days=days)
-    return types, resolved_from, resolved_to
+    return ids, resolved_from, resolved_to
 
 
 async def _get_accessible_transaction(
@@ -138,7 +135,7 @@ async def get_payment_summary(
     ``date_to`` override ``period``.
     """
     _, resolved_from, resolved_to = _history_filters(
-        service_type=None,
+        service_id=None,
         visa_type=None,
         period=period,
         date_from=date_from,
@@ -161,10 +158,10 @@ async def get_payment_history(
     settings: SettingsDep,
     request_id: RequestIdDep,
     q: Annotated[str | None, Query(max_length=100)] = None,
-    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
+    service_id: Annotated[list[uuid.UUID] | None, Query()] = None,
     visa_type: Annotated[
         list[str] | None,
-        Query(description="Alias of service_type for FE URL parity"),
+        Query(description="Legacy filter alias"),
     ] = None,
     sort: Annotated[PaymentHistorySort, Query()] = "-created_at",
     period: Annotated[PaymentPeriod | None, Query()] = None,
@@ -172,8 +169,8 @@ async def get_payment_history(
     date_to: date | None = None,
 ) -> ResponseEnvelope[list[SeekerPaymentRead]]:
     """Visa-seeker payment history with advisor + fee split columns."""
-    types, resolved_from, resolved_to = _history_filters(
-        service_type=service_type,
+    service_ids, resolved_from, resolved_to = _history_filters(
+        service_id=service_id,
         visa_type=visa_type,
         period=period,
         date_from=date_from,
@@ -183,7 +180,7 @@ async def get_payment_history(
     stmt = payment_service.list_for_seeker_stmt(
         current_user.id,
         q=q,
-        service_types=types,
+        service_ids=service_ids,
         date_from=resolved_from,
         date_to=resolved_to,
         sort=sort,
@@ -202,10 +199,10 @@ async def export_payment_history(
     session: SessionDep,
     settings: SettingsDep,
     q: Annotated[str | None, Query(max_length=100)] = None,
-    service_type: Annotated[list[AdvisorServiceType] | None, Query()] = None,
+    service_id: Annotated[list[uuid.UUID] | None, Query()] = None,
     visa_type: Annotated[
         list[str] | None,
-        Query(description="Alias of service_type for FE URL parity"),
+        Query(description="Legacy filter alias"),
     ] = None,
     sort: Annotated[PaymentHistorySort, Query()] = "-created_at",
     period: Annotated[PaymentPeriod | None, Query()] = None,
@@ -214,8 +211,8 @@ async def export_payment_history(
 ) -> Response:
     """Download seeker payment history as CSV (same filters as ``GET /history``)."""
     _require_seeker(current_user)
-    types, resolved_from, resolved_to = _history_filters(
-        service_type=service_type,
+    service_ids, resolved_from, resolved_to = _history_filters(
+        service_id=service_id,
         visa_type=visa_type,
         period=period,
         date_from=date_from,
@@ -226,7 +223,7 @@ async def export_payment_history(
         current_user.id,
         settings,
         q=q,
-        service_types=types,
+        service_ids=service_ids,
         date_from=resolved_from,
         date_to=resolved_to,
         sort=sort,

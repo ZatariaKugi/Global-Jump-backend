@@ -66,7 +66,14 @@ def profile_completion_percent(profile: AdvisorProfile) -> int:
         (1, bool(profile.languages)),
         (1, bool(profile.offered_services)),
         (1, bool(profile.profile_photo_url)),
-        (2, bool(profile.services)),  # at least one bookable service (duration + price)
+        # At least one bookable service (selected and priced).
+        (
+            2,
+            any(
+                s.price_usd is not None and s.price_usd > 0
+                for s in (profile.offered_services or [])
+            ),
+        ),
     ]
     total = sum(weight for weight, _ in checks)
     got = sum(weight for weight, ok in checks if ok)
@@ -127,7 +134,7 @@ async def _next_upcoming(session: AsyncSession, advisor_id: uuid.UUID) -> NextUp
         appointment_id=booking_service.appointment_id_str(booking),
         seeker_id=booking.seeker_id,
         seeker_name=seeker.full_name if seeker else None,
-        service_type=booking.service_type,
+        name=booking.name,
         status=booking.status.value,
         scheduled_start=booking.scheduled_start,
         scheduled_end=booking.scheduled_end,

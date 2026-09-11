@@ -21,14 +21,13 @@ from pydantic import (
 from app.core.countries import SUPPORTED_COUNTRY_CODES, is_supported_country
 from app.core.visa_types import RequiredVisaType
 from app.models.advisor_credential import DocumentType
-from app.models.advisor_profile import AdvisorServiceType
 from app.models.user import VerificationStatus
 from app.models.visa_type import VisaType
 from app.schemas.assessment import AiMatchStatusRead
 from app.schemas.availability import WeeklySlotInput, WeeklySlotRead
 
 CountryCode = Annotated[str, Field(min_length=2, max_length=2)]
-ServiceTypeSlug = Annotated[str, Field(min_length=1, max_length=100)]
+ServiceId = uuid.UUID
 LanguageName = Annotated[str, Field(min_length=1, max_length=100)]
 
 
@@ -53,7 +52,6 @@ def _require_supported_destination(value: str) -> str:
     return code
 
 
-
 SupportedCountryCode = Annotated[
     str, Field(min_length=2, max_length=2), AfterValidator(_require_supported_destination)
 ]
@@ -73,79 +71,51 @@ class LanguageEntry(BaseModel):
     proficiency: Literal["basic", "conversational", "fluent", "native"]
 
 
-class ServiceOffering(BaseModel):
-    """Bookable offering (duration + price) — managed via profile, not onboarding."""
-
-    service_type: AdvisorServiceType
-    duration_minutes: int = Field(ge=15, le=480)
-    price_usd: float = Field(ge=0)
-
-
-class ServiceRead(BaseModel):
-    """Single service offering returned by the services CRUD endpoints."""
-
-    id: uuid.UUID
-    service_type: AdvisorServiceType
-    duration_minutes: int
-    price_usd: float
-
-
-class ServiceCreateRequest(BaseModel):
-    """Admin-only: create a new service offering for an advisor."""
-
-    service_type: AdvisorServiceType
-    duration_minutes: int = Field(ge=15, le=480)
-    price_usd: float = Field(ge=0)
-
-
-class ServiceUpdateRequest(BaseModel):
-    """Update a service offering — advisor can update price/duration on own services,
-    admin can update all fields."""
-
-    service_type: AdvisorServiceType | None = None
-    duration_minutes: int | None = Field(default=None, ge=15, le=480)
-    price_usd: float | None = Field(default=None, ge=0)
-
-
-# ── Offered services (``advisor_offered_services`` — category + optional price) ─
+# ── Offered services (ID identity + display name) ────────────────────────────
 
 
 class OfferedServicePublicRead(BaseModel):
-    """Seeker / public view — service identity only (no price or duration)."""
+    """Seeker / public view — includes price and duration.
+
+    Catalog rows reuse this shape but always report ``price_usd`` null.
+    """
 
     id: uuid.UUID
-    service_type: str
+    service_id: uuid.UUID
+    name: str
+    price_usd: float | None = None
+    duration_minutes: int = 30
 
 
 class OfferedServiceRead(BaseModel):
     """Advisor / admin view — includes optional price and duration."""
 
     id: uuid.UUID
-    service_type: str
+    service_id: uuid.UUID
+    name: str
     price_usd: float | None = None
     duration_minutes: int = 30
+    has_active_bookings: bool = False
 
 
 class AdminOfferedServiceRead(BaseModel):
     """Admin catalog list row — identity only (no price/duration)."""
 
     id: uuid.UUID
-    service_type: str
+    service_id: uuid.UUID
+    name: str
 
 
 class OfferedServiceItemInput(BaseModel):
-    """One service row for replace/create (matches onboarding UI)."""
+    """One catalog service row selected by an advisor."""
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    service_type: str = Field(
-        min_length=1,
-        max_length=50,
-        validation_alias=AliasChoices("service_type", "serviceType"),
+    service_id: uuid.UUID = Field(
+        validation_alias=AliasChoices("service_id", "serviceId"),
     )
-    price_usd: float | None = Field(
-        default=None,
-        ge=0,
+    price_usd: float = Field(
+        gt=0,
         validation_alias=AliasChoices("price_usd", "priceUsd", "price"),
     )
     duration_minutes: int = Field(
@@ -155,18 +125,11 @@ class OfferedServiceItemInput(BaseModel):
         validation_alias=AliasChoices("duration_minutes", "durationMinutes", "duration"),
     )
 
-    @field_validator("service_type", mode="before")
-    @classmethod
-    def _strip_service_type(cls, value: object) -> object:
-        if isinstance(value, str):
-            return value.strip()
-        return value
-
     @field_validator("price_usd", mode="before")
     @classmethod
     def _blank_price(cls, value: object) -> object:
         if value is None or value == "":
-            return None
+            raise ValueError("A positive price is required for every selected service")
         return value
 
     @field_validator("duration_minutes", mode="before")
@@ -178,23 +141,18 @@ class OfferedServiceItemInput(BaseModel):
 
 
 class OfferedServiceCreateRequest(BaseModel):
-    """Add one offered-service category to an advisor profile.
-
-    Blank strings for optional fields are treated as omitted. ``duration_minutes``
-    defaults to 30 when missing/blank. ``service_type`` is a free-form string
-    (no enum).
-    """
+    """Create a catalog service or attach a catalog service to an advisor."""
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    service_type: str = Field(
-        min_length=1,
-        max_length=50,
-        validation_alias=AliasChoices("service_type", "serviceType"),
+    service_id: uuid.UUID | None = Field(
+        default=None,
+        validation_alias=AliasChoices("service_id", "serviceId"),
     )
+    name: str | None = Field(default=None, min_length=1, max_length=100)
     price_usd: float | None = Field(
         default=None,
-        ge=0,
+        gt=0,
         validation_alias=AliasChoices("price_usd", "priceUsd", "price"),
     )
     duration_minutes: int = Field(
@@ -204,11 +162,13 @@ class OfferedServiceCreateRequest(BaseModel):
         validation_alias=AliasChoices("duration_minutes", "durationMinutes", "duration"),
     )
 
-    @field_validator("service_type", mode="before")
+    @field_validator("name", mode="before")
     @classmethod
-    def _strip_service_type(cls, value: object) -> object:
+    def _strip_name(cls, value: object) -> object:
+        if value is None or value == "":
+            return None
         if isinstance(value, str):
-            return value.strip()
+            return value.strip() or None
         return value
 
     @field_validator("price_usd", mode="before")
@@ -246,21 +206,15 @@ class OfferedServiceUpdateRequest(BaseModel):
     """Partial update — send only the fields you want to change.
 
     Empty strings are treated as omitted (``None``) so admin forms that submit
-    blank inputs for untouched fields do not 422. ``service_type`` is free-form
-    (no enum).
+    blank inputs for untouched fields do not 422.
     """
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    service_type: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=50,
-        validation_alias=AliasChoices("service_type", "serviceType"),
-    )
+    name: str | None = Field(default=None, min_length=1, max_length=100)
     price_usd: float | None = Field(
         default=None,
-        ge=0,
+        gt=0,
         validation_alias=AliasChoices("price_usd", "priceUsd", "price"),
     )
     duration_minutes: int | None = Field(
@@ -270,9 +224,9 @@ class OfferedServiceUpdateRequest(BaseModel):
         validation_alias=AliasChoices("duration_minutes", "durationMinutes", "duration"),
     )
 
-    @field_validator("service_type", mode="before")
+    @field_validator("name", mode="before")
     @classmethod
-    def _blank_service_type(cls, value: object) -> object:
+    def _strip_name(cls, value: object) -> object:
         if value is None or value == "":
             return None
         if isinstance(value, str):
@@ -292,7 +246,6 @@ class OfferedServiceUpdateRequest(BaseModel):
         if value is None or value == "":
             return None
         return value
-
 
 
 class OfferedServicesReplaceRequest(BaseModel):
@@ -321,9 +274,8 @@ class AdvisorProfileUpdate(BaseModel):
     successful_application_rate: float | None = Field(default=None, ge=0, le=100)
     visa_specializations: list[RequiredVisaType] | None = None
     country_expertise: list[SupportedCountryCode] | None = None
-    offered_services: list[ServiceTypeSlug] | None = None
+    offered_services: list[ServiceId] | None = None
     languages: list[LanguageEntry] | None = None
-    services: list[ServiceOffering] | None = None
     weekly_slots: list[WeeklySlotInput] | None = Field(
         default=None,
         description="Weekly working hours; sending replaces saved hours, [] clears them.",
@@ -430,14 +382,14 @@ class AdvisorOnboardingSubmit(BaseModel):
 
     Matching-relevant fields (mirror seeker onboarding signals):
 
-      service_types / services  → advisor ``offered_services`` (vs seeker needed services)
+      service_ids / services  → advisor ``offered_services`` (vs seeker needed services)
       languages                 → advisor ``languages`` (vs seeker preferred_languages)
       areas_of_expertise        → visa specializations (vs seeker intended_visa_type)
       countries_you_serve       → country expertise (vs seeker intended_destination)
 
     Wizard screens:
 
-      Step 1 – What services do you offer?          → service_types (+ optional priced
+      Step 1 – What services do you offer?          → service_ids (+ optional priced
                                                        ``services`` / weekly_slots)
       Step 2 – What are your areas of expertise?    → areas_of_expertise
       Step 3 – Specify your service                 → expertise_description
@@ -449,8 +401,8 @@ class AdvisorOnboardingSubmit(BaseModel):
       Step 7 – Approval Pending                     → under_review (UI only)
     """
 
-    # Step 1 — catalog service_type slugs or catalog UUIDs (same as seeker ``services``).
-    service_types: list[ServiceTypeSlug] = Field(default_factory=list, max_length=20)
+    # Step 1 — catalog name slugs or catalog UUIDs (same as seeker ``services``).
+    service_ids: list[ServiceId] = Field(default_factory=list, max_length=20)
     # Step 1 (optional) — priced offered-service rows (merged into offered_services).
     services: list[OfferedServiceItemInput] | None = Field(default=None, max_length=20)
     # Step 1 (optional) — weekly working hours; [] or omit means no hours set.
@@ -472,7 +424,7 @@ class AdvisorOnboardingSubmit(BaseModel):
     # Step 6
     documents: list[OnboardingDocumentRef] = Field(default_factory=list, max_length=20)
 
-    @field_validator("service_types", "language_names", mode="before")
+    @field_validator("language_names", mode="before")
     @classmethod
     def _coerce_string_list(cls, value: object) -> object:
         if isinstance(value, str):
@@ -539,7 +491,7 @@ class SeekerMatchRead(BaseModel):
     intended_destination: str | None = None
     intended_visa_type: str | None = None
     preferred_languages: list[str] = Field(default_factory=list)
-    needed_services: list[str] = Field(default_factory=list)
+    service_ids: list[uuid.UUID] = Field(default_factory=list)
     match_score: float
     match_reasons: str | None = None
     rule_score: float | None = None
@@ -572,6 +524,7 @@ class AdvisorProfilePublicRead(BaseModel):
     visa_specializations: list[VisaType]
     country_expertise: list[str]
     languages: list[LanguageEntry]
+    offered_services: list[OfferedServicePublicRead] = Field(default_factory=list)
     starting_price_usd: float | None = None
     is_featured: bool
     public_profile_slug: str | None

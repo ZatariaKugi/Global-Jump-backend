@@ -11,7 +11,6 @@ from app.core.config import Settings
 from app.core.encryption import decrypt_field, encrypt_field
 from app.core.file_storage import resolve_media_url
 from app.core.logging import get_logger
-from app.models.advisor_profile import AdvisorOfferedService
 from app.models.seeker_profile import (
     SeekerCountryVisited,
     SeekerIntendedDestination,
@@ -40,51 +39,6 @@ async def get_or_create(session: AsyncSession, user_id: uuid.UUID) -> SeekerProf
         await session.flush()
         await session.refresh(profile)
     return profile
-
-
-async def resolve_service_types(
-    session: AsyncSession, values: list[str]
-) -> list[str]:
-    """Normalize catalog ids / service_type slugs into unique service_type values."""
-    if not values:
-        return []
-    cleaned = [v.strip() for v in values if v and v.strip()]
-    if not cleaned:
-        return []
-
-    uuid_ids: list[uuid.UUID] = []
-    slugs: list[str] = []
-    for value in cleaned:
-        try:
-            uuid_ids.append(uuid.UUID(value))
-        except ValueError:
-            slugs.append(value)
-
-    resolved: list[str] = []
-    if uuid_ids:
-        rows = (
-            await session.execute(
-                select(AdvisorOfferedService).where(AdvisorOfferedService.id.in_(uuid_ids))
-            )
-        ).scalars().all()
-        by_id = {row.id: row.service_type for row in rows}
-        for service_id in uuid_ids:
-            service_type = by_id.get(service_id)
-            if service_type:
-                resolved.append(service_type)
-            else:
-                resolved.append(str(service_id))
-    resolved.extend(slugs)
-
-    seen: set[str] = set()
-    unique: list[str] = []
-    for service_type in resolved:
-        key = service_type.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(service_type)
-    return unique
 
 
 async def update(
@@ -130,18 +84,14 @@ async def update(
 
     if "needed_services" in fields:
         raw_services = fields.pop("needed_services") or []
-        service_types = await resolve_service_types(session, list(raw_services))
+        service_ids = list(dict.fromkeys(raw_services))
         profile.needed_services = [
-            SeekerNeededService(profile_id=profile.id, service_type=service_type)
-            for service_type in service_types
+            SeekerNeededService(profile_id=profile.id, service_id=service_id)
+            for service_id in service_ids
         ]
 
     if "intended_destinations" in fields:
-        dest_codes = [
-            str(c).upper()
-            for c in (fields.pop("intended_destinations") or [])
-            if c
-        ]
+        dest_codes = [str(c).upper() for c in (fields.pop("intended_destinations") or []) if c]
         profile.intended_destinations = [
             SeekerIntendedDestination(profile_id=profile.id, country_code=code)
             for code in dest_codes
@@ -166,8 +116,7 @@ async def update(
             if v
         ]
         profile.intended_visa_types = [
-            SeekerIntendedVisaType(profile_id=profile.id, visa_type=visa)
-            for visa in visa_values
+            SeekerIntendedVisaType(profile_id=profile.id, visa_type=visa) for visa in visa_values
         ]
         profile.intended_visa_type = visa_values[0] if visa_values else None
         fields.pop("intended_visa_type", None)
@@ -218,28 +167,8 @@ def preferred_language_names(profile: SeekerProfile) -> list[str]:
     return out
 
 
-def needed_service_types(profile: SeekerProfile) -> list[str]:
-    return [row.service_type for row in (profile.needed_services or []) if row.service_type]
-
-
-async def resolve_service_ids(session: AsyncSession, service_types: list[str]) -> list[str]:
-    """Map stored service_type slugs back to catalog UUIDs when possible.
-
-    Falls back to the slug itself when no global catalog row exists, so the FE
-    always gets a non-empty ``service_ids`` list mirroring what was saved.
-    """
-    if not service_types:
-        return []
-    rows = (
-        await session.execute(
-            select(AdvisorOfferedService).where(
-                AdvisorOfferedService.profile_id.is_(None),
-                AdvisorOfferedService.service_type.in_(service_types),
-            )
-        )
-    ).scalars().all()
-    by_type = {row.service_type.casefold(): str(row.id) for row in rows if row.service_type}
-    return [by_type.get(s.casefold(), s) for s in service_types]
+def needed_service_ids(profile: SeekerProfile) -> list[uuid.UUID]:
+    return [row.service_id for row in (profile.needed_services or []) if row.service_id]
 
 
 def intended_destination_codes(profile: SeekerProfile) -> list[str]:
@@ -273,8 +202,7 @@ async def build_read(
     languages = preferred_language_names(profile)
     destinations = intended_destination_codes(profile)
     visa_types = intended_visa_type_values(profile)
-    services = needed_service_types(profile)
-    service_ids = await resolve_service_ids(session, services)
+    service_ids = needed_service_ids(profile)
     countries = [cv.country_code for cv in (profile.countries_visited or [])]
     visas = [
         PriorVisa(country=pv.country, visa_type=pv.visa_type, year=pv.year)
