@@ -36,8 +36,14 @@ async def notify(
     entity_type: NotificationEntityType | None = None,
     entity_id: uuid.UUID | None = None,
     actor_id: uuid.UUID | None = None,
+    scheduled_start: datetime | None = None,
 ) -> Notification:
-    """Queue a notification for ``user_id`` inside the current transaction."""
+    """Queue a notification for ``user_id`` inside the current transaction.
+
+    ``scheduled_start`` is the related booking's raw UTC instant, when there is
+    one — carried separately from ``body`` so a client can render it in the
+    viewer's own timezone instead of a fixed, pre-formatted clause.
+    """
     notification = Notification(
         user_id=user_id,
         actor_id=actor_id,
@@ -46,6 +52,7 @@ async def notify(
         body=body,
         entity_type=entity_type,
         entity_id=entity_id,
+        scheduled_start=scheduled_start,
     )
     session.add(notification)
     await session.flush()

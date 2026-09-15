@@ -43,6 +43,7 @@ from app.schemas.booking import (
     SessionTimelineStepRead,
 )
 from app.services import (
+    advisor_lead_service,
     availability_service,
     booking_document_service,
     booking_meeting_service,
@@ -131,9 +132,14 @@ def _in_chat_window_clause(now: datetime) -> ColumnElement[bool]:
 
 
 def _booking_summary(booking: Booking) -> str:
-    when = as_utc(booking.scheduled_start).strftime("%b %d, %Y %H:%M UTC")
+    # No absolute clock time here on purpose — it used to be baked in as a
+    # fixed UTC-labeled string, which every recipient saw identically
+    # regardless of their own timezone. The in-app feed now renders the raw
+    # `scheduled_start` passed to `_notify_booking` in the viewer's own
+    # timezone instead; this text is also the push-notification body, which
+    # has no client-side formatting available at all.
     service = booking.name
-    return f"{service} on {when} — appointment #{booking.appointment_number}"
+    return f"{service} — appointment #{booking.appointment_number}"
 
 
 def _counterparty(booking: Booking, actor_id: uuid.UUID) -> uuid.UUID:
@@ -159,6 +165,7 @@ async def _notify_booking(
         entity_type=NotificationEntityType.booking,
         entity_id=booking.id,
         actor_id=actor_id,
+        scheduled_start=booking.scheduled_start,
     )
 
 
@@ -591,6 +598,8 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    # Show the advisor which lead this booking came from, when it came from one.
+    await advisor_lead_service.link_booking(session, booking)
     # Advisor notification is sent only after payment succeeds
     # (see payment_service._handle_checkout_completed) to avoid
     # misleading advisors with unpaid booking requests.
@@ -646,6 +655,8 @@ async def create_by_advisor(
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    # Show the advisor which lead this booking came from, when it came from one.
+    await advisor_lead_service.link_booking(session, booking)
     await _notify_booking(
         session,
         booking,

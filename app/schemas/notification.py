@@ -22,6 +22,9 @@ class NotificationRead(BaseModel):
     actor_id: uuid.UUID | None
     read_at: datetime | None
     created_at: datetime
+    # Raw instant for booking-related notifications, so the client can render it
+    # in the viewer's own timezone. Null for notification types with no booking.
+    scheduled_start: datetime | None
 
 
 class UnreadCountRead(BaseModel):

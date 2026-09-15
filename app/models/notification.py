@@ -88,6 +88,12 @@ class Notification(BaseModel):
     )
     entity_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Snapshot of the related booking's start, when entity_type is booking. Lets
+    # clients render it in the viewer's own timezone instead of the fixed
+    # UTC-labeled clause `body` used to bake in — see booking_service._booking_summary.
+    scheduled_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     push_status: Mapped[PushStatus] = mapped_column(
         SAEnum(PushStatus, name="notification_push_status"),
