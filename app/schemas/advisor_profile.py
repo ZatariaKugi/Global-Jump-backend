@@ -528,5 +528,11 @@ class AdvisorProfilePublicRead(BaseModel):
     starting_price_usd: float | None = None
     is_featured: bool
     public_profile_slug: str | None
+    # Read-only / derived. Mirrors AdvisorListingCard so the seeker's profile
+    # sheet shows the same rating the directory row showed. Nullable on
+    # purpose: an advisor nobody has reviewed must stay distinguishable from
+    # one rated 0.0, and a 0.0 default would erase that distinction.
+    average_rating: float | None = None
+    review_count: int = 0
     match_percentage: int | None = None  # 0–100 for seeker; null without destination/visa context
     is_bookmarked: bool = False  # true when the current seeker has bookmarked this advisor

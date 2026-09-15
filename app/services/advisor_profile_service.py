@@ -405,6 +405,8 @@ def build_public_read(
     settings: Settings,
     match_percentage: int | None = None,
     is_bookmarked: bool = False,
+    average_rating: float | None = None,
+    review_count: int = 0,
 ) -> AdvisorProfilePublicRead:
     if profile is not None:
         return AdvisorProfilePublicRead(
@@ -413,6 +415,8 @@ def build_public_read(
             email=user.email,
             match_percentage=match_percentage,
             is_bookmarked=is_bookmarked,
+            average_rating=average_rating,
+            review_count=review_count,
             offered_services=_public_offered_services(profile),
             **_build_common(profile, settings),
         )
@@ -420,6 +424,8 @@ def build_public_read(
         user_id=user.id,
         full_name=user.full_name,
         email=user.email,
+        average_rating=average_rating,
+        review_count=review_count,
         title=None,
         bio=None,
         profile_photo_url=None,

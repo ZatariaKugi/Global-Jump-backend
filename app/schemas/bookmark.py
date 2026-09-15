@@ -23,6 +23,7 @@ class BookmarkRead(BaseModel):
     profile_photo_url: str | None
     expertise: str | None  # title / specialty label
     average_rating: float | None
+    review_count: int = 0  # public reviews behind average_rating; 0 means unrated
     years_of_experience: int | None
     offered_services: list[str] = Field(default_factory=list)
     starting_price_usd: float | None = None

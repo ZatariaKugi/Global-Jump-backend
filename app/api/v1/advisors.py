@@ -381,7 +381,7 @@ async def get_advisor_by_slug(
     if not await advisor_search_service.is_integrations_ready(session, user.id):
         raise NotFoundError("Advisor not found")
     destination, match_visa = await _seeker_match_context(session, principal)
-    avg, _count = await review_service.rating_summary(session, user.id)
+    avg, count = await review_service.rating_summary(session, user.id)
     bookmarked = await _bookmarked_ids(session, principal, [user.id])
     return ResponseEnvelope[AdvisorProfilePublicRead](
         data=advisor_profile_service.build_public_read(
@@ -392,6 +392,8 @@ async def get_advisor_by_slug(
                 profile, destination, match_visa, avg
             ),
             is_bookmarked=user.id in bookmarked,
+            average_rating=avg,
+            review_count=count,
         ),
         meta=Meta(request_id=request_id),
     )
@@ -420,7 +422,7 @@ async def get_advisor_public_profile(
     )
     profile = result.scalar_one_or_none()
     destination, match_visa = await _seeker_match_context(session, principal)
-    avg, _count = await review_service.rating_summary(session, user.id)
+    avg, count = await review_service.rating_summary(session, user.id)
     bookmarked = await _bookmarked_ids(session, principal, [user.id])
     return ResponseEnvelope[AdvisorProfilePublicRead](
         data=advisor_profile_service.build_public_read(
@@ -431,6 +433,8 @@ async def get_advisor_public_profile(
                 profile, destination, match_visa, avg
             ),
             is_bookmarked=user.id in bookmarked,
+            average_rating=avg,
+            review_count=count,
         ),
         meta=Meta(request_id=request_id),
     )
