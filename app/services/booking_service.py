@@ -131,6 +131,24 @@ def _in_chat_window_clause(now: datetime) -> ColumnElement[bool]:
     return and_(Booking.scheduled_start <= now, Booking.scheduled_end >= now)
 
 
+# Meeting join/start link kab tak diya jaye. Seekers jaldi aana chahte hain,
+# isliye shuru se pehle thori gunjaish; khatam hone par foran band — QA/product
+# ka faisla, koi grace nahi.
+#
+# Note: yeh sirf *darwaza* band karta hai. Jo log Zoom mein pohnch chuke hain
+# unka session isse nahi rukta — hum Zoom ko koi end call nahi bhejte, meeting
+# jitni marzi lambi chale.
+MEETING_JOIN_LEAD_MINUTES = 10
+
+
+def is_meeting_joinable(booking: Booking, now: datetime | None = None) -> bool:
+    """`scheduled_start - 10min` se `scheduled_end` tak True."""
+    moment = now or datetime.now(UTC)
+    opens = as_utc(booking.scheduled_start) - timedelta(minutes=MEETING_JOIN_LEAD_MINUTES)
+    closes = as_utc(booking.scheduled_end)
+    return opens <= moment <= closes
+
+
 def _booking_summary(booking: Booking) -> str:
     # No absolute clock time here on purpose — it used to be baked in as a
     # fixed UTC-labeled string, which every recipient saw identically
@@ -360,8 +378,18 @@ def build_read(
         can_reschedule=can_reschedule,
         can_cancel=can_cancel,
         cancellation_notice_hours=cancellation_notice_hours,
-        meeting_join_url=booking.meeting_join_url if viewer_role == UserRole.seeker else None,
-        meeting_start_url=booking.meeting_start_url if viewer_role == UserRole.advisor else None,
+        # Detail sheet jaisa hi gate — appointments list bhi URL deti hai, aur
+        # sirf ek jagah rokna kaafi nahi tha.
+        meeting_join_url=(
+            booking.meeting_join_url
+            if viewer_role == UserRole.seeker and is_meeting_joinable(booking)
+            else None
+        ),
+        meeting_start_url=(
+            booking.meeting_start_url
+            if viewer_role == UserRole.advisor and is_meeting_joinable(booking)
+            else None
+        ),
     )
 
 
@@ -1398,15 +1426,21 @@ def _meeting_read(
     end = as_utc(booking.scheduled_end)
     label = booking.name or "Consultation"
     is_advisor = viewer_user_id is not None and viewer_user_id == booking.advisor_id
+    # Window ke bahar sirf *links* rok diye jate hain — meeting ka record
+    # (waqt, tareekh, passcode) dikhta rehta hai, warna user ko lagta hai
+    # booking hi gayab ho gayi. Rule admin par bhi barabar lagta hai.
+    joinable = is_meeting_joinable(booking)
     return BookingMeetingRead(
         label=label,
         time_range=(
             f"{start.strftime('%I:%M %p').lstrip('0')} - {end.strftime('%I:%M %p').lstrip('0')} UTC"
         ),
         date=start.strftime("%d %b %Y"),
-        join_url=booking.meeting_join_url if not is_advisor else None,
-        start_url=booking.meeting_start_url if is_advisor else None,
+        join_url=booking.meeting_join_url if (joinable and not is_advisor) else None,
+        start_url=booking.meeting_start_url if (joinable and is_advisor) else None,
         passcode=booking.meeting_passcode,
+        starts_at=start,
+        ends_at=end,
     )
 
 

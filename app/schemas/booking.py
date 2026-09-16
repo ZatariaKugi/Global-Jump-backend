@@ -204,6 +204,11 @@ class BookingMeetingRead(BaseModel):
     join_url: str | None = None
     start_url: str | None = None
     passcode: str | None = None
+    # Raw instants so the client can gate the join button itself and let it
+    # disappear as the slot ends, without waiting for a refetch. `time_range`
+    # and `date` above are display-only strings and cannot be compared.
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
 
 
 class BookingAiSuggestionRead(BaseModel):
