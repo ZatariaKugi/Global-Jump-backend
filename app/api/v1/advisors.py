@@ -21,7 +21,7 @@ from app.api.deps import (
 )
 from app.api.pagination import PaginationDep, page_meta, paginate
 from app.api.v1.bookings import _party_names, _read_booking, _send_confirmations
-from app.core.exceptions import NotFoundError, PermissionDeniedError
+from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import delete_file, resolve_url
 from app.core.visa_types import OptionalVisaType, visa_type_name
 from app.db.session import SessionDep
@@ -522,11 +522,15 @@ async def complete_advisor_onboarding(
             continue
         seen.add(service_id)
         existing = priced_by_id.get(service_id)
-        offered_items.append(
-            existing
-            if existing is not None
-            else OfferedServiceItemInput(service_id=service_id)
-        )
+        if existing is None:
+            # price_usd is required (gt=0); building the item without it would
+            # raise inside the handler and surface as a 500.
+            raise AppError(
+                "A positive price is required for every selected service",
+                code="service_not_priced",
+                detail={"service_id": str(service_id)},
+            )
+        offered_items.append(existing)
     if data.services is not None:
         for service_id, item in priced_by_id.items():
             if service_id not in seen:
@@ -1138,7 +1142,13 @@ async def create_booking_for_client(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=current_user.role
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
+            viewer_id=current_user.id,
+            viewer_role=current_user.role,
         ),
         meta=Meta(request_id=request_id),
     )

@@ -725,7 +725,13 @@ async def reschedule_booking_admin(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=UserRole.admin
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
+            viewer_id=admin_principal.id,
+            viewer_role=UserRole.admin,
         ),
         meta=Meta(request_id=request_id),
     )

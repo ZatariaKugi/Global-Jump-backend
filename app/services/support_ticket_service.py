@@ -501,6 +501,7 @@ async def build_list_reads(
                 related_user_name=ticket.related_user_name,
                 related_user_type=ticket.related_user_type,
                 session_scheduled_start=ticket.session_scheduled_start,
+                service_id=ticket.service_id,
                 name=ticket.name,
             )
         )

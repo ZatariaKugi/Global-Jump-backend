@@ -134,6 +134,7 @@ async def _next_upcoming(session: AsyncSession, advisor_id: uuid.UUID) -> NextUp
         appointment_id=booking_service.appointment_id_str(booking),
         seeker_id=booking.seeker_id,
         seeker_name=seeker.full_name if seeker else None,
+        service_id=booking.service_id,
         name=booking.name,
         status=booking.status.value,
         scheduled_start=booking.scheduled_start,
