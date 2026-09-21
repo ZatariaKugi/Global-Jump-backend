@@ -1,4 +1,3 @@
-"""CRUD for the ID-based service catalog and advisor offerings."""
 
 from __future__ import annotations
 
@@ -29,7 +28,6 @@ def _catalog_in_use_message(count: int, action: str) -> str:
 
 
 def _service_id(row: AdvisorOfferedService) -> uuid.UUID:
-    """Return the public service ID for either a catalog or advisor row."""
     return row.service_id or row.id
 
 
@@ -136,7 +134,6 @@ async def _active_booked_service_ids(
     advisor_id: uuid.UUID,
     service_ids: set[uuid.UUID],
 ) -> set[uuid.UUID]:
-    """Return catalog service IDs with a pending or confirmed booking."""
     if not service_ids:
         return set()
     result = await session.execute(

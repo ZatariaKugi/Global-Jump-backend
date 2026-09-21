@@ -47,7 +47,6 @@ class AdvisorManagementListRead(BaseModel):
     avg_rating: float | None
     review_count: int
     earnings: float
-    # False when the advisor has no priced offered service.
     is_bookable: bool = True
     created_at: datetime
 

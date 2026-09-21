@@ -75,8 +75,6 @@ class SeekerPreferredLanguage(Base):
 
 
 class SeekerNeededService(Base):
-    """One row per catalog service the seeker selected during onboarding."""
-
     __tablename__ = "seeker_needed_services"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)

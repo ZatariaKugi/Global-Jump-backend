@@ -71,15 +71,7 @@ class LanguageEntry(BaseModel):
     proficiency: Literal["basic", "conversational", "fluent", "native"]
 
 
-# ── Offered services (ID identity + display name) ────────────────────────────
-
-
 class OfferedServicePublicRead(BaseModel):
-    """Seeker / public view — includes price and duration.
-
-    Catalog rows reuse this shape but always report ``price_usd`` null.
-    """
-
     id: uuid.UUID
     service_id: uuid.UUID
     name: str
@@ -107,8 +99,6 @@ class AdminOfferedServiceRead(BaseModel):
 
 
 class OfferedServiceItemInput(BaseModel):
-    """One catalog service row selected by an advisor."""
-
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     service_id: uuid.UUID = Field(
@@ -141,8 +131,6 @@ class OfferedServiceItemInput(BaseModel):
 
 
 class OfferedServiceCreateRequest(BaseModel):
-    """Create a catalog service or attach a catalog service to an advisor."""
-
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     service_id: uuid.UUID | None = Field(
@@ -206,7 +194,6 @@ class OfferedServiceUpdateRequest(BaseModel):
     """Partial update — send only the fields you want to change.
 
     Empty strings are treated as omitted (``None``) so admin forms that submit
-    blank inputs for untouched fields do not 422.
     """
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
@@ -401,7 +388,6 @@ class AdvisorOnboardingSubmit(BaseModel):
       Step 7 – Approval Pending                     → under_review (UI only)
     """
 
-    # Step 1 — catalog name slugs or catalog UUIDs (same as seeker ``services``).
     service_ids: list[ServiceId] = Field(default_factory=list, max_length=20)
     # Step 1 (optional) — priced offered-service rows (merged into offered_services).
     services: list[OfferedServiceItemInput] | None = Field(default=None, max_length=20)
@@ -528,10 +514,6 @@ class AdvisorProfilePublicRead(BaseModel):
     starting_price_usd: float | None = None
     is_featured: bool
     public_profile_slug: str | None
-    # Read-only / derived. Mirrors AdvisorListingCard so the seeker's profile
-    # sheet shows the same rating the directory row showed. Nullable on
-    # purpose: an advisor nobody has reviewed must stay distinguishable from
-    # one rated 0.0, and a 0.0 default would erase that distinction.
     average_rating: float | None = None
     review_count: int = 0
     match_percentage: int | None = None  # 0–100 for seeker; null without destination/visa context

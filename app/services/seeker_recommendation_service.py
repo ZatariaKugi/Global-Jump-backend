@@ -42,7 +42,6 @@ async def notify_seekers_about_new_advisor(
     *,
     settings: Settings,
 ) -> int:
-    """Notify existing seekers whose current profile matches a newly approved advisor."""
     result = await session.execute(
         select(User, SeekerProfile)
         .join(SeekerProfile, SeekerProfile.user_id == User.id)
@@ -336,9 +335,6 @@ async def matches_for_dashboard(
     """
     ai_failure: AiMatchFailure | None = None
     ai_attempted = False
-    # Recommendations are a live view of advisor eligibility. Recompute on
-    # every dashboard read so suspension, onboarding, and profile changes do
-    # not leave stale rows in the seeker's result set.
     recs, ai_failure, ai_attempted = await refresh_for_seeker(
         session, seeker_id, settings=settings
     )

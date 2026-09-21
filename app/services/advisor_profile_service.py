@@ -36,15 +36,10 @@ from app.schemas.advisor_profile import (
 from app.schemas.availability import WeeklySlotRead
 from app.services import availability_service, review_service
 
-# Mirrors the ``AdvisorOfferedService.duration_minutes`` column default.
 DEFAULT_OFFERED_DURATION_MINUTES = 30
 
 
 def offered_service_ids(profile: AdvisorProfile) -> list[str]:
-    """Service-type strings for listing cards, de-duplicated case-insensitively.
-
-    Includes unpriced selections — this is a label list, not a bookable list.
-    """
     out: list[str] = []
     seen: set[str] = set()
     for raw in [s.name for s in (profile.offered_services or [])]:
@@ -58,7 +53,6 @@ def offered_service_ids(profile: AdvisorProfile) -> list[str]:
 
 
 def starting_price_usd(profile: AdvisorProfile | None) -> float | None:
-    """Lowest price across the advisor's priced offered services."""
     if profile is None:
         return None
     prices = [s.price_usd for s in (profile.offered_services or []) if s.price_usd is not None]
@@ -209,10 +203,6 @@ async def update(
 
 
 def _public_offered_services(profile: AdvisorProfile) -> list[OfferedServicePublicRead]:
-    """The advisor's own offerings for the seeker booking picker.
-
-    Built inline rather than reusing the offered-service service, to avoid a cycle.
-    """
     return [
         OfferedServicePublicRead(
             id=row.id,

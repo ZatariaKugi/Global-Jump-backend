@@ -46,14 +46,12 @@ class Booking(BaseModel):
     # Human-readable Appointment ID shown in the Consultations list (e.g. "3520145678").
     appointment_number: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
 
-    # Stable reference to the global service catalog row. Nullable for legacy rows.
     service_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("advisor_offered_services.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
 
-    # Service name snapshot — copied at booking time so
     # later price/duration changes don't rewrite history.
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False)

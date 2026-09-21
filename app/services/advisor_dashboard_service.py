@@ -66,7 +66,6 @@ def profile_completion_percent(profile: AdvisorProfile) -> int:
         (1, bool(profile.languages)),
         (1, bool(profile.offered_services)),
         (1, bool(profile.profile_photo_url)),
-        # At least one bookable service (selected and priced).
         (
             2,
             any(

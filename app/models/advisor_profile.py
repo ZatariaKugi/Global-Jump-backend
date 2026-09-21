@@ -64,13 +64,6 @@ class AdvisorLanguage(Base):
 
 
 class AdvisorOfferedService(Base):
-    """A global service catalog row or an advisor's priced offering.
-
-    Global rows have ``profile_id`` null and use their own ``id`` as the stable
-    service ID. Advisor rows reference that global row through ``service_id``.
-    Names are display values; all relationships use UUIDs.
-    """
-
     __tablename__ = "advisor_offered_services"
     __table_args__ = (
         UniqueConstraint("profile_id", "service_id", name="uq_offered_service_profile_service"),

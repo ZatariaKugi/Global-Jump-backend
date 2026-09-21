@@ -36,12 +36,7 @@ class BookingCreate(BaseModel):
     )
 
 class AdvisorBookingCreate(BaseModel):
-    """Advisor books a consultation directly for one of their existing clients.
-
-    Unlike the seeker-initiated flow, the advisor picks any service they
-    *offer* (``offered_services``) rather than a priced service, and
-    supplies the slot length directly — advisor-created bookings carry no price.
-    """
+    """Advisor books a consultation directly for one of their existing clients."""
 
     seeker_id: uuid.UUID
     service_id: uuid.UUID
@@ -204,9 +199,6 @@ class BookingMeetingRead(BaseModel):
     join_url: str | None = None
     start_url: str | None = None
     passcode: str | None = None
-    # Raw instants so the client can gate the join button itself and let it
-    # disappear as the slot ends, without waiting for a refetch. `time_range`
-    # and `date` above are display-only strings and cannot be compared.
     starts_at: datetime | None = None
     ends_at: datetime | None = None
 

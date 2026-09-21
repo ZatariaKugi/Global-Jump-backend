@@ -1138,7 +1138,6 @@ async def notify_seeker_of_document_status_update(
     status: str,
     note: str | None = None,
 ) -> None:
-    """Notify an advisor's document-status update through in-app and FCM outbox."""
     advisor_name = advisor.full_name or "Your advisor"
     status_capitalized = status.capitalize()
     

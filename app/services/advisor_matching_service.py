@@ -109,7 +109,6 @@ def _services_points(
     needed_services: list[uuid.UUID] | None,
     weight: float,
 ) -> float:
-    """Full services weight when any needed ID is offered by the advisor."""
     needed = set(needed_services or [])
     if not needed:
         return weight * 0.5

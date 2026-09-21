@@ -38,12 +38,6 @@ async def notify(
     actor_id: uuid.UUID | None = None,
     scheduled_start: datetime | None = None,
 ) -> Notification:
-    """Queue a notification for ``user_id`` inside the current transaction.
-
-    ``scheduled_start`` is the related booking's raw UTC instant, when there is
-    one — carried separately from ``body`` so a client can render it in the
-    viewer's own timezone instead of a fixed, pre-formatted clause.
-    """
     notification = Notification(
         user_id=user_id,
         actor_id=actor_id,

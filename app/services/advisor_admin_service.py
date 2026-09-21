@@ -169,7 +169,6 @@ async def build_list_read(
 
 
 def _has_priced_service(profile: AdvisorProfile | None) -> bool:
-    """True when at least one offered service carries a price."""
     if profile is None:
         return False
     return any(

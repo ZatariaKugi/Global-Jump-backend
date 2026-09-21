@@ -46,7 +46,6 @@ async def list_all_offered_services(
     request_id: RequestIdDep,
     service_id: Annotated[uuid.UUID | None, Query()] = None,
 ) -> ResponseEnvelope[list[OfferedServicePublicRead]]:
-    """Seeker/public catalog — same global rows admin manages."""
     items = await advisor_offered_service_service.list_all_public(
         session, service_id=service_id
     )
@@ -163,7 +162,6 @@ async def admin_list_all_offered_services(
     request_id: RequestIdDep,
     service_id: Annotated[uuid.UUID | None, Query()] = None,
 ) -> ResponseEnvelope[list[AdminOfferedServiceRead]]:
-    """List all catalog services for admin management."""
     items = await advisor_offered_service_service.list_all_admin(
         session, service_id=service_id
     )

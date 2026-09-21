@@ -1109,7 +1109,6 @@ async def send_new_relevant_advisor_email(
     advisor_name: str,
     settings: Settings,
 ) -> None:
-    """Notify a seeker that a newly approved advisor matches their profile."""
     ctx = {
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
@@ -1159,7 +1158,6 @@ async def send_lead_contacted_email(
     advisor_name: str,
     settings: Settings,
 ) -> None:
-    """Tell a seeker that a matched advisor marked their lead as contacted."""
     ctx = {
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,

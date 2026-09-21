@@ -131,18 +131,10 @@ def _in_chat_window_clause(now: datetime) -> ColumnElement[bool]:
     return and_(Booking.scheduled_start <= now, Booking.scheduled_end >= now)
 
 
-# Meeting join/start link kab tak diya jaye. Seekers jaldi aana chahte hain,
-# isliye shuru se pehle thori gunjaish; khatam hone par foran band — QA/product
-# ka faisla, koi grace nahi.
-#
-# Note: yeh sirf *darwaza* band karta hai. Jo log Zoom mein pohnch chuke hain
-# unka session isse nahi rukta — hum Zoom ko koi end call nahi bhejte, meeting
-# jitni marzi lambi chale.
 MEETING_JOIN_LEAD_MINUTES = 10
 
 
 def is_meeting_joinable(booking: Booking, now: datetime | None = None) -> bool:
-    """`scheduled_start - 10min` se `scheduled_end` tak True."""
     moment = now or datetime.now(UTC)
     opens = as_utc(booking.scheduled_start) - timedelta(minutes=MEETING_JOIN_LEAD_MINUTES)
     closes = as_utc(booking.scheduled_end)
@@ -150,12 +142,6 @@ def is_meeting_joinable(booking: Booking, now: datetime | None = None) -> bool:
 
 
 def _booking_summary(booking: Booking) -> str:
-    # No absolute clock time here on purpose — it used to be baked in as a
-    # fixed UTC-labeled string, which every recipient saw identically
-    # regardless of their own timezone. The in-app feed now renders the raw
-    # `scheduled_start` passed to `_notify_booking` in the viewer's own
-    # timezone instead; this text is also the push-notification body, which
-    # has no client-side formatting available at all.
     service = booking.name
     return f"{service} — appointment #{booking.appointment_number}"
 
@@ -378,8 +364,6 @@ def build_read(
         can_reschedule=can_reschedule,
         can_cancel=can_cancel,
         cancellation_notice_hours=cancellation_notice_hours,
-        # Detail sheet jaisa hi gate — appointments list bhi URL deti hai, aur
-        # sirf ek jagah rokna kaafi nahi tha.
         meeting_join_url=(
             booking.meeting_join_url
             if viewer_role == UserRole.seeker and is_meeting_joinable(booking)
@@ -470,11 +454,6 @@ async def _resolve_service(
     *,
     service_id: uuid.UUID,
 ) -> AdvisorOfferedService:
-    """Resolve the priced offering a seeker is booking, scoped to the advisor.
-
-    The join on ``profile_id`` keeps global catalog rows unbookable. An unpriced
-    row gets its own error code — it is a real service, just not sellable yet.
-    """
     offered_service = await _resolve_offered_service(
         session,
         advisor_id,
@@ -494,7 +473,6 @@ async def _resolve_offered_service(
     *,
     service_id: uuid.UUID,
 ) -> AdvisorOfferedService:
-    """Resolve one advisor-owned offered-service row by stable ID or legacy type."""
     stmt = (
         select(AdvisorOfferedService)
         .join(AdvisorProfile, AdvisorProfile.id == AdvisorOfferedService.profile_id)
@@ -515,10 +493,6 @@ async def _assert_service_offered(
     *,
     service_id: uuid.UUID,
 ) -> AdvisorOfferedService:
-    """Validate a service ID/type against the advisor's ``offered_services``.
-
-    Advisor-created bookings carry no price, so an unpriced row is fine here.
-    """
     return await _resolve_offered_service(
         session,
         advisor_id,
@@ -626,7 +600,6 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
-    # Show the advisor which lead this booking came from, when it came from one.
     await advisor_lead_service.link_booking(session, booking)
     # Advisor notification is sent only after payment succeeds
     # (see payment_service._handle_checkout_completed) to avoid
@@ -651,13 +624,14 @@ async def create_by_advisor(
         raise NotFoundError("Client not found")
 
     service = await _assert_service_offered(session, advisor.id, service_id=data.service_id)
+    duration_minutes = service.duration_minutes or data.duration_minutes
 
     start_utc = as_utc(data.scheduled_start)
     if start_utc <= datetime.now(UTC):
         raise AppError("Booking must be in the future", code="invalid_booking")
 
     await _lock_advisor_schedule(session, advisor.id)
-    end_utc = await _assert_slot_free(session, advisor.id, start_utc, data.duration_minutes)
+    end_utc = await _assert_slot_free(session, advisor.id, start_utc, duration_minutes)
 
     booking = Booking(
         seeker_id=seeker.id,
@@ -665,7 +639,7 @@ async def create_by_advisor(
         appointment_number=await _next_appointment_number(session),
         service_id=service.service_id or service.id,
         name=service.name or "Consultation",
-        duration_minutes=data.duration_minutes,
+        duration_minutes=duration_minutes,
         # Advisor-created bookings are not paid consultations — no checkout
         # session is ever created for them (see create_checkout_session, which
         # rejects price_usd <= 0), so the booking must not surface to the
@@ -683,7 +657,6 @@ async def create_by_advisor(
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
-    # Show the advisor which lead this booking came from, when it came from one.
     await advisor_lead_service.link_booking(session, booking)
     await _notify_booking(
         session,
@@ -1426,9 +1399,6 @@ def _meeting_read(
     end = as_utc(booking.scheduled_end)
     label = booking.name or "Consultation"
     is_advisor = viewer_user_id is not None and viewer_user_id == booking.advisor_id
-    # Window ke bahar sirf *links* rok diye jate hain — meeting ka record
-    # (waqt, tareekh, passcode) dikhta rehta hai, warna user ko lagta hai
-    # booking hi gayab ho gayi. Rule admin par bhi barabar lagta hai.
     joinable = is_meeting_joinable(booking)
     return BookingMeetingRead(
         label=label,

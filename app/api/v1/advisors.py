@@ -506,7 +506,6 @@ async def complete_advisor_onboarding(
                 duration_minutes=item.duration_minutes,
             )
     else:
-        # Keep prices already saved via PUT /offered_services when POST only sends IDs.
         for row in profile.offered_services or []:
             service_id = row.service_id or row.id
             priced_by_id[service_id] = OfferedServiceItemInput(
@@ -523,8 +522,6 @@ async def complete_advisor_onboarding(
         seen.add(service_id)
         existing = priced_by_id.get(service_id)
         if existing is None:
-            # price_usd is required (gt=0); building the item without it would
-            # raise inside the handler and surface as a 500.
             raise AppError(
                 "A positive price is required for every selected service",
                 code="service_not_priced",
@@ -1175,8 +1172,6 @@ async def list_my_clients(
     (``booking_id``, ``consultation_number`` / ``appointment_id``,
     ``consultation_type``, ``status``, ``is_important``) come from the latest
     booking; ``match_score`` from the latest non-dismissed lead when present.
-
-    ``name`` / ``status`` filter on that latest booking.
     """
     stmt = booking_service.list_clients_stmt(
         current_user.id, q, service_ids=service_id, status=status

@@ -301,23 +301,12 @@ async def dismiss(session: AsyncSession, lead: AdvisorLead, actor_id: uuid.UUID)
 
 
 async def booking_for_lead(session: AsyncSession, lead: AdvisorLead) -> Booking | None:
-    """Return only the booking explicitly linked to this lead."""
     if lead.booking_id is None:
         return None
     return await session.get(Booking, lead.booking_id)
 
 
 async def link_booking(session: AsyncSession, booking: Booking) -> AdvisorLead | None:
-    """Attach a new booking to this seeker+advisor's most recent unlinked lead.
-
-    ``booking_for_lead`` reads ``AdvisorLead.booking_id``, but nothing used to
-    write it, so an advisor's Leads list showed a blank Appointment ID even
-    after a lead turned into a real booking. Status is deliberately not
-    filtered: a seeker can book after the advisor already dismissed the lead,
-    and that booking is still the one that lead produced.
-
-    Returns ``None`` — the common case — when the pair has no open lead.
-    """
     stmt = (
         select(AdvisorLead)
         .where(

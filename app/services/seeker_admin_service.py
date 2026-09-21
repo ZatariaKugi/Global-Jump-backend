@@ -101,11 +101,6 @@ async def build_list_read(session: AsyncSession, users: list[User]) -> list[Seek
     result = []
     for u in users:
         profile = profiles.get(u.id)
-        # complete_onboarding's SeekerProfileUpdate only ever writes `nationality`,
-        # never `country_of_residence`; the admin "Add Visa Seeker" invite flow
-        # (create_seeker) is the reverse — only `country_of_residence` is set.
-        # Prefer nationality (the common, self-onboarded path) and fall back to
-        # country_of_residence so the admin-invited path still resolves.
         residence = (profile.nationality or profile.country_of_residence) if profile else None
         result.append(
             SeekerListRead(
@@ -152,7 +147,6 @@ async def get_seeker_detail(session: AsyncSession, user_id: uuid.UUID) -> Seeker
         full_name=user.full_name,
         email=user.email,
         profile_photo_url=profile.profile_photo_url,
-        # Same nationality/country_of_residence split as build_list_read.
         country_of_residence=profile.nationality or profile.country_of_residence,
         country_of_residence_name=country_name(profile.nationality or profile.country_of_residence),
         intended_visa_type=profile.intended_visa_type,

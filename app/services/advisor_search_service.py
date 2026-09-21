@@ -41,7 +41,6 @@ class AdvisorSearchFilters:
 
 
 def _min_price_subquery() -> ScalarSelect[Any]:
-    """Correlated scalar subquery: cheapest priced service the advisor offers."""
     return (
         select(func.min(AdvisorOfferedService.price_usd))
         .where(AdvisorOfferedService.profile_id == AdvisorProfile.id)
