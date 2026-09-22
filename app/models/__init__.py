@@ -53,6 +53,7 @@ from app.models.notification import (
     PushStatus,
 )
 from app.models.payout_request import PayoutRequest
+from app.models.pre_registration import PreRegistration, PreRegistrationInterest
 from app.models.regulatory_update import RegulatoryUpdate
 from app.models.review import Review
 from app.models.seeker_advisor_recommendation import SeekerAdvisorRecommendation
@@ -142,6 +143,8 @@ __all__ = [
     "Transaction",
     "TransactionEvent",
     "PayoutRequest",
+    "PreRegistration",
+    "PreRegistrationInterest",
     "SupportMessage",
     "SupportTicket",
     "TicketMessage",

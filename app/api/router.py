@@ -22,6 +22,7 @@ from app.api.v1 import (
     nationality_countries,
     notifications,
     payments,
+    pre_registrations,
     reviews,
     seeker_profiles,
     support,
@@ -51,6 +52,7 @@ api_router.include_router(assessments.router)
 api_router.include_router(uploads.router)
 api_router.include_router(tickets.router)
 api_router.include_router(support.router)
+api_router.include_router(pre_registrations.router)
 api_router.include_router(integrations_zoom.advisor_router)
 api_router.include_router(integrations_zoom.router)
 api_router.include_router(admin.router)

@@ -23,6 +23,7 @@ from app.models.booking import BookingStatus
 from app.models.country_rule import RulePublishStatus
 from app.models.eligibility_rule import EligibilityRule
 from app.models.payout_request import PayoutStatus
+from app.models.pre_registration import PreRegistrationInterest
 from app.models.review import Review
 from app.models.support_ticket import TicketPriority
 from app.models.ticket_message import TicketMessageAttachment
@@ -88,6 +89,7 @@ from app.schemas.payment import (
     TransactionFinanceRead,
 )
 from app.schemas.payout import PayoutDecision, PayoutRequestRead
+from app.schemas.pre_registration import PreRegistrationRead
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.review import (
     AdvisorReviewsTabRead,
@@ -116,6 +118,7 @@ from app.services import (
     matching_weights_service,
     payment_service,
     payout_service,
+    pre_registration_service,
     review_service,
     seeker_admin_service,
     seeker_document_service,
@@ -221,9 +224,8 @@ async def update_advisor_verification(
     await session.flush()
     await session.refresh(advisor)
 
-    if (
-        body.status == VerificationStatus.approved
-        and (previous_status != VerificationStatus.approved or not was_active)
+    if body.status == VerificationStatus.approved and (
+        previous_status != VerificationStatus.approved or not was_active
     ):
         advisor_profile = await session.scalar(
             select(AdvisorProfile).where(AdvisorProfile.user_id == advisor.id)
@@ -2020,4 +2022,36 @@ async def delete_country_rule(
     await country_rule_service.delete_rule(session, rule)
     return ResponseEnvelope[dict[str, bool]](
         data={"deleted": True}, meta=Meta(request_id=request_id)
+    )
+
+
+@router.get("/pre-registrations", response_model=ResponseEnvelope[list[PreRegistrationRead]])
+async def list_pre_registrations(
+    params: PaginationDep,
+    session: SessionDep,
+    request_id: RequestIdDep,
+    search: str | None = None,
+    interest: PreRegistrationInterest | None = None,
+) -> ResponseEnvelope[list[PreRegistrationRead]]:
+    """Leads captured by the public Pre-Registration form, newest first."""
+    stmt = pre_registration_service.list_stmt(search, interest)
+    rows, total = await paginate(session, stmt, params)
+    return ResponseEnvelope[list[PreRegistrationRead]](
+        data=[PreRegistrationRead.model_validate(row) for row in rows],
+        meta=page_meta(params, total, request_id),
+    )
+
+
+@router.get(
+    "/pre-registrations/{pre_registration_id}",
+    response_model=ResponseEnvelope[PreRegistrationRead],
+)
+async def get_pre_registration(
+    pre_registration_id: uuid.UUID,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[PreRegistrationRead]:
+    row = await pre_registration_service.get_by_id(session, pre_registration_id)
+    return ResponseEnvelope[PreRegistrationRead](
+        data=PreRegistrationRead.model_validate(row), meta=Meta(request_id=request_id)
     )
