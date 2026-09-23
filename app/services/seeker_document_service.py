@@ -987,7 +987,7 @@ def list_customer_documents_stmt(
     advisor_id: uuid.UUID,
     *,
     q: str | None = None,
-    service_types: list[str] | None = None,
+    service_ids: list[uuid.UUID] | None = None,
     documents_status: CustomerDocumentsRowStatus | None = None,
     sort: BookingSort = "-scheduled_start",
 ) -> Select[tuple[Booking]]:
@@ -999,7 +999,7 @@ def list_customer_documents_stmt(
         seeker_id=None,
         date_from=None,
         date_to=None,
-        service_types=service_types,
+        service_ids=service_ids,
         q=q,
         sort=sort,
     )
@@ -1117,7 +1117,8 @@ async def build_customer_document_rows(
                 seeker_name=seeker.full_name,
                 seeker_email=seeker.email,
                 seeker_profile_photo_url=resolve_media_url(photos.get(seeker.id), settings),
-                service_type=booking.service_type,
+                service_id=booking.service_id,
+                name=booking.name,
                 booking_status=booking.status,
                 documents_count=tallies["total"],
                 documents_status=status,
@@ -1137,7 +1138,6 @@ async def notify_seeker_of_document_status_update(
     status: str,
     note: str | None = None,
 ) -> None:
-    """In-app + FCM outbox for an advisor updating document status. Caller sends email separately."""
     advisor_name = advisor.full_name or "Your advisor"
     status_capitalized = status.capitalize()
     

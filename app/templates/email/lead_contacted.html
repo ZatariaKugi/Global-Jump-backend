@@ -1,0 +1,13 @@
+﻿{% extends "_base.html" %}
+{% from "_macros.html" import headline, cta %}
+
+{% block title %}An advisor has contacted you — {{ app_name }}{% endblock %}
+
+{% block content %}
+  {{ headline("An advisor has contacted you") }}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    Hi {{ full_name }}, {{ advisor_name }} has contacted you about your advisor match.
+  </p>
+  {{ cta(leads_url, "View your matches") }}
+{% endblock %}
+

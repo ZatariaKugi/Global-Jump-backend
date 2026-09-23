@@ -2,7 +2,7 @@ Hi {{ full_name }},
 
 You have a new consultation request awaiting your response.
 
-  Service:         {{ service_type }}
+  Service:         {{ name }}
   From:            {{ other_party }}
   Requested time:  {{ start_str }} (UTC)
 

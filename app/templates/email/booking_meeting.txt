@@ -2,7 +2,7 @@ Hi {{ full_name }},
 
 Your video consultation with {{ other_party }} is ready.
 
-  Service:   {{ service_type }}
+  Service:   {{ name }}
   With:      {{ other_party }}
   When:      {{ start_str }} (UTC)
   Duration:  {{ duration_minutes }} minutes

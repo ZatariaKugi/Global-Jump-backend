@@ -36,7 +36,7 @@ from app.services.matching_weights_service import DEFAULT_CONFIG, MatchingWeight
 from app.services.seeker_profile_service import (
     intended_destination_codes,
     intended_visa_type_values,
-    needed_service_types,
+    needed_service_ids,
     preferred_language_names,
 )
 
@@ -64,11 +64,10 @@ def _advisor_languages(profile: AdvisorProfile) -> set[str]:
     }
 
 
-def _advisor_services(profile: AdvisorProfile) -> set[str]:
+def _advisor_services(profile: AdvisorProfile) -> set[uuid.UUID]:
     return {
-        row.service_type.strip().lower()
+        row.service_id or row.id
         for row in (profile.offered_services or [])
-        if row.service_type
     }
 
 
@@ -105,7 +104,7 @@ def score_seeker_for_advisor(
     if seeker_langs and advisor_langs and (seeker_langs & advisor_langs):
         score += float(weights.language)
 
-    needed = {s.strip().lower() for s in needed_service_types(seeker) if s and s.strip()}
+    needed = set(needed_service_ids(seeker))
     offered = _advisor_services(profile)
     if needed and offered and (needed & offered):
         score += float(weights.services)
@@ -134,7 +133,7 @@ def _rule_reasons(profile: AdvisorProfile, seeker: SeekerProfile) -> str:
     }
     if seeker_langs & _advisor_languages(profile):
         parts.append("Language match")
-    needed = {s.strip().lower() for s in needed_service_types(seeker) if s and s.strip()}
+    needed = set(needed_service_ids(seeker))
     if needed & _advisor_services(profile):
         parts.append("Services match")
     return "; ".join(parts) if parts else "Profile fit"
@@ -238,7 +237,7 @@ async def match_seekers_for_advisor(
                 ),
                 intended_visa_type=visa_types[0] if visa_types else seeker.intended_visa_type,
                 preferred_languages=preferred_language_names(seeker),
-                needed_services=needed_service_types(seeker),
+                service_ids=needed_service_ids(seeker),
                 match_score=score,
                 match_reasons=_rule_reasons(profile, seeker),
                 rule_score=score,

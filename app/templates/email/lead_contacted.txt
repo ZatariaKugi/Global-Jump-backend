@@ -1,0 +1,8 @@
+﻿An advisor has contacted you — {{ app_name }}
+
+Hi {{ full_name }},
+
+{{ advisor_name }} has contacted you about your advisor match.
+
+View your matches: {{ leads_url }}
+

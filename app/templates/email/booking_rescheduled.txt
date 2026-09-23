@@ -2,7 +2,7 @@ Hi {{ full_name }},
 
 Your consultation has been rescheduled.
 
-  Service:   {{ service_type }}
+  Service:   {{ name }}
   With:      {{ other_party }}
   New time:  {{ start_str }} (UTC)
   Duration:  {{ duration_minutes }} minutes

@@ -8,7 +8,6 @@ from app.api.v1 import (
     admin,
     admin_profile,
     advisor_offered_services,
-    advisor_services,
     advisors,
     assessments,
     auth,
@@ -23,6 +22,7 @@ from app.api.v1 import (
     nationality_countries,
     notifications,
     payments,
+    pre_registrations,
     reviews,
     seeker_profiles,
     support,
@@ -40,7 +40,6 @@ api_router.include_router(users.router)
 api_router.include_router(seeker_profiles.router)
 api_router.include_router(availability.router)  # before advisors: /me/availability vs /{id}
 api_router.include_router(advisors.router)
-api_router.include_router(advisor_services.router)
 api_router.include_router(advisor_offered_services.router)
 api_router.include_router(bookings.router)
 api_router.include_router(bookmarks.router)
@@ -53,6 +52,7 @@ api_router.include_router(assessments.router)
 api_router.include_router(uploads.router)
 api_router.include_router(tickets.router)
 api_router.include_router(support.router)
+api_router.include_router(pre_registrations.router)
 api_router.include_router(integrations_zoom.advisor_router)
 api_router.include_router(integrations_zoom.router)
 api_router.include_router(admin.router)

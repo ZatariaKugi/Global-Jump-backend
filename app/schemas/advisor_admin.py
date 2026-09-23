@@ -47,6 +47,7 @@ class AdvisorManagementListRead(BaseModel):
     avg_rating: float | None
     review_count: int
     earnings: float
+    is_bookable: bool = True
     created_at: datetime
 
 

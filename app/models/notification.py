@@ -40,7 +40,10 @@ class NotificationType(StrEnum):
     payout_completed = "payout_completed"
     payout_rejected = "payout_rejected"
     user_registered = "user_registered"
+    pre_registration_received = "pre_registration_received"
+    new_relevant_advisor = "new_relevant_advisor"
     message_received = "message_received"
+    lead_contacted = "lead_contacted"
     document_comment = "document_comment"
     document_status_updated = "document_status_updated"
 
@@ -86,6 +89,9 @@ class Notification(BaseModel):
     )
     entity_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    scheduled_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     push_status: Mapped[PushStatus] = mapped_column(
         SAEnum(PushStatus, name="notification_push_status"),

@@ -2,7 +2,7 @@ Hi {{ full_name }},
 
 Your consultation booking is confirmed.
 
-  Service:   {{ service_type }}
+  Service:   {{ name }}
   With:      {{ other_party }}
   When:      {{ start_str }} (UTC)
   Duration:  {{ duration_minutes }} minutes

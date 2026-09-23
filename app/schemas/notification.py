@@ -22,6 +22,7 @@ class NotificationRead(BaseModel):
     actor_id: uuid.UUID | None
     read_at: datetime | None
     created_at: datetime
+    scheduled_start: datetime | None
 
 
 class UnreadCountRead(BaseModel):

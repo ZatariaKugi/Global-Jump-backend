@@ -8,6 +8,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
+from sqlalchemy import select
 
 from app.api.deps import CurrentPrincipal, RequestIdDep, SettingsDep, require_role
 from app.api.pagination import PaginationDep, page_meta, paginate
@@ -15,12 +16,14 @@ from app.core.file_storage import resolve_url
 from app.core.visa_types import OptionalVisaType
 from app.db.session import SessionDep
 from app.models.advisor_credential import CredentialStatus
+from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import AssessmentQuestion
 from app.models.assessment_threshold import AssessmentThreshold
 from app.models.booking import BookingStatus
 from app.models.country_rule import RulePublishStatus
 from app.models.eligibility_rule import EligibilityRule
 from app.models.payout_request import PayoutStatus
+from app.models.pre_registration import PreRegistrationInterest
 from app.models.review import Review
 from app.models.support_ticket import TicketPriority
 from app.models.ticket_message import TicketMessageAttachment
@@ -86,6 +89,7 @@ from app.schemas.payment import (
     TransactionFinanceRead,
 )
 from app.schemas.payout import PayoutDecision, PayoutRequestRead
+from app.schemas.pre_registration import PreRegistrationRead
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.review import (
     AdvisorReviewsTabRead,
@@ -114,6 +118,7 @@ from app.services import (
     matching_weights_service,
     payment_service,
     payout_service,
+    pre_registration_service,
     review_service,
     seeker_admin_service,
     seeker_document_service,
@@ -171,7 +176,7 @@ async def update_advisor_verification(
     Rejection emails include an optional ``reason``.
     """
     from app.core.exceptions import NotFoundError
-    from app.services import advisor_credential_service
+    from app.services import advisor_credential_service, seeker_recommendation_service
     from app.services.email_service import (
         schedule_email,
         send_advisor_pending_email,
@@ -184,6 +189,7 @@ async def update_advisor_verification(
         raise NotFoundError("Advisor not found")
 
     previous_status = advisor.verification_status
+    was_active = advisor.is_active
     advisor.verification_status = body.status
     if body.status == VerificationStatus.approved:
         advisor.is_active = True
@@ -218,10 +224,19 @@ async def update_advisor_verification(
     await session.flush()
     await session.refresh(advisor)
 
-    if (
-        body.status == VerificationStatus.approved
-        and previous_status != VerificationStatus.approved
+    if body.status == VerificationStatus.approved and (
+        previous_status != VerificationStatus.approved or not was_active
     ):
+        advisor_profile = await session.scalar(
+            select(AdvisorProfile).where(AdvisorProfile.user_id == advisor.id)
+        )
+        if advisor_profile is not None:
+            await seeker_recommendation_service.notify_seekers_about_new_advisor(
+                session,
+                advisor,
+                advisor_profile,
+                settings=settings,
+            )
         schedule_email(
             send_advisor_welcome_email(
                 advisor.email,
@@ -712,7 +727,13 @@ async def reschedule_booking_admin(
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
-            session, booking, seeker, advisor, settings, viewer_role=UserRole.admin
+            session,
+            booking,
+            seeker,
+            advisor,
+            settings,
+            viewer_id=admin_principal.id,
+            viewer_role=UserRole.admin,
         ),
         meta=Meta(request_id=request_id),
     )
@@ -1896,7 +1917,10 @@ async def list_country_rules(
     status: RulePublishStatus | None = None,
     sort: str | None = Query(
         default=None,
-        description="Only ``newest`` is honored (created_at desc); omitted/unknown keep country/visa/version order",
+        description=(
+            "Only ``newest`` is honored (created_at desc); omitted/unknown keep "
+            "country/visa/version order"
+        ),
     ),
 ) -> ResponseEnvelope[list[CountryRuleRead]]:
     stmt = country_rule_service.list_rules_stmt(
@@ -1998,4 +2022,36 @@ async def delete_country_rule(
     await country_rule_service.delete_rule(session, rule)
     return ResponseEnvelope[dict[str, bool]](
         data={"deleted": True}, meta=Meta(request_id=request_id)
+    )
+
+
+@router.get("/pre-registrations", response_model=ResponseEnvelope[list[PreRegistrationRead]])
+async def list_pre_registrations(
+    params: PaginationDep,
+    session: SessionDep,
+    request_id: RequestIdDep,
+    search: str | None = None,
+    interest: PreRegistrationInterest | None = None,
+) -> ResponseEnvelope[list[PreRegistrationRead]]:
+    """Leads captured by the public Pre-Registration form, newest first."""
+    stmt = pre_registration_service.list_stmt(search, interest)
+    rows, total = await paginate(session, stmt, params)
+    return ResponseEnvelope[list[PreRegistrationRead]](
+        data=[PreRegistrationRead.model_validate(row) for row in rows],
+        meta=page_meta(params, total, request_id),
+    )
+
+
+@router.get(
+    "/pre-registrations/{pre_registration_id}",
+    response_model=ResponseEnvelope[PreRegistrationRead],
+)
+async def get_pre_registration(
+    pre_registration_id: uuid.UUID,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[PreRegistrationRead]:
+    row = await pre_registration_service.get_by_id(session, pre_registration_id)
+    return ResponseEnvelope[PreRegistrationRead](
+        data=PreRegistrationRead.model_validate(row), meta=Meta(request_id=request_id)
     )

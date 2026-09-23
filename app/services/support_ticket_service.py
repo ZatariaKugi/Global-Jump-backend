@@ -5,13 +5,15 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import ColumnElement, Select, String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import AppError, ConflictError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import resolve_url
+from app.models.admin_profile import AdminProfile
 from app.models.advisor_profile import AdvisorProfile
+from app.models.booking import Booking
 from app.models.seeker_profile import SeekerProfile
 from app.models.support_ticket import (
     SupportTicket,
@@ -21,10 +23,19 @@ from app.models.support_ticket import (
 )
 from app.models.ticket_message import TicketMessage, TicketMessageAttachment
 from app.models.user import User, UserRole
-from app.schemas.support_ticket import TicketCreate, TicketRead, TicketUpdate
+from app.schemas.support_ticket import TicketCreate, TicketRead, TicketSelfCreate, TicketUpdate
 from app.schemas.ticket_message import TicketAttachmentRead
 
 _RESOLVED_STATUSES = (TicketStatus.resolved, TicketStatus.closed)
+
+# Allowed status transitions (admin-driven). A no-op transition (X → X) is
+# always permitted so re-saving the same status never 409s.
+_STATUS_TRANSITIONS: dict[TicketStatus, set[TicketStatus]] = {
+    TicketStatus.open: {TicketStatus.in_progress, TicketStatus.resolved, TicketStatus.closed},
+    TicketStatus.in_progress: {TicketStatus.open, TicketStatus.resolved, TicketStatus.closed},
+    TicketStatus.resolved: {TicketStatus.open, TicketStatus.closed},
+    TicketStatus.closed: {TicketStatus.open},
+}
 
 # Frontend filter labels → canonical TicketStatus (list query only).
 _STATUS_ALIASES: dict[str, TicketStatus] = {
@@ -85,6 +96,40 @@ async def _resolve_ticket_user(session: AsyncSession, data: TicketCreate) -> Use
     return user
 
 
+async def _booking_snapshot(
+    session: AsyncSession, booking_id: uuid.UUID, owner: User
+) -> dict[str, object | None]:
+    """Validate the booking belongs to ``owner`` and snapshot its context.
+
+    The "related user" is the *other* party: a seeker's ticket shows the advisor,
+    an advisor's ticket shows the seeker. Admins own no booking side, so the
+    related party is chosen by which side ``owner`` sits on.
+    """
+    booking = await session.get(Booking, booking_id)
+    if booking is None:
+        raise AppError("Invalid booking_id", code="invalid_booking")
+    if owner.id not in (booking.seeker_id, booking.advisor_id):
+        raise AppError("Booking does not belong to this user", code="invalid_booking")
+
+    # The counterpart is whoever the owner is NOT. For an admin-owned ticket the
+    # owner is on neither side, so default to showing the seeker.
+    if owner.id == booking.advisor_id:
+        related_id, related_type = booking.seeker_id, UserRole.seeker
+    else:
+        related_id, related_type = booking.advisor_id, UserRole.advisor
+    related_user = await session.get(User, related_id)
+
+    return {
+        "booking_id": booking.id,
+        "booking_reference": f"APT-{booking.appointment_number}",
+        "related_user_name": related_user.full_name if related_user else None,
+        "related_user_type": related_type.value,
+        "session_scheduled_start": booking.scheduled_start,
+        "service_id": booking.service_id,
+        "name": booking.name,
+    }
+
+
 async def create(
     session: AsyncSession,
     data: TicketCreate,
@@ -99,6 +144,10 @@ async def create(
         if assignee is None:
             raise NotFoundError("Assignee not found")
 
+    snapshot: dict[str, object | None] = {}
+    if data.booking_id is not None:
+        snapshot = await _booking_snapshot(session, data.booking_id, user)
+
     ticket = SupportTicket(
         user_id=user.id,
         subject=data.subject,
@@ -109,6 +158,7 @@ async def create(
         assigned_to=data.assigned_to,
         internal_notes=data.internal_notes,
         created_by=admin_id,
+        **snapshot,
     )
     session.add(ticket)
     await session.flush()
@@ -131,6 +181,73 @@ async def create(
     return ticket
 
 
+async def create_for_user(
+    session: AsyncSession, data: TicketSelfCreate, user: User
+) -> SupportTicket:
+    """Seeker/advisor self-service ticket creation. Owner is the current user."""
+    snapshot: dict[str, object | None] = {}
+    if data.booking_id is not None:
+        snapshot = await _booking_snapshot(session, data.booking_id, user)
+
+    ticket = SupportTicket(
+        user_id=user.id,
+        subject=data.subject,
+        description=data.description,
+        category=data.category,
+        priority=TicketPriority.medium,
+        status=TicketStatus.open,
+        created_by=user.id,
+        **snapshot,
+    )
+    session.add(ticket)
+    await session.flush()
+
+    # Opening thread message so the description appears in the conversation
+    # (mirrors admin create; sender is the requester).
+    message = TicketMessage(
+        ticket_id=ticket.id,
+        sender_id=user.id,
+        body=data.description,
+        created_by=user.id,
+        created_at=datetime.now(UTC),
+    )
+    session.add(message)
+    await session.flush()
+
+    await session.refresh(ticket)
+    return ticket
+
+
+def assert_repliable(ticket: SupportTicket) -> None:
+    """Guard message-send endpoints: no replies once resolved/closed."""
+    if ticket.status in _RESOLVED_STATUSES:
+        raise ConflictError(
+            f"Cannot reply to a {ticket.status.value} ticket",
+            code="ticket_not_repliable",
+        )
+
+
+def _own_field_search(search: str) -> list[ColumnElement[bool]]:
+    """Search predicates over the ticket's own columns (no user join needed).
+
+    Covers ``ticket_number`` (``TKT-`` + first 8 hex chars of the id),
+    ``subject`` and ``description``.
+    """
+    term = search.strip()
+    pattern = f"%{term}%"
+    clauses: list[ColumnElement[bool]] = [
+        SupportTicket.subject.ilike(pattern),
+        SupportTicket.description.ilike(pattern),
+    ]
+
+    number = term
+    if number.lower().startswith("tkt-"):
+        number = number[4:]
+    if number:
+        clauses.append(cast(SupportTicket.id, String).ilike(f"{number.lower()}%"))
+    return clauses
+
+
 def list_stmt(
     status: TicketStatus | None = None,
     priority: TicketPriority | None = None,
@@ -147,20 +264,25 @@ def list_stmt(
     if search:
         stmt = stmt.join(User, User.id == SupportTicket.user_id).where(
             or_(
-                SupportTicket.subject.ilike(f"%{search}%"),
-                User.full_name.ilike(f"%{search}%"),
-                User.email.ilike(f"%{search}%"),
+                *_own_field_search(search),
+                User.full_name.ilike(f"%{search.strip()}%"),
+                User.email.ilike(f"%{search.strip()}%"),
             )
         )
     return stmt.order_by(SupportTicket.created_at.desc())
 
 
-def list_for_user_stmt(user_id: uuid.UUID) -> Select[tuple[SupportTicket]]:
-    return (
-        select(SupportTicket)
-        .where(SupportTicket.user_id == user_id)
-        .order_by(SupportTicket.created_at.desc())
-    )
+def list_for_user_stmt(
+    user_id: uuid.UUID,
+    status: TicketStatus | None = None,
+    search: str | None = None,
+) -> Select[tuple[SupportTicket]]:
+    stmt = select(SupportTicket).where(SupportTicket.user_id == user_id)
+    if status is not None:
+        stmt = stmt.where(SupportTicket.status == status)
+    if search:
+        stmt = stmt.where(or_(*_own_field_search(search)))
+    return stmt.order_by(SupportTicket.created_at.desc())
 
 
 async def get_by_id(session: AsyncSession, ticket_id: uuid.UUID) -> SupportTicket:
@@ -174,8 +296,10 @@ async def get_for_user(
     session: AsyncSession, ticket_id: uuid.UUID, user_id: uuid.UUID
 ) -> SupportTicket:
     ticket = await session.get(SupportTicket, ticket_id)
-    if ticket is None or ticket.user_id != user_id:
+    if ticket is None:
         raise NotFoundError("Ticket not found")
+    if ticket.user_id != user_id:
+        raise PermissionDeniedError("You do not have access to this ticket")
     return ticket
 
 
@@ -193,6 +317,11 @@ async def update(
         fields.pop("assigned_to")
     if "status" in fields:
         status = fields.pop("status")
+        if status != ticket.status and status not in _STATUS_TRANSITIONS.get(ticket.status, set()):
+            raise ConflictError(
+                f"Cannot move ticket from {ticket.status.value} to {status.value}",
+                code="invalid_status_transition",
+            )
         ticket.status = status
         if status in _RESOLVED_STATUSES:
             ticket.resolved_at = datetime.now(UTC)
@@ -210,16 +339,30 @@ async def update(
 
 
 async def ticket_read(
-    session: AsyncSession, ticket: SupportTicket, settings: Settings
+    session: AsyncSession,
+    ticket: SupportTicket,
+    settings: Settings,
+    *,
+    include_internal: bool = True,
 ) -> TicketRead:
-    rows = await build_list_reads(session, [ticket], settings)
+    rows = await build_list_reads(
+        session, [ticket], settings, include_internal=include_internal
+    )
     return rows[0]
 
 
 async def build_list_reads(
-    session: AsyncSession, tickets: list[SupportTicket], settings: Settings
+    session: AsyncSession,
+    tickets: list[SupportTicket],
+    settings: Settings,
+    *,
+    include_internal: bool = True,
 ) -> list[TicketRead]:
-    """Bulk-enrich tickets for list/detail without per-row queries."""
+    """Bulk-enrich tickets for list/detail without per-row queries.
+
+    ``include_internal=False`` (user-facing routes) strips ``internal_notes``
+    so only admins see it.
+    """
     if not tickets:
         return []
 
@@ -237,6 +380,7 @@ async def build_list_reads(
 
     advisor_photos: dict[uuid.UUID, str | None] = {}
     seeker_photos: dict[uuid.UUID, str | None] = {}
+    phones: dict[uuid.UUID, str | None] = {}
     if user_ids:
         for adv in (
             (
@@ -248,6 +392,7 @@ async def build_list_reads(
             .all()
         ):
             advisor_photos[adv.user_id] = adv.profile_photo_url
+            phones[adv.user_id] = adv.phone
         for seeker in (
             (
                 await session.execute(
@@ -258,6 +403,17 @@ async def build_list_reads(
             .all()
         ):
             seeker_photos[seeker.user_id] = seeker.profile_photo_url
+            phones[seeker.user_id] = seeker.phone
+        for admin in (
+            (
+                await session.execute(
+                    select(AdminProfile).where(AdminProfile.user_id.in_(user_ids))
+                )
+            )
+            .scalars()
+            .all()
+        ):
+            phones[admin.user_id] = admin.phone
 
     ticket_ids = [t.id for t in tickets]
     msg_stats: dict[uuid.UUID, tuple[int, datetime | None]] = dict.fromkeys(ticket_ids, (0, None))
@@ -323,14 +479,14 @@ async def build_list_reads(
                 user_email=user.email if user else None,
                 user_type=user_type,
                 avatar_url=resolve_url(avatar_raw, settings) if avatar_raw else None,
-                phone=None,
+                phone=phones.get(ticket.user_id),
                 subject=ticket.subject,
                 description=ticket.description,
                 category=ticket.category,
                 priority=ticket.priority,
                 status=ticket.status,
                 preferred_contact_at=ticket.preferred_contact_at,
-                internal_notes=ticket.internal_notes,
+                internal_notes=ticket.internal_notes if include_internal else None,
                 resolved_at=ticket.resolved_at,
                 resolved_by=ticket.resolved_by,
                 assigned_to=ticket.assigned_to,
@@ -340,6 +496,13 @@ async def build_list_reads(
                 attachments=attachments_by_ticket.get(ticket.id, []),
                 created_at=ticket.created_at,
                 updated_at=ticket.updated_at,
+                booking_id=ticket.booking_id,
+                booking_reference=ticket.booking_reference,
+                related_user_name=ticket.related_user_name,
+                related_user_type=ticket.related_user_type,
+                session_scheduled_start=ticket.session_scheduled_start,
+                service_id=ticket.service_id,
+                name=ticket.name,
             )
         )
     return out

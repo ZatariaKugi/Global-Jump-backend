@@ -2,7 +2,7 @@ Hi {{ full_name }},
 
 The following consultation has been cancelled{% if cancelled_by %} by {{ cancelled_by }}{% endif %}.
 
-  Service:        {{ service_type }}
+  Service:        {{ name }}
   With:           {{ other_party }}
   Was scheduled:  {{ start_str }} (UTC)
 {% if reason %}  Reason:         {{ reason }}

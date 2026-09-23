@@ -2,7 +2,7 @@ Hi {{ full_name }},
 
 {{ author_name }} added a note to your consultation.
 
-  Service:  {{ service_type }}
+  Service:  {{ name }}
   With:     {{ other_party }}
 {% if preview %}
   "{{ preview }}"

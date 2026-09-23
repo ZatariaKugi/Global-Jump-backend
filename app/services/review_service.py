@@ -310,7 +310,7 @@ async def build_enriched_reads(session: AsyncSession, reviews: list[Review]) -> 
         .all()
     }
     service_by_booking = {
-        b.id: b.service_type
+        b.id: b.name
         for b in (await session.execute(select(Booking).where(Booking.id.in_(booking_ids))))
         .scalars()
         .all()

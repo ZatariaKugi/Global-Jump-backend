@@ -9,7 +9,7 @@
     Hi {{ full_name }}, you have a new consultation request awaiting your response.
   </p>
   {{ details_open() }}
-  {{ details_row("Service", service_type) }}
+  {{ details_row("Service", name) }}
   {{ details_row("From", other_party) }}
   {{ details_row("Requested time", start_str ~ " UTC") }}
   {{ details_close() }}

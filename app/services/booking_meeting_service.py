@@ -60,7 +60,7 @@ async def maybe_provision_meeting(
 
     seeker = await session.get(User, booking.seeker_id)
     advisor = await session.get(User, booking.advisor_id)
-    service_label = humanize_slug(booking.service_type) or booking.service_type
+    service_label = humanize_slug(booking.name) or booking.name
     topic = f"{settings.EMAILS_FROM_NAME}: {service_label}"
     if seeker and seeker.full_name:
         topic = f"{topic} with {seeker.full_name}"
@@ -203,7 +203,7 @@ async def _send_meeting_notifications(
                 seeker.email,
                 seeker.full_name or seeker.email,
                 other_party=advisor.full_name if advisor and advisor.full_name else "Advisor",
-                service_type=booking.service_type,
+                name=booking.name,
                 start_utc=as_utc(booking.scheduled_start),
                 duration_minutes=booking.duration_minutes,
                 meeting_url=booking.meeting_join_url,
@@ -212,7 +212,7 @@ async def _send_meeting_notifications(
                 settings=settings,
             )
         )
-        service_label = humanize_slug(booking.service_type) or "consultation"
+        service_label = humanize_slug(booking.name) or "consultation"
         await notification_service.notify(
             session,
             user_id=seeker.id,
@@ -230,7 +230,7 @@ async def _send_meeting_notifications(
                 advisor.email,
                 advisor.full_name or advisor.email,
                 other_party=seeker.full_name if seeker and seeker.full_name else "Client",
-                service_type=booking.service_type,
+                name=booking.name,
                 start_utc=as_utc(booking.scheduled_start),
                 duration_minutes=booking.duration_minutes,
                 meeting_url=booking.meeting_start_url,

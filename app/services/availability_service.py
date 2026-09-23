@@ -174,11 +174,14 @@ async def free_slots(
         else:
             busy.append(window)
 
+    busy_from = datetime.combine(date_from - timedelta(days=1), datetime.min.time(), UTC)
+    busy_to = datetime.combine(date_to + timedelta(days=2), datetime.min.time(), UTC)
     bookings_result = await session.execute(
         select(Booking)
         .where(Booking.advisor_id == advisor_id)
         .where(Booking.status.in_(ACTIVE_BOOKING_STATUSES))
-        .where(Booking.scheduled_end >= datetime.combine(date_from, datetime.min.time(), UTC))
+        .where(Booking.scheduled_end >= busy_from)
+        .where(Booking.scheduled_start < busy_to)
     )
     for booking in bookings_result.scalars().all():
         if exclude_booking_id is not None and booking.id == exclude_booking_id:

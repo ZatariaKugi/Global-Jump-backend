@@ -40,6 +40,9 @@ class TicketCreate(BaseModel):
     preferred_contact_at: datetime | None = None
     assigned_to: uuid.UUID | None = None
     internal_notes: str | None = Field(default=None, max_length=2000)
+    # When category=booking the FE sends this as required; validated to belong
+    # to the ticket's user and snapshotted onto the ticket.
+    booking_id: uuid.UUID | None = None
     attachments: list[TicketMessageAttachmentRef] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -50,6 +53,27 @@ class TicketCreate(BaseModel):
             raise ValueError("Provide exactly one of user_id or user_email")
         if self.user_email:
             self.user_email = self.user_email.strip().lower()
+        if self.category == TicketCategory.booking and self.booking_id is None:
+            raise ValueError("booking_id is required for booking tickets")
+        return self
+
+
+class TicketSelfCreate(BaseModel):
+    """Create a ticket as the current seeker/advisor (owner is set server-side).
+
+    Attachments are not accepted here — the opening message carries only the
+    ``description``; follow up with ``POST /tickets/{id}/messages`` to attach files.
+    """
+
+    subject: str = Field(min_length=1, max_length=255)
+    description: str = Field(min_length=1, max_length=2000)
+    category: CoercedTicketCategory
+    booking_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _require_booking(self) -> TicketSelfCreate:
+        if self.category == TicketCategory.booking and self.booking_id is None:
+            raise ValueError("booking_id is required for booking tickets")
         return self
 
 
@@ -89,3 +113,12 @@ class TicketRead(BaseModel):
     attachments: list[TicketAttachmentRead]
     created_at: datetime
     updated_at: datetime
+
+    # Booking / session context snapshot (null unless linked to a booking).
+    booking_id: uuid.UUID | None
+    booking_reference: str | None
+    related_user_name: str | None
+    related_user_type: str | None
+    session_scheduled_start: datetime | None
+    service_id: uuid.UUID | None
+    name: str | None

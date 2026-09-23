@@ -63,7 +63,8 @@ class TransactionFinanceRead(TransactionAdminRead):
     seeker_name: str | None
     advisor_id: uuid.UUID
     advisor_name: str | None
-    service_type: str
+    service_id: uuid.UUID | None
+    name: str
     scheduled_start: datetime
     invoice_id: str | None = None
     display_id: str | None = None
@@ -91,7 +92,8 @@ class TransactionAdvisorRead(TransactionRead):
     seeker_id: uuid.UUID
     seeker_name: str | None
     seeker_email: str | None = None
-    service_type: str
+    service_id: uuid.UUID | None
+    name: str
     scheduled_start: datetime
     appointment_id: str | None = None
     invoice_id: str | None = None
@@ -114,7 +116,8 @@ class SeekerPaymentRead(BaseModel):
     advisor_name: str | None
     advisor_email: str | None
     advisor_photo_url: str | None
-    service_type: str
+    service_id: uuid.UUID | None
+    name: str
     created_at: datetime
     amount_usd: float
     total_amount: float  # same as amount_usd — grand total charged (FE column name)

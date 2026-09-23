@@ -101,7 +101,7 @@ async def build_list_read(session: AsyncSession, users: list[User]) -> list[Seek
     result = []
     for u in users:
         profile = profiles.get(u.id)
-        residence = profile.country_of_residence if profile else None
+        residence = (profile.nationality or profile.country_of_residence) if profile else None
         result.append(
             SeekerListRead(
                 id=u.id,
@@ -147,8 +147,8 @@ async def get_seeker_detail(session: AsyncSession, user_id: uuid.UUID) -> Seeker
         full_name=user.full_name,
         email=user.email,
         profile_photo_url=profile.profile_photo_url,
-        country_of_residence=profile.country_of_residence,
-        country_of_residence_name=country_name(profile.country_of_residence),
+        country_of_residence=profile.nationality or profile.country_of_residence,
+        country_of_residence_name=country_name(profile.nationality or profile.country_of_residence),
         intended_visa_type=profile.intended_visa_type,
         intended_visa_type_name=visa_type_name(profile.intended_visa_type),
         status=user_admin_service.compute_status(user),

@@ -24,7 +24,7 @@ from app.schemas.assessment import AdvisorMatchRead, AiMatchStatusRead
 
 CountryCode = Annotated[str, Field(min_length=2, max_length=2)]
 LanguageName = Annotated[str, Field(min_length=1, max_length=100)]
-ServiceTypeSlug = Annotated[str, Field(min_length=1, max_length=100)]
+ServiceId = uuid.UUID
 
 
 def _expand_comma_separated_list(value: object) -> object:
@@ -130,9 +130,8 @@ class SeekerProfileUpdate(BaseModel):
     passport_expiry: date | None = None
     countries_visited: list[CountryCode] | None = None
     prior_visas: list[PriorVisa] | None = None
-    needed_services: list[ServiceTypeSlug] | None = None
-    # Alias accepted from onboarding FE drafts.
-    service_ids: list[ServiceTypeSlug] | None = None
+    needed_services: list[ServiceId] | None = None
+    service_ids: list[ServiceId] | None = None
     education_level: EducationLevel | None = None
     employment_status: EmploymentStatus | None = None
     employer_name: str | None = Field(default=None, max_length=255)
@@ -231,8 +230,7 @@ class OnboardingSubmit(BaseModel):
     countries_visited: str = Field(default="", max_length=100)
     preferred_languages: list[LanguageName] = Field(default_factory=list, max_length=20)
     preferred_language: str | None = Field(default=None, max_length=100)
-    services: list[ServiceTypeSlug] = Field(default_factory=list, max_length=20)
-    service_ids: list[ServiceTypeSlug] = Field(default_factory=list, max_length=20)
+    service_ids: list[ServiceId] = Field(default_factory=list, max_length=20)
     nationality: str | None = Field(default=None, min_length=2, max_length=100)
     country_of_residence: str | None = Field(default=None, min_length=2, max_length=100)
     education_level: EducationLevel | None = None
@@ -255,11 +253,6 @@ class OnboardingSubmit(BaseModel):
             self.intended_visa_types = [self.intended_visa_type]
         if not self.intended_destinations and self.intended_destination:
             self.intended_destinations = [self.intended_destination]
-        # FE sends service_ids; keep services in sync even when services=[] was defaulted.
-        if not self.services and self.service_ids:
-            self.services = list(self.service_ids)
-        elif not self.service_ids and self.services:
-            self.service_ids = list(self.services)
 
         if not self.intended_visa_types:
             raise ValueError("At least one intended visa type is required")
@@ -343,7 +336,6 @@ class OnboardingSubmit(BaseModel):
 
     @field_validator(
         "preferred_languages",
-        "services",
         "service_ids",
         mode="before",
     )
@@ -371,7 +363,7 @@ class SeekerProfileRead(BaseModel):
     passport_expiry: date | None
     countries_visited: list[str]
     prior_visas: list[PriorVisa]
-    service_ids: list[str] = Field(default_factory=list)
+    service_ids: list[uuid.UUID] = Field(default_factory=list)
     education_level: EducationLevel | None
     employment_status: EmploymentStatus | None
     employer_name: str | None

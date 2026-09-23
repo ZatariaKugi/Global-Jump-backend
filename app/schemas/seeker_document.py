@@ -151,7 +151,8 @@ class CustomerDocumentsRowRead(BaseModel):
     seeker_name: str | None
     seeker_email: str
     seeker_profile_photo_url: str | None
-    service_type: str
+    service_id: uuid.UUID | None
+    name: str
     booking_status: BookingStatus
     documents_count: int
     # pending = zero docs, any under_review, or mixed approved/rejected;

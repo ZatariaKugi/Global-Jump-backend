@@ -27,6 +27,7 @@ class CredentialStatus(StrEnum):
     pending = "pending"
     verified = "verified"
     rejected = "rejected"
+    replacement_required = "replacement_required"
     expired = "expired"
 
 

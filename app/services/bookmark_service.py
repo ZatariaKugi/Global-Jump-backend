@@ -217,7 +217,7 @@ async def build_list_reads(
         if advisor is None:
             continue
         profile = profiles.get(bookmark.advisor_id)
-        avg, _count = ratings.get(bookmark.advisor_id, (None, 0))
+        avg, count = ratings.get(bookmark.advisor_id, (None, 0))
         match_percentage = advisor_matching_service.match_percentage(
             profile, destination, visa_type, avg
         )
@@ -239,9 +239,10 @@ async def build_list_reads(
                 ),
                 expertise=expertise,
                 average_rating=avg,
+                review_count=count,
                 years_of_experience=profile.years_of_experience if profile else None,
                 offered_services=(
-                    advisor_profile_service.offered_service_types(profile) if profile else []
+                    advisor_profile_service.offered_service_ids(profile) if profile else []
                 ),
                 starting_price_usd=advisor_profile_service.starting_price_usd(profile),
                 match_percentage=match_percentage,

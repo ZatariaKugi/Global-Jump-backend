@@ -16,19 +16,18 @@ from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import resolve_media_url
 from app.core.logging import get_logger
-from app.core.visa_types import humanize_slug
 from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
-from app.models.advisor_profile import AdvisorOfferedService, AdvisorProfile, AdvisorService
+from app.models.advisor_profile import AdvisorOfferedService, AdvisorProfile
 from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus, PaymentStatus
-from app.models.booking_document_request import BookingDocumentRequest
+from app.models.booking_document_request import BookingDocumentRequest, DocumentRequestStatus
 from app.models.booking_note import BookingNote
-from app.models.booking_document_request import DocumentRequestStatus
 from app.models.notification import NotificationEntityType, NotificationType
 from app.models.review import Review
 from app.models.seeker_profile import SeekerProfile
 from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.booking import (
+    AdminBookingPickerRead,
     AdvisorBookingCreate,
     BookingAiSuggestionRead,
     BookingAttachmentRead,
@@ -44,6 +43,7 @@ from app.schemas.booking import (
     SessionTimelineStepRead,
 )
 from app.services import (
+    advisor_lead_service,
     availability_service,
     booking_document_service,
     booking_meeting_service,
@@ -55,9 +55,7 @@ from app.services.availability_service import as_utc
 from app.services.seeker_profile_service import preferred_language_names
 
 DEFAULT_NOTICE_HOURS = 24
-UNACCEPTED_BOOKING_EXPIRY_REASON = (
-    "Advisor did not accept before the scheduled session time"
-)
+UNACCEPTED_BOOKING_EXPIRY_REASON = "Advisor did not accept before the scheduled session time"
 
 log = get_logger(__name__)
 
@@ -114,9 +112,10 @@ async def notice_hours_by_advisor(
         )
     ).all()
     return {
-        user_id: (hours if hours is not None else DEFAULT_NOTICE_HOURS)
-        for user_id, hours in rows
+        user_id: (hours if hours is not None else DEFAULT_NOTICE_HOURS) for user_id, hours in rows
     }
+
+
 _ACTIVE_UPCOMING = (BookingStatus.pending, BookingStatus.confirmed)
 
 
@@ -132,10 +131,19 @@ def _in_chat_window_clause(now: datetime) -> ColumnElement[bool]:
     return and_(Booking.scheduled_start <= now, Booking.scheduled_end >= now)
 
 
+MEETING_JOIN_LEAD_MINUTES = 10
+
+
+def is_meeting_joinable(booking: Booking, now: datetime | None = None) -> bool:
+    moment = now or datetime.now(UTC)
+    opens = as_utc(booking.scheduled_start) - timedelta(minutes=MEETING_JOIN_LEAD_MINUTES)
+    closes = as_utc(booking.scheduled_end)
+    return opens <= moment <= closes
+
+
 def _booking_summary(booking: Booking) -> str:
-    when = as_utc(booking.scheduled_start).strftime("%b %d, %Y %H:%M UTC")
-    service = humanize_slug(booking.service_type)
-    return f"{service} on {when} — appointment #{booking.appointment_number}"
+    service = booking.name
+    return f"{service} — appointment #{booking.appointment_number}"
 
 
 def _counterparty(booking: Booking, actor_id: uuid.UUID) -> uuid.UUID:
@@ -161,6 +169,7 @@ async def _notify_booking(
         entity_type=NotificationEntityType.booking,
         entity_id=booking.id,
         actor_id=actor_id,
+        scheduled_start=booking.scheduled_start,
     )
 
 
@@ -330,7 +339,8 @@ def build_read(
         advisor_name=advisor.full_name if advisor else None,
         advisor_email=advisor.email if advisor else None,
         advisor_profile_photo_url=resolve_media_url(advisor_profile_photo_key, settings),
-        service_type=booking.service_type,
+        service_id=booking.service_id,
+        name=booking.name,
         duration_minutes=booking.duration_minutes,
         advisor_fee_usd=advisor_fee,
         platform_fee_usd=platform_fee,
@@ -354,8 +364,16 @@ def build_read(
         can_reschedule=can_reschedule,
         can_cancel=can_cancel,
         cancellation_notice_hours=cancellation_notice_hours,
-        meeting_join_url=booking.meeting_join_url if viewer_role == UserRole.seeker else None,
-        meeting_start_url=booking.meeting_start_url if viewer_role == UserRole.advisor else None,
+        meeting_join_url=(
+            booking.meeting_join_url
+            if viewer_role == UserRole.seeker and is_meeting_joinable(booking)
+            else None
+        ),
+        meeting_start_url=(
+            booking.meeting_start_url
+            if viewer_role == UserRole.advisor and is_meeting_joinable(booking)
+            else None
+        ),
     )
 
 
@@ -431,36 +449,55 @@ async def _resolve_advisor(session: AsyncSession, advisor_id: uuid.UUID) -> User
 
 
 async def _resolve_service(
-    session: AsyncSession, advisor_id: uuid.UUID, service_type: str
-) -> AdvisorService:
-    result = await session.execute(
-        select(AdvisorService)
-        .join(AdvisorProfile, AdvisorProfile.id == AdvisorService.profile_id)
-        .where(AdvisorProfile.user_id == advisor_id)
-        .where(AdvisorService.service_type == service_type)
+    session: AsyncSession,
+    advisor_id: uuid.UUID,
+    *,
+    service_id: uuid.UUID,
+) -> AdvisorOfferedService:
+    offered_service = await _resolve_offered_service(
+        session,
+        advisor_id,
+        service_id=service_id,
     )
-    service = result.scalars().first()
-    if service is None:
+    if offered_service.price_usd is None or offered_service.price_usd <= 0:
+        raise AppError(
+            "This advisor has not set a price for this service yet",
+            code="service_not_priced",
+        )
+    return offered_service
+
+
+async def _resolve_offered_service(
+    session: AsyncSession,
+    advisor_id: uuid.UUID,
+    *,
+    service_id: uuid.UUID,
+) -> AdvisorOfferedService:
+    stmt = (
+        select(AdvisorOfferedService)
+        .join(AdvisorProfile, AdvisorProfile.id == AdvisorOfferedService.profile_id)
+        .where(AdvisorProfile.user_id == advisor_id)
+    )
+    stmt = stmt.where(AdvisorOfferedService.service_id == service_id)
+
+    result = await session.execute(stmt)
+    offered_service = result.scalars().first()
+    if offered_service is None:
         raise AppError("Advisor does not offer this service", code="unknown_service")
-    return service
+    return offered_service
 
 
 async def _assert_service_offered(
-    session: AsyncSession, advisor_id: uuid.UUID, service_type: str
-) -> None:
-    """Validate a service type against the advisor's onboarding ``offered_services``.
-
-    Advisor-created bookings don't require a priced ``AdvisorService`` row — the
-    advisor only needs to have listed the category as one they offer.
-    """
-    result = await session.execute(
-        select(AdvisorOfferedService.id)
-        .join(AdvisorProfile, AdvisorProfile.id == AdvisorOfferedService.profile_id)
-        .where(AdvisorProfile.user_id == advisor_id)
-        .where(AdvisorOfferedService.service_type == service_type)
+    session: AsyncSession,
+    advisor_id: uuid.UUID,
+    *,
+    service_id: uuid.UUID,
+) -> AdvisorOfferedService:
+    return await _resolve_offered_service(
+        session,
+        advisor_id,
+        service_id=service_id,
     )
-    if result.scalars().first() is None:
-        raise AppError("Advisor does not offer this service", code="unknown_service")
 
 
 async def get_notice_hours(session: AsyncSession, advisor_id: uuid.UUID) -> int:
@@ -479,9 +516,7 @@ def _floor_to_minute(dt: datetime) -> datetime:
 async def _lock_advisor_schedule(session: AsyncSession, advisor_id: uuid.UUID) -> None:
     """Serialize slot mutations for one advisor to prevent concurrent double-booking."""
     result = await session.execute(
-        select(AdvisorProfile)
-        .where(AdvisorProfile.user_id == advisor_id)
-        .with_for_update()
+        select(AdvisorProfile).where(AdvisorProfile.user_id == advisor_id).with_for_update()
     )
     if result.scalar_one_or_none() is None:
         raise NotFoundError("Advisor profile not found")
@@ -532,7 +567,7 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
         raise AppError("Cannot book yourself", code="invalid_booking")
 
     await _resolve_advisor(session, data.advisor_id)
-    service = await _resolve_service(session, data.advisor_id, str(data.service_type))
+    service = await _resolve_service(session, data.advisor_id, service_id=data.service_id)
 
     if data.scheduled_start.tzinfo is None and data.timezone:
         tz = ZoneInfo(data.timezone)
@@ -544,15 +579,14 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
         raise AppError("Booking must be in the future", code="invalid_booking")
 
     await _lock_advisor_schedule(session, data.advisor_id)
-    end_utc = await _assert_slot_free(
-        session, data.advisor_id, start_utc, service.duration_minutes
-    )
+    end_utc = await _assert_slot_free(session, data.advisor_id, start_utc, service.duration_minutes)
 
     booking = Booking(
         seeker_id=seeker.id,
         advisor_id=data.advisor_id,
         appointment_number=await _next_appointment_number(session),
-        service_type=service.service_type,
+        service_id=service.service_id or service.id,
+        name=service.name or "Consultation",
         duration_minutes=service.duration_minutes,
         price_usd=service.price_usd,
         scheduled_start=start_utc,
@@ -566,6 +600,7 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    await advisor_lead_service.link_booking(session, booking)
     # Advisor notification is sent only after payment succeeds
     # (see payment_service._handle_checkout_completed) to avoid
     # misleading advisors with unpaid booking requests.
@@ -588,21 +623,23 @@ async def create_by_advisor(
     if seeker is None or seeker.role != UserRole.seeker or not seeker.is_active:
         raise NotFoundError("Client not found")
 
-    await _assert_service_offered(session, advisor.id, str(data.service_type))
+    service = await _assert_service_offered(session, advisor.id, service_id=data.service_id)
+    duration_minutes = service.duration_minutes or data.duration_minutes
 
     start_utc = as_utc(data.scheduled_start)
     if start_utc <= datetime.now(UTC):
         raise AppError("Booking must be in the future", code="invalid_booking")
 
     await _lock_advisor_schedule(session, advisor.id)
-    end_utc = await _assert_slot_free(session, advisor.id, start_utc, data.duration_minutes)
+    end_utc = await _assert_slot_free(session, advisor.id, start_utc, duration_minutes)
 
     booking = Booking(
         seeker_id=seeker.id,
         advisor_id=advisor.id,
         appointment_number=await _next_appointment_number(session),
-        service_type=str(data.service_type),
-        duration_minutes=data.duration_minutes,
+        service_id=service.service_id or service.id,
+        name=service.name or "Consultation",
+        duration_minutes=duration_minutes,
         # Advisor-created bookings are not paid consultations — no checkout
         # session is ever created for them (see create_checkout_session, which
         # rejects price_usd <= 0), so the booking must not surface to the
@@ -620,6 +657,7 @@ async def create_by_advisor(
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
+    await advisor_lead_service.link_booking(session, booking)
     await _notify_booking(
         session,
         booking,
@@ -638,7 +676,7 @@ def list_for_user_stmt(
     seeker_id: uuid.UUID | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
-    service_types: list[str] | None = None,
+    service_ids: list[uuid.UUID] | None = None,
     q: str | None = None,
     sort: BookingSort = "-updated_at",
 ) -> Select[tuple[Booking]]:
@@ -666,8 +704,8 @@ def list_for_user_stmt(
             Booking.scheduled_start
             < datetime.combine(date_to + timedelta(days=1), datetime.min.time(), UTC)
         )
-    if service_types:
-        stmt = stmt.where(Booking.service_type.in_(service_types))
+    if service_ids:
+        stmt = stmt.where(Booking.service_id.in_(service_ids))
     if q:
         pattern = f"%{q.strip()}%"
         # Advisor searches their clients; seeker searches the advisor side
@@ -676,12 +714,65 @@ def list_for_user_stmt(
         stmt = stmt.join(User, User.id == counterpart).where(
             or_(
                 cast(Booking.appointment_number, String).ilike(pattern),
-                Booking.service_type.ilike(pattern),
+                Booking.name.ilike(pattern),
                 User.full_name.ilike(pattern),
                 User.email.ilike(pattern),
             )
         )
     return stmt
+
+
+def list_by_user_stmt(
+    user_id: uuid.UUID,
+    status: BookingStatus | None = None,
+    q: str | None = None,
+) -> Select[tuple[Booking]]:
+    """All bookings where ``user_id`` is either the seeker or the advisor.
+
+    Admin-only helper (e.g. the support "related session" picker) — unlike
+    ``list_for_user_stmt`` it is role-agnostic and matches either side.
+    """
+    stmt = (
+        select(Booking)
+        .where(or_(Booking.seeker_id == user_id, Booking.advisor_id == user_id))
+        .order_by(Booking.scheduled_start.desc())
+    )
+    if status is not None:
+        stmt = stmt.where(Booking.status == status)
+    if q:
+        pattern = f"%{q.strip()}%"
+        stmt = stmt.where(
+            or_(
+                cast(Booking.appointment_number, String).ilike(pattern),
+                Booking.name.ilike(pattern),
+            )
+        )
+    return stmt
+
+
+async def build_picker_reads(
+    session: AsyncSession, bookings: list[Booking]
+) -> list[AdminBookingPickerRead]:
+    """Batch-enrich bookings with both parties' names for the admin picker."""
+    if not bookings:
+        return []
+    ids = {b.seeker_id for b in bookings} | {b.advisor_id for b in bookings}
+    rows = (await session.execute(select(User).where(User.id.in_(ids)))).scalars().all()
+    names = {u.id: u.full_name for u in rows}
+    return [
+        AdminBookingPickerRead(
+            id=b.id,
+            appointment_id=appointment_id_str(b),
+            seeker_id=b.seeker_id,
+            advisor_id=b.advisor_id,
+            seeker_name=names.get(b.seeker_id),
+            advisor_name=names.get(b.advisor_id),
+            scheduled_start=as_utc(b.scheduled_start),
+            name=b.name,
+            status=b.status,
+        )
+        for b in bookings
+    ]
 
 
 async def get_next_upcoming(
@@ -946,9 +1037,7 @@ async def reject(
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
-    await payment_service.auto_refund_booking_if_paid(
-        session, booking, actor_id, reason, settings
-    )
+    await payment_service.auto_refund_booking_if_paid(session, booking, actor_id, reason, settings)
     await booking_meeting_service.remove_meeting(session, booking, settings)
     await _notify_booking(
         session,
@@ -961,9 +1050,7 @@ async def reject(
     return booking
 
 
-async def expire_unaccepted_pending_bookings(
-    session: AsyncSession, settings: Settings
-) -> int:
+async def expire_unaccepted_pending_bookings(session: AsyncSession, settings: Settings) -> int:
     """Cancel pending bookings past ``scheduled_start`` without advisor acceptance.
 
     Paid bookings are fully refunded via Stripe (same path as reject/cancel).
@@ -1041,9 +1128,8 @@ async def expire_unaccepted_pending_bookings(
 
 STALE_UNPAID_EXPIRY_REASON = "Payment was not completed within the allowed time window"
 
-async def expire_stale_unpaid_bookings(
-    session: AsyncSession, settings: Settings
-) -> int:
+
+async def expire_stale_unpaid_bookings(session: AsyncSession, settings: Settings) -> int:
     """Cancel pending+unpaid bookings older than ``STALE_UNPAID_BOOKING_MINUTES``.
 
     Safety net: if the checkout.session.expired webhook was missed or the seeker
@@ -1276,7 +1362,7 @@ async def build_history(
         seeker_name=seeker.full_name if seeker else None,
         seeker_email=seeker.email if seeker else None,
         advisor_name=advisor.full_name if advisor else None,
-        service_type=booking.service_type,
+        name=booking.name,
         scheduled_start=as_utc(booking.scheduled_start),
         scheduled_end=as_utc(booking.scheduled_end),
         status=booking.status,
@@ -1311,17 +1397,20 @@ def _meeting_read(
         return None
     start = as_utc(booking.scheduled_start)
     end = as_utc(booking.scheduled_end)
-    label = humanize_slug(booking.service_type) or "Consultation"
+    label = booking.name or "Consultation"
     is_advisor = viewer_user_id is not None and viewer_user_id == booking.advisor_id
+    joinable = is_meeting_joinable(booking)
     return BookingMeetingRead(
         label=label,
         time_range=(
             f"{start.strftime('%I:%M %p').lstrip('0')} - {end.strftime('%I:%M %p').lstrip('0')} UTC"
         ),
         date=start.strftime("%d %b %Y"),
-        join_url=booking.meeting_join_url if not is_advisor else None,
-        start_url=booking.meeting_start_url if is_advisor else None,
+        join_url=booking.meeting_join_url if (joinable and not is_advisor) else None,
+        start_url=booking.meeting_start_url if (joinable and is_advisor) else None,
         passcode=booking.meeting_passcode,
+        starts_at=start,
+        ends_at=end,
     )
 
 
@@ -1344,7 +1433,7 @@ async def build_details(
         amount_paid = 0.0
 
     description = (booking.seeker_note or "").strip() or (
-        f"Consultation for {booking.service_type.replace('_', ' ').strip()}"
+        f"Consultation for {booking.name}"
     )
 
     attachments: list[BookingAttachmentRead] = []
@@ -1380,7 +1469,7 @@ async def build_details(
     return BookingDetailsRead(
         appointment_id=f"#{booking.appointment_number:07d}",
         seeker_name=seeker.full_name if seeker else None,
-        service_type=booking.service_type,
+        name=booking.name,
         scheduled_start=as_utc(booking.scheduled_start),
         duration_minutes=booking.duration_minutes,
         amount_paid=amount_paid,
@@ -1474,10 +1563,10 @@ async def build_session_detail(
             avatar_url=avatar_url,
         ),
         timeline=_session_timeline(booking),
-        session_type=humanize_slug(booking.service_type) or booking.service_type,
+        session_type=booking.name or "Consultation",
         duration_minutes=booking.duration_minutes,
         platform=booking.meeting_platform,
-        topic=humanize_slug(booking.service_type) or booking.service_type,
+        topic=booking.name or "Consultation",
         language=language,
         meeting_recording_url=booking.meeting_recording_url,
         meeting_id=booking.meeting_id,
@@ -1489,7 +1578,7 @@ def list_clients_stmt(
     advisor_id: uuid.UUID,
     q: str | None = None,
     *,
-    service_types: list[str] | None = None,
+    service_ids: list[uuid.UUID] | None = None,
     status: BookingStatus | None = None,
 ) -> Select[tuple[User]]:
     """Distinct seekers with at least one prior booking with this advisor.
@@ -1498,7 +1587,7 @@ def list_clients_stmt(
     Clients table — deliberately scoped to existing clients only, not an open
     search across every seeker.
 
-    When ``service_types`` / ``status`` are set, filter on the seeker's
+    When ``service_ids`` / ``status`` are set, filter on the seeker's
     *latest* booking (max ``scheduled_start``) with this advisor.
     """
     latest_starts = (
@@ -1527,8 +1616,8 @@ def list_clients_stmt(
     if q:
         pattern = f"%{q.strip()}%"
         stmt = stmt.where(or_(User.full_name.ilike(pattern), User.email.ilike(pattern)))
-    if service_types:
-        stmt = stmt.where(Booking.service_type.in_(service_types))
+    if service_ids:
+        stmt = stmt.where(Booking.service_id.in_(service_ids))
     if status is not None:
         stmt = stmt.where(Booking.status == status)
     return stmt
@@ -1601,7 +1690,7 @@ async def build_client_reads(
                 booking_id=latest.id if latest is not None else None,
                 consultation_number=appt,
                 appointment_id=appt,
-                consultation_type=latest.service_type if latest is not None else None,
+                consultation_type=latest.name if latest is not None else None,
                 match_score=lead_row.match_score if lead_row is not None else None,
                 status=latest.status if latest is not None else None,
                 is_important=latest.is_important if latest is not None else False,

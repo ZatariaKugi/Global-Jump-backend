@@ -57,7 +57,7 @@ class Settings(BaseSettings):
 
     # Auth — token lifetimes ------------------------------------------------
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
-    EMAIL_VERIFY_TOKEN_EXPIRE_HOURS: int = 1
+    EMAIL_VERIFY_TOKEN_EXPIRE_HOURS: int = 24
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = 15
 
     # Auth — external identity-service trust --------------------------------

@@ -17,7 +17,6 @@ from app.models.advisor_profile import (
     AdvisorLanguage,
     AdvisorOfferedService,
     AdvisorProfile,
-    AdvisorService,
     AdvisorVisaSpecialization,
 )
 from app.models.conversation import Conversation
@@ -32,23 +31,18 @@ from app.schemas.advisor_profile import (
     AdvisorProfileRead,
     AdvisorProfileUpdate,
     LanguageEntry,
+    OfferedServicePublicRead,
 )
 from app.schemas.availability import WeeklySlotRead
 from app.services import availability_service, review_service
 
+DEFAULT_OFFERED_DURATION_MINUTES = 30
 
-def offered_service_types(profile: AdvisorProfile) -> list[str]:
-    """Service-type strings for listing cards and booking dropdowns.
 
-    Prefer bookable ``AdvisorService`` types, then onboarding ``offered_services``
-    categories, de-duplicated. Free-form catalog slugs are allowed (matching
-    compares the same strings seekers select).
-    """
+def offered_service_ids(profile: AdvisorProfile) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
-    for raw in [s.service_type for s in (profile.services or [])] + [
-        s.service_type for s in (profile.offered_services or [])
-    ]:
+    for raw in [s.name for s in (profile.offered_services or [])]:
         if not raw:
             continue
         key = raw.casefold()
@@ -59,13 +53,9 @@ def offered_service_types(profile: AdvisorProfile) -> list[str]:
 
 
 def starting_price_usd(profile: AdvisorProfile | None) -> float | None:
-    """Lowest bookable price from ``advisor_services`` or priced offered services."""
     if profile is None:
         return None
-    prices: list[float] = [s.price_usd for s in (profile.services or [])]
-    prices.extend(
-        s.price_usd for s in (profile.offered_services or []) if s.price_usd is not None
-    )
+    prices = [s.price_usd for s in (profile.offered_services or []) if s.price_usd is not None]
     return min(prices) if prices else None
 
 
@@ -165,9 +155,23 @@ async def update(
 
     if "offered_services" in fields:
         fields.pop("offered_services")
+        catalog_rows = (
+            await session.execute(
+                select(AdvisorOfferedService).where(
+                    AdvisorOfferedService.profile_id.is_(None),
+                    AdvisorOfferedService.id.in_(data.offered_services or []),
+                )
+            )
+        ).scalars().all()
+        by_id = {row.id: row for row in catalog_rows}
         profile.offered_services = [
-            AdvisorOfferedService(profile_id=profile.id, service_type=str(s))
-            for s in (data.offered_services or [])
+            AdvisorOfferedService(
+                profile_id=profile.id,
+                service_id=service_id,
+                name=by_id[service_id].name,
+            )
+            for service_id in (data.offered_services or [])
+            if service_id in by_id
         ]
 
     if "languages" in fields:
@@ -181,17 +185,6 @@ async def update(
             for lang in (data.languages or [])
         ]
 
-    if "services" in fields:
-        fields.pop("services")
-        profile.services = [
-            AdvisorService(
-                profile_id=profile.id,
-                service_type=str(svc.service_type),
-                duration_minutes=svc.duration_minutes,
-                price_usd=svc.price_usd,
-            )
-            for svc in (data.services or [])
-        ]
 
     if "weekly_slots" in fields:
         fields.pop("weekly_slots")
@@ -207,6 +200,19 @@ async def update(
     await session.flush()
     await session.refresh(profile)
     return profile
+
+
+def _public_offered_services(profile: AdvisorProfile) -> list[OfferedServicePublicRead]:
+    return [
+        OfferedServicePublicRead(
+            id=row.id,
+            service_id=row.service_id or row.id,
+            name=row.name,
+            price_usd=row.price_usd,
+            duration_minutes=row.duration_minutes or DEFAULT_OFFERED_DURATION_MINUTES,
+        )
+        for row in (profile.offered_services or [])
+    ]
 
 
 def _build_common(profile: AdvisorProfile, settings: Settings) -> dict[str, object]:
@@ -368,7 +374,7 @@ def build_listing_card(
         title=profile.title,
         profile_photo_url=resolve_media_url(profile.profile_photo_url, settings),
         years_of_experience=profile.years_of_experience,
-        offered_services=offered_service_types(profile),
+        offered_services=offered_service_ids(profile),
         visa_specializations=_visa_specializations(profile),
         country_expertise=[c.country_code for c in (profile.country_expertise or [])],
         languages=[lang.language for lang in (profile.languages or [])],
@@ -389,6 +395,8 @@ def build_public_read(
     settings: Settings,
     match_percentage: int | None = None,
     is_bookmarked: bool = False,
+    average_rating: float | None = None,
+    review_count: int = 0,
 ) -> AdvisorProfilePublicRead:
     if profile is not None:
         return AdvisorProfilePublicRead(
@@ -397,12 +405,17 @@ def build_public_read(
             email=user.email,
             match_percentage=match_percentage,
             is_bookmarked=is_bookmarked,
+            average_rating=average_rating,
+            review_count=review_count,
+            offered_services=_public_offered_services(profile),
             **_build_common(profile, settings),
         )
     return AdvisorProfilePublicRead(
         user_id=user.id,
         full_name=user.full_name,
         email=user.email,
+        average_rating=average_rating,
+        review_count=review_count,
         title=None,
         bio=None,
         profile_photo_url=None,
@@ -454,7 +467,7 @@ async def build_onboarding_status(
         area_of_expertise_completed=area_of_expertise_completed,
         profile_completed=profile_completed,
         languages_completed=bool(profile.languages),
-        services_completed=bool(profile.offered_services) or bool(profile.services),
+        services_completed=bool(profile.offered_services),
         government_id_uploaded=DocumentType.government_id in doc_types,
         license_uploaded=has_license,
         certification_uploaded=DocumentType.certification in doc_types,

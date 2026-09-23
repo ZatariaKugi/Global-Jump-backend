@@ -62,9 +62,11 @@ Two JWT issuers are trusted simultaneously:
 
 ### Three-role RBAC
 
-Roles: `customer`, `advisor`, `admin`. Enforced via:
+Roles: `seeker`, `advisor`, `admin` (`app/models/user.py:15-18`). Enforced via:
 - `require_role(UserRole.admin)` — dependency factory, used as router-level dependency on `/admin`
 - `require_verified_advisor` — dependency for advisor-only endpoints; checks both role and `verification_status == approved`
+
+The seeker role was renamed from `customer` on 2026-06-24 by migrations `f3a1b9c7d2e4` (the `user_role` enum value) and `a7e2c5b8f1d9` (tables and indexes). `UserRole.customer` does not exist. The `customer` spellings still in the tree — the `/advisors/me/customer-documents` endpoint, `CustomerDocumentsRowRead`, and UI copy such as "Documents of customers" — are display labels and legacy paths, never role values. Both this service and the web client send and compare the string `seeker`.
 
 Advisors register as inactive (`is_active=False`, `verification_status=pending`). Login is blocked until an admin approves via `PATCH /admin/advisors/{id}/verification`.
 
@@ -89,17 +91,22 @@ Every endpoint returns `ResponseEnvelope[T]` — `{success: true, data: T, meta:
 
 ### Profile models and child tables
 
-`CustomerProfile` and `AdvisorProfile` use normalised child tables instead of JSON columns:
+`SeekerProfile` (`app/models/seeker_profile.py`) and `AdvisorProfile` (`app/models/advisor_profile.py`) use normalised child tables instead of JSON columns:
 
 | Parent | Child table | Relationship attr |
 |--------|-------------|-------------------|
-| `CustomerProfile` | `customer_countries_visited` | `countries_visited` |
-| `CustomerProfile` | `customer_prior_visas` | `prior_visas` |
+| `SeekerProfile` | `seeker_countries_visited` | `countries_visited` |
+| `SeekerProfile` | `seeker_prior_visas` | `prior_visas` |
+| `SeekerProfile` | `seeker_preferred_languages` | `preferred_languages` |
+| `SeekerProfile` | `seeker_needed_services` | `needed_services` |
+| `SeekerProfile` | `seeker_intended_destinations` | `intended_destinations` |
+| `SeekerProfile` | `seeker_intended_visa_types` | `intended_visa_types` |
 | `AdvisorProfile` | `advisor_visa_specializations` | `visa_specializations` |
 | `AdvisorProfile` | `advisor_country_expertise` | `country_expertise` |
 | `AdvisorProfile` | `advisor_languages` | `languages` |
 | `AdvisorProfile` | `advisor_offered_services` | `offered_services` |
-| `AdvisorProfile` | `advisor_services` | `services` |
+
+`advisor_services` is gone — dropped by migration `a8c4e6f2b1d9` (PR #127). `advisor_offered_services` is the single source of truth for what an advisor sells.
 
 All relationships use `cascade="all, delete-orphan"`. Services replace the entire child collection on update (reassigning the relationship list; delete-orphan cascade removes the old rows).
 

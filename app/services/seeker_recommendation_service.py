@@ -16,15 +16,79 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.core.file_storage import resolve_media_url
 from app.models.advisor_profile import AdvisorProfile
+from app.models.notification import NotificationEntityType, NotificationType
 from app.models.seeker_advisor_recommendation import SeekerAdvisorRecommendation
+from app.models.seeker_profile import SeekerProfile
 from app.models.user import User
 from app.models.visa_type import VisaType
 from app.schemas.assessment import AdvisorMatchRead
-from app.services import advisor_matching_service, advisor_profile_service, review_service
+from app.services import (
+    advisor_matching_service,
+    advisor_profile_service,
+    email_service,
+    notification_service,
+    review_service,
+)
 from app.services.advisor_profile_service import build_match_reasons
 from app.services.ai_advisor_match_service import AiMatchFailure, SeekerMatchCase
 
 PROFILE_CONTEXT = "profile"
+
+
+async def notify_seekers_about_new_advisor(
+    session: AsyncSession,
+    advisor: User,
+    advisor_profile: AdvisorProfile,
+    *,
+    settings: Settings,
+) -> int:
+    result = await session.execute(
+        select(User, SeekerProfile)
+        .join(SeekerProfile, SeekerProfile.user_id == User.id)
+        .where(
+            User.role == "seeker",
+            User.is_active.is_(True),
+            User.is_suspended.is_(False),
+        )
+    )
+    notified = 0
+    for seeker, seeker_profile in result.all():
+        case = await advisor_matching_service.build_profile_match_case(session, seeker.id)
+        if case is None:
+            continue
+        matches, _total, _failure = await advisor_matching_service.match_from_context(
+            session,
+            case,
+            candidates=[(advisor, advisor_profile)],
+            limit=1,
+            positive_only=True,
+            settings=settings,
+            use_ai=False,
+        )
+        if not matches:
+            continue
+
+        await notification_service.notify(
+            session,
+            user_id=seeker.id,
+            type=NotificationType.new_relevant_advisor,
+            title="A new advisor matches your profile",
+            body=f"{advisor.full_name or 'A new advisor'} is now available for your visa journey.",
+            entity_type=NotificationEntityType.user,
+            entity_id=advisor.id,
+            actor_id=advisor.id,
+        )
+        if seeker_profile.email_notifications:
+            email_service.schedule_email(
+                email_service.send_new_relevant_advisor_email(
+                    seeker.email,
+                    seeker.full_name or "",
+                    advisor.full_name or "",
+                    settings,
+                )
+            )
+        notified += 1
+    return notified
 
 
 async def list_for_seeker(
@@ -238,8 +302,16 @@ async def as_match_reads(
                 match_reasons=rec.match_reasons,
                 rule_score=rec.rule_score,
                 ai_score=rec.ai_score,
-                visa_specializations=[s.specialization for s in (profile.visa_specializations or [])] if profile is not None else None,
-                country_expertise=[c.country_code for c in (profile.country_expertise or [])] if profile is not None else None,
+                visa_specializations=(
+                    [s.specialization for s in (profile.visa_specializations or [])]
+                    if profile is not None
+                    else None
+                ),
+                country_expertise=(
+                    [c.country_code for c in (profile.country_expertise or [])]
+                    if profile is not None
+                    else None
+                ),
             )
         )
     return reads
@@ -263,12 +335,9 @@ async def matches_for_dashboard(
     """
     ai_failure: AiMatchFailure | None = None
     ai_attempted = False
-    existing = await list_for_seeker(session, seeker_id)
-    if not existing:
-        existing, ai_failure, ai_attempted = await refresh_for_seeker(
-            session, seeker_id, settings=settings
-        )
-    recs = existing
+    recs, ai_failure, ai_attempted = await refresh_for_seeker(
+        session, seeker_id, settings=settings
+    )
     if country is not None:
         dest = country.upper()
         recs = [r for r in recs if r.destination_country == dest]

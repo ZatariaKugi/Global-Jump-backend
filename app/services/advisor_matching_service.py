@@ -44,7 +44,7 @@ from app.services.matching_weights_service import DEFAULT_CONFIG, MatchingWeight
 from app.services.seeker_profile_service import (
     intended_destination_codes,
     intended_visa_type_values,
-    needed_service_types,
+    needed_service_ids,
     preferred_language_names,
 )
 
@@ -106,18 +106,13 @@ def _language_points(
 
 def _services_points(
     profile: AdvisorProfile,
-    needed_services: list[str] | None,
+    needed_services: list[uuid.UUID] | None,
     weight: float,
 ) -> float:
-    """Full services weight when any needed service_type is offered by the advisor."""
-    needed = [s.strip().lower() for s in (needed_services or []) if s and s.strip()]
+    needed = set(needed_services or [])
     if not needed:
         return weight * 0.5
-    offered = {
-        row.service_type.strip().lower()
-        for row in (profile.offered_services or [])
-        if row.service_type
-    }
+    offered = {row.service_id or row.id for row in (profile.offered_services or [])}
     if not offered:
         return 0.0
     if any(service in offered for service in needed):
@@ -151,7 +146,7 @@ def score_advisor_for_assessment(
     *,
     weights: MatchingWeightConfig = DEFAULT_CONFIG,
     preferred_languages: list[str] | None = None,
-    needed_services: list[str] | None = None,
+    needed_services: list[uuid.UUID] | None = None,
 ) -> float:
     """Weighted match score for recommendations.
 
@@ -210,7 +205,7 @@ def _soft_fields_from_profile(profile: SeekerProfile | None) -> dict[str, object
         }
     return {
         "preferred_languages": tuple(preferred_language_names(profile)),
-        "needed_services": tuple(needed_service_types(profile)),
+        "needed_services": tuple(needed_service_ids(profile)),
         "timezone": profile.timezone,
         "nationality": profile.nationality,
         "country_of_residence": profile.country_of_residence,

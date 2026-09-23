@@ -1,11 +1,12 @@
-"""Advisor offered services — ``advisor_offered_services`` with optional price/duration.
+"""ID-based service catalog and advisor offerings.
 
 Permissions:
-  - Seeker / public: list services (``id`` + ``service_type`` only — no price/duration)
+  - Seeker / public: list services (``id`` + ``name``)
   - Advisor: list + replace/update own offered services (includes price/duration)
   - Admin: full CRUD on any advisor's offered services
 
-Distinct from priced bookable ``advisor_services`` (see ``advisor_services.py``).
+Catalog rows and advisor offerings share one ID-based service model; pricing is
+stored only on advisor-owned offering rows.
 """
 
 from __future__ import annotations
@@ -43,11 +44,10 @@ router = APIRouter(tags=["advisor_offered_services"])
 async def list_all_offered_services(
     session: SessionDep,
     request_id: RequestIdDep,
-    service_type: Annotated[str | None, Query()] = None,
+    service_id: Annotated[uuid.UUID | None, Query()] = None,
 ) -> ResponseEnvelope[list[OfferedServicePublicRead]]:
-    """Seeker/public catalog — same global rows admin manages (id + service_type)."""
     items = await advisor_offered_service_service.list_all_public(
-        session, service_type=service_type
+        session, service_id=service_id
     )
     return ResponseEnvelope[list[OfferedServicePublicRead]](
         data=items,
@@ -160,11 +160,10 @@ async def get_advisor_offered_services(
 async def admin_list_all_offered_services(
     session: SessionDep,
     request_id: RequestIdDep,
-    service_type: Annotated[str | None, Query()] = None,
+    service_id: Annotated[uuid.UUID | None, Query()] = None,
 ) -> ResponseEnvelope[list[AdminOfferedServiceRead]]:
-    """List all offered services (admin — id + service_type only)."""
     items = await advisor_offered_service_service.list_all_admin(
-        session, service_type=service_type
+        session, service_id=service_id
     )
     return ResponseEnvelope[list[AdminOfferedServiceRead]](
         data=items,
@@ -207,7 +206,8 @@ async def admin_create_offered_service(
     Omit ``advisor_id`` to create a global catalog row; pass it to attach to an advisor.
     """
     payload = OfferedServiceCreateRequest(
-        service_type=data.service_type,
+        service_id=data.service_id,
+        name=data.name,
         price_usd=data.price_usd,
         duration_minutes=data.duration_minutes,
     )

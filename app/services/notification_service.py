@@ -36,8 +36,8 @@ async def notify(
     entity_type: NotificationEntityType | None = None,
     entity_id: uuid.UUID | None = None,
     actor_id: uuid.UUID | None = None,
+    scheduled_start: datetime | None = None,
 ) -> Notification:
-    """Queue a notification for ``user_id`` inside the current transaction."""
     notification = Notification(
         user_id=user_id,
         actor_id=actor_id,
@@ -46,6 +46,7 @@ async def notify(
         body=body,
         entity_type=entity_type,
         entity_id=entity_id,
+        scheduled_start=scheduled_start,
     )
     session.add(notification)
     await session.flush()
