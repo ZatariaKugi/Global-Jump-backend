@@ -102,8 +102,6 @@ class AdvisorOfferedService(Base):
     )
 
 
-
-
 class AdvisorProfile(BaseModel):
     __tablename__ = "advisor_profiles"
 
@@ -179,6 +177,11 @@ class AdvisorProfile(BaseModel):
     # Integration onboarding banners — synced when Stripe/Zoom state changes.
     needs_stripe_connect: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="true", nullable=False
+    )
+    # Cached from the advisor's subscription webhooks so admin lists can filter on it
+    # without a join: none | active | past_due | canceled | ... (EPIC 04).
+    subscription_status: Mapped[str] = mapped_column(
+        String(20), default="none", server_default="none", nullable=False
     )
     needs_zoom_connect: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="true", nullable=False

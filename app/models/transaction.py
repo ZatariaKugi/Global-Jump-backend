@@ -35,6 +35,13 @@ class TransferStatus(StrEnum):
     failed = "failed"  # transfer attempts exhausted; needs manual intervention
 
 
+class ChargeModel(StrEnum):
+    """How the money moved for this payment."""
+
+    separate_transfer = "separate_transfer"  # legacy: platform charged, sweep transferred
+    destination = "destination"  # EPIC 04: destination charge, advisor paid in the charge
+
+
 class Transaction(BaseModel):
     __tablename__ = "transactions"
 
@@ -69,6 +76,25 @@ class Transaction(BaseModel):
         Integer, default=0, server_default="0", nullable=False
     )
     transfer_last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # EPIC 04 destination charges (PAY-102 / PAY-105). Historical rows keep the
+    # server default ``separate_transfer``.
+    charge_model: Mapped[ChargeModel] = mapped_column(
+        SAEnum(ChargeModel, name="charge_model"),
+        default=ChargeModel.destination,
+        server_default=ChargeModel.separate_transfer.value,
+        nullable=False,
+    )
+    application_fee_usd: Mapped[float] = mapped_column(
+        Numeric(10, 2), nullable=False, default=0, server_default="0"
+    )
+    stripe_application_fee_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    advisor_reversed_usd: Mapped[float] = mapped_column(
+        Numeric(10, 2), nullable=False, default=0, server_default="0"
+    )
+    platform_fee_refunded_usd: Mapped[float] = mapped_column(
+        Numeric(10, 2), nullable=False, default=0, server_default="0"
+    )
 
     amount_usd: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     commission_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)

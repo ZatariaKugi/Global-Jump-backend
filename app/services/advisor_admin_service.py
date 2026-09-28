@@ -18,7 +18,6 @@ from app.core.money import as_float
 from app.models.advisor_credential import AdvisorCredential, CredentialStatus
 from app.models.advisor_profile import AdvisorProfile, AdvisorVisaSpecialization
 from app.models.booking import Booking, BookingStatus
-from app.models.payout_request import PayoutRequest, PayoutStatus
 from app.models.seeker_profile import SeekerProfile
 from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User, UserRole, VerificationStatus
@@ -35,8 +34,8 @@ from app.schemas.advisor_credential import AdvisorCredentialRead
 from app.schemas.advisor_profile import LanguageEntry
 from app.services import (
     booking_service,
+    payment_config_service,
     payment_service,
-    payout_service,
     review_service,
     user_admin_service,
 )
@@ -59,14 +58,28 @@ def list_advisors_stmt(
     search: str | None,
     status: VerificationStatus | None,
     visa_type: VisaType | None = None,
+    *,
+    subscription_status: str | None = None,
 ) -> Select[tuple[User]]:
     """Same shape as seeker_admin_service.list_seekers_stmt, scoped to advisors.
 
     ``visa_type`` filters against ``advisor_visa_specializations`` (PRD enum only).
+    ``subscription_status`` filters on the cached ``advisor_profiles.subscription_status``
+    (EPIC 04; ``none`` matches advisors without a profile row too).
     """
     stmt = select(User).where(User.role == UserRole.advisor).order_by(User.created_at.desc())
     if status is not None:
         stmt = stmt.where(User.verification_status == status)
+    if subscription_status is not None:
+        has_status = exists().where(
+            AdvisorProfile.user_id == User.id,
+            AdvisorProfile.subscription_status == subscription_status,
+        )
+        if subscription_status == "none":
+            has_profile = exists().where(AdvisorProfile.user_id == User.id)
+            stmt = stmt.where(has_status | ~has_profile)
+        else:
+            stmt = stmt.where(has_status)
     clause = user_admin_service.user_search_clause(search)
     if clause is not None:
         stmt = stmt.where(clause)
@@ -162,6 +175,7 @@ async def build_list_read(
                 review_count=review_count,
                 earnings=earnings_by_advisor.get(a.id, 0.0),
                 is_bookable=_has_priced_service(profile),
+                subscription_status=(profile.subscription_status if profile else "none") or "none",
                 created_at=a.created_at,
             )
         )
@@ -343,15 +357,12 @@ async def build_session_reads(
             )
         )
     ).all()
-    residence_codes: dict[uuid.UUID, str | None] = {
-        row[0]: row[1] for row in residence_rows
-    }
+    residence_codes: dict[uuid.UUID, str | None] = {row[0]: row[1] for row in residence_rows}
 
-    notice_map = await booking_service.notice_hours_by_advisor(session, {advisor_id})
+    config = await payment_config_service.get_config(session)
 
     out: list[AdvisorSessionRead] = []
     for b in bookings:
-        notice_hours = notice_map.get(b.advisor_id, booking_service.DEFAULT_NOTICE_HOURS)
         base = booking_service.build_read(
             b,
             seekers.get(b.seeker_id),
@@ -359,7 +370,7 @@ async def build_session_reads(
             settings=settings,
             advisor_profile_photo_key=photo_key,
             seeker_profile_photo_key=seeker_photos.get(b.seeker_id),
-            cancellation_notice_hours=notice_hours,
+            config=config,
             viewer_role=viewer_role,
         )
         residence_code = residence_codes.get(b.seeker_id)
@@ -394,27 +405,12 @@ async def get_earnings_summary(
         raise NotFoundError("Advisor not found")
 
     earnings = await payment_service.get_advisor_earnings(session, advisor_id)
-    available = await payout_service.get_available_balance(session, advisor_id)
-
-    payout_rows = (
-        await session.execute(
-            select(PayoutRequest.status, func.coalesce(func.sum(PayoutRequest.amount_usd), 0.0))
-            .where(PayoutRequest.advisor_id == advisor_id)
-            .group_by(PayoutRequest.status)
-        )
-    ).all()
-    payout_totals: dict[PayoutStatus, float] = {}
-    for status, total in payout_rows:
-        payout_totals[status] = total
 
     total_earned_usd = float(earnings["total_earned_usd"])  # type: ignore[arg-type]
     total_commission_paid_usd = float(earnings["total_commission_paid_usd"])  # type: ignore[arg-type]
     return AdvisorEarningsSummaryRead(
         total_earned_usd=total_earned_usd,
         total_commission_paid_usd=total_commission_paid_usd,
-        available_balance_usd=available,
-        total_payouts_usd=round(payout_totals.get(PayoutStatus.completed, 0.0), 2),
-        pending_payout_usd=round(payout_totals.get(PayoutStatus.pending, 0.0), 2),
         transaction_count=transaction_count,
         items=items,
     )

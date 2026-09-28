@@ -21,6 +21,7 @@ from app.services import (
     advisor_profile_service,
     advisor_search_service,
     conversation_service,
+    entitlement_service,
     review_service,
 )
 from app.services.advisor_search_service import SortOption
@@ -43,6 +44,21 @@ async def _require_approved_advisor(session: AsyncSession, advisor_id: uuid.UUID
     return advisor
 
 
+async def count_active(session: AsyncSession, seeker_id: uuid.UUID) -> int:
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(AdvisorBookmark)
+                .where(
+                    AdvisorBookmark.seeker_id == seeker_id,
+                    AdvisorBookmark.is_archived.is_(False),
+                )
+            )
+        ).scalar_one()
+    )
+
+
 async def create(session: AsyncSession, seeker: User, advisor_id: uuid.UUID) -> AdvisorBookmark:
     if seeker.role != UserRole.seeker:
         raise PermissionDeniedError("Seeker account required")
@@ -56,9 +72,15 @@ async def create(session: AsyncSession, seeker: User, advisor_id: uuid.UUID) -> 
             )
         )
     ).scalar_one_or_none()
+    if existing is not None and not existing.is_archived:
+        raise AppError("Advisor is already bookmarked", code="already_bookmarked")
+
+    # EPIC 04: ``bookmarks`` caps how many advisors a seeker keeps saved at once.
+    await entitlement_service.assert_within(
+        session, seeker, "bookmarks", await count_active(session, seeker.id)
+    )
+
     if existing is not None:
-        if not existing.is_archived:
-            raise AppError("Advisor is already bookmarked", code="already_bookmarked")
         existing.unarchive(seeker.id)
         session.add(existing)
         await session.flush()

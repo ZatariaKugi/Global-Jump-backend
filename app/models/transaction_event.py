@@ -25,6 +25,9 @@ class TransactionEventType(StrEnum):
     transfer_scheduled = "transfer_scheduled"  # delayed payout hold armed
     transfer_completed = "transfer_completed"  # advisor payout transferred
     transfer_failed = "transfer_failed"  # transfer attempt failed (retryable)
+    refund_requested = "refund_requested"  # EPIC 04 refund engine started
+    transfer_reversed = "transfer_reversed"  # advisor share pulled back
+    refund_failed = "refund_failed"  # a Stripe refund/reversal call failed
 
 
 class TransactionEvent(Base):

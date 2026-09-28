@@ -1,0 +1,16 @@
+{% extends "_base.html" %}
+{% from "_macros.html" import headline, cta, info_box %}
+
+{% block title %}Subscription payment failed — {{ app_name }}{% endblock %}
+
+{% block content %}
+  {{ headline("Payment failed") }}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    Hi {{ full_name }}, we could not charge your card for the <strong>{{ plan_name }}</strong> plan.
+  </p>
+  {{ info_box("Your plan stays active for a short grace period. Update your payment method to keep it.") }}
+  {{ cta(manage_url, "Update payment method") }}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    If the card is not updated before the grace period ends, the plan will end and its features will pause.
+  </p>
+{% endblock %}

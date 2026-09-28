@@ -26,7 +26,7 @@ from app.schemas.assessment import (
     QuestionRead,
 )
 from app.schemas.response import Meta, ResponseEnvelope
-from app.services import advisor_lead_service, assessment_service
+from app.services import advisor_lead_service, assessment_service, entitlement_service
 
 router = APIRouter(prefix="/assessments", tags=["assessments"])
 
@@ -39,11 +39,13 @@ def _require_seeker(user: User) -> None:
 async def _build_read(
     session: SessionDep,
     assessment: Assessment,
+    *,
+    insights_locked: bool = False,
 ) -> AssessmentRead:
     strengths: list[str] = []
     weaknesses: list[str] = []
     missing_requirements: list[str] = []
-    for insight in assessment.insights or []:
+    for insight in [] if insights_locked else (assessment.insights or []):
         if insight.kind == InsightKind.strength:
             strengths.append(insight.text)
         elif insight.kind == InsightKind.weakness:
@@ -68,6 +70,7 @@ async def _build_read(
         strengths=strengths,
         weaknesses=weaknesses,
         missing_requirements=missing_requirements,
+        insights_locked=insights_locked,
         ai_summary=assessment.ai_summary,
     )
 
@@ -110,6 +113,8 @@ async def start_assessment(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AssessmentRead]:
     _require_seeker(current_user)
+    # EPIC 04: the plan's ``ai_assessments`` limit is enforced here (quota_exceeded).
+    await entitlement_service.consume(session, current_user, "ai_assessments")
     assessment = await assessment_service.start(session, current_user.id, data)
     return ResponseEnvelope[AssessmentRead](
         data=await _build_read(session, assessment),
@@ -150,8 +155,10 @@ async def get_assessment(
 ) -> ResponseEnvelope[AssessmentRead]:
     _require_seeker(current_user)
     assessment = await assessment_service.get_for_user(session, assessment_id, current_user.id)
+    # EPIC 04: ``ai_insights`` is a plan feature — the score stays, the narrative locks.
+    locked = not await entitlement_service.allowed(session, current_user, "ai_insights")
     return ResponseEnvelope[AssessmentRead](
-        data=await _build_read(session, assessment),
+        data=await _build_read(session, assessment, insights_locked=locked),
         meta=Meta(request_id=request_id),
     )
 
@@ -179,13 +186,18 @@ async def list_matched_advisors(
             "Matched advisors are available after the assessment is completed",
             code="assessment_incomplete",
         )
+    # EPIC 04: ``matched_advisors`` — off -> subscription_required; n -> top n only.
+    cap = await entitlement_service.limit_for(session, current_user, "matched_advisors")
     await advisor_lead_service.ensure_for_assessment(session, assessment)
+    limit = params.limit if cap is None else max(0, min(params.limit, cap - params.offset))
     items, total = await advisor_lead_service.matches_for_assessment(
         session,
         assessment.id,
-        limit=params.limit,
+        limit=limit,
         offset=params.offset,
     )
+    if cap is not None:
+        total = min(total, cap)
     return ResponseEnvelope[list[AdvisorMatchRead]](
         data=items,
         meta=page_meta(params, total, request_id),
@@ -228,7 +240,9 @@ async def list_my_assessments(
         visa_type=visa_type,
         q=q,
     )
-    assessments, total = await paginate(session, stmt, params)
+    # EPIC 04: ``assessment_history`` caps how far back the seeker can see.
+    cap = await entitlement_service.limit_for(session, current_user, "assessment_history")
+    assessments, total = await paginate(session, stmt, params, cap=cap)
     counts = await assessment_service.matched_advisor_counts(session, list(assessments))
     return ResponseEnvelope[list[AssessmentSummaryRead]](
         data=[

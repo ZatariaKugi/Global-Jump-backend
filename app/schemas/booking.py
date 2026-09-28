@@ -35,6 +35,7 @@ class BookingCreate(BaseModel):
         ),
     )
 
+
 class AdvisorBookingCreate(BaseModel):
     """Advisor books a consultation directly for one of their existing clients."""
 
@@ -43,6 +44,7 @@ class AdvisorBookingCreate(BaseModel):
     scheduled_start: datetime
     duration_minutes: int = Field(ge=15, le=480)
     seeker_note: str | None = Field(default=None, max_length=1000)
+
 
 class ClientRead(BaseModel):
     """Advisor Clients table / picker row.
@@ -104,7 +106,7 @@ class BookingRead(BaseModel):
     service_id: uuid.UUID | None = None
     name: str
     duration_minutes: int
-    # ``price_usd`` is the total charge; fee split uses PLATFORM_COMMISSION_RATE.
+    # ``price_usd`` is the total charge; the fee split comes from the admin payment settings.
     advisor_fee_usd: float
     platform_fee_usd: float
     price_usd: float
@@ -126,7 +128,10 @@ class BookingRead(BaseModel):
     updated_at: datetime
     can_reschedule: bool = False
     can_cancel: bool = False
+    # Seeker reschedule window in hours (kept for older clients); prefer the deadlines.
     cancellation_notice_hours: int = 24
+    reschedule_deadline: datetime | None = None
+    cancellation_deadline: datetime | None = None
     meeting_join_url: str | None = None
     meeting_start_url: str | None = None
 
@@ -182,7 +187,10 @@ class BookingHistoryRead(BaseModel):
     created_at: datetime
     can_reschedule: bool = False
     can_cancel: bool = False
+    # Seeker reschedule window in hours (kept for older clients); prefer the deadlines.
     cancellation_notice_hours: int = 24
+    reschedule_deadline: datetime | None = None
+    cancellation_deadline: datetime | None = None
 
 
 class BookingAttachmentRead(BaseModel):
@@ -253,7 +261,10 @@ class SessionDetailRead(BaseModel):
     scheduled_start: datetime
     can_reschedule: bool = False
     can_cancel: bool = False
+    # Seeker reschedule window in hours (kept for older clients); prefer the deadlines.
     cancellation_notice_hours: int = 24
+    reschedule_deadline: datetime | None = None
+    cancellation_deadline: datetime | None = None
     client: SessionClientRead
     timeline: list[SessionTimelineStepRead]
     session_type: str

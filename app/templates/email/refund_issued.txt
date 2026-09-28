@@ -1,0 +1,17 @@
+Hi {{ full_name }},
+
+A refund has been issued for your consultation.
+
+  Consultation:  {{ booking_name }}
+  Refunded:      ${{ amount_usd }}
+
+The money goes back to your original payment method and may take 5-10 business days to appear on your statement.
+
+— The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}
+How it works: {{ how_it_works_url }}
+FAQs: {{ faq_url }}

@@ -48,6 +48,8 @@ class AdvisorManagementListRead(BaseModel):
     review_count: int
     earnings: float
     is_bookable: bool = True
+    # EPIC 04: cached Advisor Subscription state ("none" when never subscribed).
+    subscription_status: str = "none"
     created_at: datetime
 
 
@@ -96,9 +98,6 @@ class AdvisorEarningRowRead(BaseModel):
 class AdvisorEarningsSummaryRead(BaseModel):
     total_earned_usd: float
     total_commission_paid_usd: float
-    available_balance_usd: float
-    total_payouts_usd: float
-    pending_payout_usd: float
     transaction_count: int
     items: list[AdvisorEarningRowRead]
 

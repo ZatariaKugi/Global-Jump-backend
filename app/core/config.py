@@ -120,9 +120,9 @@ class Settings(BaseSettings):
     STRIPE_SECRET_KEY: str | None = None
     STRIPE_WEBHOOK_SECRET: str | None = None
     STRIPE_PUBLISHABLE_KEY: str | None = None
-    PLATFORM_COMMISSION_RATE: float = 0.15  # 15% platform commission, configurable
-    TAX_WITHHOLDING_RATE: float = 0.08  # 8% tax withheld from advisor payouts, configurable
-    PAYOUT_PROCESSING_FEE_RATE: float = 0.02  # 2% fee on manual payout requests, configurable
+    # Seeds the first ``platform_payment_settings`` row only (0.15 -> 15 percent). After
+    # that the admin panel owns the commission; nothing reads this at request time.
+    PLATFORM_COMMISSION_RATE: float = 0.15
     # Delayed payout: how long the platform holds the advisor's share before the
     # automatic Connect transfer fires. Refunds are only possible during this window.
     PAYOUT_HOLD_MINUTES: int = 2

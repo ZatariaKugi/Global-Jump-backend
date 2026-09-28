@@ -37,6 +37,7 @@ from app.schemas.seeker_profile import (
 )
 from app.schemas.visa_journey import VisaJourneyRead
 from app.services import (
+    entitlement_service,
     seeker_dashboard_service,
     seeker_document_service,
     seeker_profile_service,
@@ -282,6 +283,7 @@ async def get_my_visa_journey(
     ] = None,
 ) -> ResponseEnvelope[VisaJourneyRead]:
     _require_seeker(current_user)
+    await entitlement_service.check(session, current_user, "visa_journey")
     if country is not None and country_code(country) is None:
         raise AppError("Unknown country code", code="invalid_country")
 
@@ -322,6 +324,7 @@ async def submit_visa_application(
 ) -> ResponseEnvelope[VisaJourneyRead]:
     """Marks Submission complete. Requires the Review stage to be completed. Idempotent."""
     _require_seeker(current_user)
+    await entitlement_service.check(session, current_user, "visa_journey")
     if country is not None and country_code(country) is None:
         raise AppError("Unknown country code", code="invalid_country")
     resolved_visa, resolved_country = await seeker_dashboard_service.resolve_scope(
@@ -366,6 +369,13 @@ async def upload_document(
     expected_prefix = f"seeker_document/{current_user.id}/"
     if not data.file_key.startswith(expected_prefix):
         raise PermissionDeniedError("Invalid attachment key")
+    # EPIC 04: ``documents`` caps how many documents the seeker keeps uploaded.
+    await entitlement_service.assert_within(
+        session,
+        current_user,
+        "documents",
+        await seeker_document_service.count_active(session, current_user.id),
+    )
     file_url = resolve_url(f"/uploads/{data.file_key}", settings)
     document = await seeker_document_service.create(session, current_user.id, data, file_url)
     return ResponseEnvelope[SeekerDocumentRead](

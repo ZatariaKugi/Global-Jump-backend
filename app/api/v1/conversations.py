@@ -18,7 +18,7 @@ from app.core.security import decode_token
 from app.db.session import SessionDep
 from app.models.conversation import Conversation
 from app.models.message import Message, MessageAttachment
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.schemas.conversation import (
     ConversationCreate,
     ConversationRead,
@@ -29,7 +29,7 @@ from app.schemas.conversation import (
 )
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.token import TokenPayload
-from app.services import conversation_service, email_service, user_service
+from app.services import conversation_service, email_service, entitlement_service, user_service
 from app.services.ws_manager import inbox_manager, manager
 
 router = APIRouter(tags=["conversations"])
@@ -74,9 +74,7 @@ async def _send_new_message_email(
 ) -> None:
     """Email the other participant that they received a new message."""
     recipient_id = (
-        conversation.advisor_id
-        if sender.id == conversation.seeker_id
-        else conversation.seeker_id
+        conversation.advisor_id if sender.id == conversation.seeker_id else conversation.seeker_id
     )
     recipient = await session.get(User, recipient_id)
     if recipient is None or recipient.id == sender.id:
@@ -93,6 +91,12 @@ async def _send_new_message_email(
     )
 
 
+async def _assert_seeker_may_chat(session: AsyncSession, user: User) -> None:
+    """EPIC 04: ``chats`` is a seeker plan feature; advisors and admins are never gated."""
+    if user.role == UserRole.seeker:
+        await entitlement_service.check(session, user, "chats")
+
+
 @router.post("/conversations", status_code=201, response_model=ResponseEnvelope[ConversationRead])
 async def create_conversation(
     data: ConversationCreate,
@@ -101,6 +105,7 @@ async def create_conversation(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[ConversationRead]:
+    await _assert_seeker_may_chat(session, current_user)
     conversation = await conversation_service.get_or_create(
         session, current_user, data.other_user_id
     )
@@ -176,6 +181,7 @@ async def send_message(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[MessageRead]:
+    await _assert_seeker_may_chat(session, current_user)
     conversation = await conversation_service.get_for_user(
         session, conversation_id, current_user.id
     )
@@ -406,9 +412,7 @@ async def _authenticate_websocket(
     user = await user_service.get_by_id(session, payload.sub)
     if user is None or not user.is_active:
         return None
-    if (
-        payload.token_version if payload.token_version is not None else 0
-    ) != user.token_version:
+    if (payload.token_version if payload.token_version is not None else 0) != user.token_version:
         return None
     return user
 

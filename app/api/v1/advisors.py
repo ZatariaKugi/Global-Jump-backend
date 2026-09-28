@@ -64,7 +64,6 @@ from app.schemas.payment import (
     TransactionAdvisorRead,
     TransactionRead,
 )
-from app.schemas.payout import PayoutPreviewRead, PayoutRequestCreate, PayoutRequestRead
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.review import AdvisorReviewSummaryRead
 from app.schemas.seeker_document import (
@@ -89,9 +88,9 @@ from app.services import (
     bookmark_service,
     conversation_service,
     email_service,
+    entitlement_service,
     notification_service,
     payment_service,
-    payout_service,
     review_service,
     seeker_document_service,
     seeker_recommendation_service,
@@ -234,6 +233,9 @@ async def list_advisors(
         recommended=recommended,
         sort=sort,
     )
+    # EPIC 04: Find Advisor search is a seeker plan feature (``find_advisor``).
+    if principal.user is not None and principal.user.role == UserRole.seeker:
+        await entitlement_service.check(session, principal.user, "find_advisor")
     stmt = advisor_search_service.build_search_stmt(filters)
     destination, match_visa = await _seeker_match_context(session, principal)
     blended_pct: dict[uuid.UUID, int] = {}
@@ -941,12 +943,10 @@ async def get_my_earnings(
 ) -> ResponseEnvelope[AdvisorEarnings]:
     """Advisor earnings summary and full transaction history."""
     data = await payment_service.get_advisor_earnings(session, current_user.id)
-    available_balance = await payout_service.get_available_balance(session, current_user.id)
     return ResponseEnvelope[AdvisorEarnings](
         data=AdvisorEarnings(
             total_earned_usd=data["total_earned_usd"],
             total_commission_paid_usd=data["total_commission_paid_usd"],
-            available_balance_usd=available_balance,
             transactions=[
                 TransactionRead.model_validate(t)
                 for t in data["transactions"]  # type: ignore[attr-defined]
@@ -1021,14 +1021,19 @@ async def list_my_leads(
         OptionalVisaType, Query(description="Filter by assessment visa type")
     ] = None,
 ) -> ResponseEnvelope[list[AdvisorLeadRead]]:
-    """AI-matched customer leads for this advisor, ranked by match score."""
+    """AI-matched customer leads for this advisor, ranked by match score.
+
+    EPIC 04: the advisor plan's ``leads`` feature caps the list at the top *n*
+    matches (off -> ``subscription_required``).
+    """
+    cap = await entitlement_service.limit_for(session, current_user, "leads")
     stmt = advisor_lead_service.list_for_advisor_stmt(
         current_user.id,
         status,
         q=q,
         visa_type=visa_type.value if visa_type else None,
     )
-    leads, total = await paginate(session, stmt, params)
+    leads, total = await paginate(session, stmt, params, cap=cap)
     data = [await _build_lead_read(session, lead) for lead in leads]
     return ResponseEnvelope[list[AdvisorLeadRead]](
         data=data, meta=page_meta(params, total, request_id)
@@ -1291,9 +1296,7 @@ async def review_client_document(
         )
 
     existing = (
-        await seeker_document_service.reviews_for_advisor(
-            session, [document.id], current_user.id
-        )
+        await seeker_document_service.reviews_for_advisor(session, [document.id], current_user.id)
     ).get(document.id)
     current_status = seeker_document_service.advisor_effective_status(document, existing)
     if data.status == current_status and (existing is None or existing.note == data.note):
@@ -1449,61 +1452,4 @@ async def list_my_payments(
 
     return ResponseEnvelope[list[TransactionAdvisorRead]](
         data=data, meta=page_meta(params, total, request_id)
-    )
-
-
-@router.get(
-    "/me/payouts/preview",
-    response_model=ResponseEnvelope[PayoutPreviewRead],
-    dependencies=[Depends(require_role(UserRole.advisor))],
-)
-async def preview_payout(
-    amount_usd: float,
-    current_user: CurrentUser,
-    session: SessionDep,
-    settings: SettingsDep,
-    request_id: RequestIdDep,
-) -> ResponseEnvelope[PayoutPreviewRead]:
-    """Request Payout modal — fee breakdown before submitting."""
-    available = await payout_service.get_available_balance(session, current_user.id)
-    data = payout_service.preview_payout(available, amount_usd, settings)
-    return ResponseEnvelope[PayoutPreviewRead](data=data, meta=Meta(request_id=request_id))
-
-
-@router.get(
-    "/me/payouts",
-    response_model=ResponseEnvelope[list[PayoutRequestRead]],
-    dependencies=[Depends(require_role(UserRole.advisor))],
-)
-async def list_my_payouts(
-    params: PaginationDep,
-    current_user: CurrentUser,
-    session: SessionDep,
-    request_id: RequestIdDep,
-) -> ResponseEnvelope[list[PayoutRequestRead]]:
-    stmt = payout_service.list_for_advisor_stmt(current_user.id)
-    payouts, total = await paginate(session, stmt, params)
-    return ResponseEnvelope[list[PayoutRequestRead]](
-        data=[PayoutRequestRead.model_validate(p) for p in payouts],
-        meta=page_meta(params, total, request_id),
-    )
-
-
-@router.post(
-    "/me/payouts",
-    status_code=201,
-    response_model=ResponseEnvelope[PayoutRequestRead],
-    dependencies=[Depends(require_role(UserRole.advisor))],
-)
-async def request_payout(
-    data: PayoutRequestCreate,
-    current_user: CurrentUser,
-    session: SessionDep,
-    settings: SettingsDep,
-    request_id: RequestIdDep,
-) -> ResponseEnvelope[PayoutRequestRead]:
-    payout = await payout_service.create_request(session, current_user, data, settings)
-    return ResponseEnvelope[PayoutRequestRead](
-        data=PayoutRequestRead.model_validate(payout),
-        meta=Meta(request_id=request_id),
     )

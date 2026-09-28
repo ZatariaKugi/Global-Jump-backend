@@ -225,6 +225,9 @@ class AssessmentRead(BaseModel):
     weaknesses: list[str]
     missing_requirements: list[str]
     ai_summary: str | None
+    # EPIC 04: true when the seeker's plan does not include ``ai_insights`` —
+    # the score is shown, the narrative lists above are emptied.
+    insights_locked: bool = False
 
 
 class AssessmentSummaryRead(BaseModel):

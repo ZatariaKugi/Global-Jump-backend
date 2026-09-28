@@ -11,12 +11,13 @@ from app.api.pagination import PaginationDep, page_meta, paginate
 from app.core.exceptions import PermissionDeniedError
 from app.core.file_storage import resolve_url
 from app.db.session import SessionDep
+from app.models.support_ticket import TicketPriority
 from app.models.ticket_message import TicketMessageAttachment
 from app.models.user import User
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.support_ticket import TicketRead, TicketSelfCreate
 from app.schemas.ticket_message import TicketMessageRead, TicketMessageSend
-from app.services import support_ticket_service, ticket_message_service
+from app.services import entitlement_service, support_ticket_service, ticket_message_service
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
@@ -35,7 +36,15 @@ async def create_my_ticket(
     seeker or advisor on that booking); its session context is snapshotted onto
     the ticket. The ``description`` becomes the opening thread message.
     """
-    ticket = await support_ticket_service.create_for_user(session, body, current_user)
+    # EPIC 04: ``priority_support`` (seeker or advisor plan) opens the ticket as high.
+    priority = (
+        TicketPriority.high
+        if await entitlement_service.granted(session, current_user, "priority_support")
+        else TicketPriority.medium
+    )
+    ticket = await support_ticket_service.create_for_user(
+        session, body, current_user, priority=priority
+    )
     return ResponseEnvelope[TicketRead](
         data=await support_ticket_service.ticket_read(session, ticket, settings),
         meta=Meta(request_id=request_id),

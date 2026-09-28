@@ -24,9 +24,20 @@ class CheckoutResponse(BaseModel):
 
 
 class PaymentConfigRead(BaseModel):
+    """Publishable key plus the admin rules the client needs to render copy.
+
+    Fee amounts themselves come from ``BookingRead.platform_fee_usd``; a client must
+    not recompute them (a fixed commission cannot be derived from a rate).
+    """
+
     publishable_key: str | None
-    # FE derives platform fee = price * platform_commission_rate before checkout.
-    platform_commission_rate: float
+    commission_type: Literal["percent", "fixed"]
+    commission_value: float
+    seeker_reschedule_window_hours: int
+    advisor_cancellation_window_hours: int
+    platform_fee_refund_behavior: Literal["retained", "refunded"]
+    # Legacy field for the current web client: percent / 100, or null for a fixed fee.
+    platform_commission_rate: float | None = None
 
 
 class TransactionRead(BaseModel):
@@ -46,6 +57,25 @@ class TransactionRead(BaseModel):
     stripe_payment_intent_id: str | None
     refunded_at: datetime | None
     refund_reason: str | None
+    created_at: datetime
+
+
+class TransactionRefundRead(BaseModel):
+    """One refund attempt on a payment (EPIC 04 refund ledger)."""
+
+    id: uuid.UUID
+    transaction_id: uuid.UUID
+    kind: Literal["advisor_cancel", "admin_full", "admin_partial", "expiry", "rejection"]
+    status: Literal["pending", "refunded", "reversed", "failed"]
+    refund_to_seeker_usd: float
+    advisor_reversed_usd: float
+    platform_fee_refunded_usd: float
+    fee_policy_refunded: bool
+    stripe_refund_id: str | None
+    stripe_reversal_id: str | None
+    reason: str | None
+    initiated_by: uuid.UUID | None
+    last_error: str | None
     created_at: datetime
 
 
@@ -84,6 +114,12 @@ class TransactionFinanceRead(TransactionAdminRead):
     transfer_status: str | None = None
     # Free-text admin note on the payment.
     admin_note: str | None = None
+    # EPIC 04: how the money moved and what has been pulled back so far.
+    charge_model: Literal["separate_transfer", "destination"] = "separate_transfer"
+    application_fee_usd: float = 0.0
+    advisor_reversed_usd: float = 0.0
+    platform_fee_refunded_usd: float = 0.0
+    refunds: list[TransactionRefundRead] = []
 
 
 class TransactionAdvisorRead(TransactionRead):
@@ -162,15 +198,23 @@ class StripeDashboardLink(BaseModel):
 
 
 class AdvisorEarnings(BaseModel):
+    """Advisor earnings. The advisor share is paid inside each charge (destination
+    charge), so there is no separate balance to withdraw."""
+
     total_earned_usd: float
     total_commission_paid_usd: float
-    available_balance_usd: float
     transactions: list[TransactionRead]
 
 
 class RefundCreate(BaseModel):
+    """Admin refund. ``amount_usd`` absent means a full refund of what is left."""
+
     reason: str | None = None
     amount_usd: float | None = Field(default=None, gt=0)
+    # Pull the advisor's share back from the connected account.
+    reverse_advisor_share: bool = True
+    # Return the platform fee too (full refund defaults to yes, partial to no).
+    refund_platform_fee: bool | None = None
 
 
 class InvoiceLineItem(BaseModel):

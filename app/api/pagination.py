@@ -45,16 +45,27 @@ PaginationDep = Annotated[PaginationParams, Depends(pagination_params)]
 
 
 async def paginate(
-    session: AsyncSession, stmt: Select[Any], params: PaginationParams
+    session: AsyncSession,
+    stmt: Select[Any],
+    params: PaginationParams,
+    *,
+    cap: int | None = None,
 ) -> tuple[list[Any], int]:
     """Return ``(items, total_count)`` for ``stmt`` at the requested page.
 
     The count is computed from the statement (ordering stripped) so it stays correct
-    regardless of the underlying filters.
+    regardless of the underlying filters. ``cap`` (a plan limit, EPIC 04) clips the
+    visible list to its first ``cap`` rows: the total and every page respect it.
     """
     count_stmt = select(func.count()).select_from(stmt.order_by(None).subquery())
     total = (await session.scalar(count_stmt)) or 0
-    result = await session.execute(stmt.offset(params.offset).limit(params.limit))
+    limit = params.limit
+    if cap is not None:
+        total = min(total, cap)
+        limit = max(0, min(limit, total - params.offset))
+        if limit == 0:
+            return [], total
+    result = await session.execute(stmt.offset(params.offset).limit(limit))
     return list(result.scalars().all()), total
 
 

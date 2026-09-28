@@ -20,10 +20,9 @@ from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import Assessment, AssessmentStatus, EligibilityTier
 from app.models.booking import Booking, BookingStatus
 from app.models.message import Message
-from app.models.payout_request import PayoutRequest, PayoutStatus
 from app.models.seeker_document import SeekerDocument
 from app.models.seeker_profile import SeekerProfile
-from app.models.transaction import Transaction, TransactionStatus
+from app.models.transaction import Transaction, TransactionStatus, TransferStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.models.visa_type import VisaType
 from app.schemas.analytics import (
@@ -403,11 +402,14 @@ def _change_pct(current: float, previous: float) -> float:
 
 def _finance_window_totals(
     transactions: Sequence[Transaction],
-    payouts: Sequence[PayoutRequest],
     window_start: datetime,
     window_end: datetime,
 ) -> tuple[float, float, float, float]:
-    """Gross / refunds / net / advisor payout for [window_start, window_end)."""
+    """Gross / refunds / net / advisor earnings for [window_start, window_end).
+
+    Advisor earnings = the advisor share of every payment whose transfer completed
+    (paid inside the charge since EPIC 04; via the sweep for legacy rows).
+    """
     gross_txns = [
         t
         for t in transactions
@@ -423,12 +425,14 @@ def _finance_window_totals(
     refunds = round(money_sum(t.refunded_amount_usd for t in refunded), 2)
     net = round(gross - refunds, 2)
 
-    window_payouts = [
-        p
-        for p in payouts
-        if p.processed_at is not None and window_start <= _as_utc(p.processed_at) < window_end
+    paid_out = [
+        t
+        for t in transactions
+        if t.transfer_status == TransferStatus.completed
+        and t.status in _GROSS_STATUSES
+        and window_start <= _as_utc(t.created_at) < window_end
     ]
-    advisor_payout = round(money_sum(p.amount_usd for p in window_payouts), 2)
+    advisor_payout = round(money_sum(t.advisor_payout_usd for t in paid_out), 2)
     return gross, refunds, net, advisor_payout
 
 
@@ -463,24 +467,11 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
         by_id.setdefault(t.id, t)
     transactions = list(by_id.values())
 
-    payouts = (
-        (
-            await session.execute(
-                select(PayoutRequest).where(
-                    PayoutRequest.status == PayoutStatus.completed,
-                    PayoutRequest.processed_at >= prev_since,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-
     gross_revenue_usd, refunds_usd, net_revenue_usd, advisor_payout_usd = _finance_window_totals(
-        transactions, payouts, since, now
+        transactions, since, now
     )
     prev_gross, prev_refunds, prev_net, prev_payout = _finance_window_totals(
-        transactions, payouts, prev_since, since
+        transactions, prev_since, since
     )
 
     # Trends: current window only.
@@ -509,11 +500,13 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
     ]
 
     payout_trend_map: dict[str, float] = defaultdict(float)
-    for p in payouts:
-        assert p.processed_at is not None
-        if _as_utc(p.processed_at) < since:
+    for t in transactions:
+        if t.transfer_status != TransferStatus.completed or t.status not in _GROSS_STATUSES:
             continue
-        payout_trend_map[_month_key(p.processed_at)] += as_float(p.amount_usd)
+        created = _as_utc(t.created_at)
+        if created < since:
+            continue
+        payout_trend_map[_month_key(created)] += as_float(t.advisor_payout_usd)
     monthly_payouts = [
         MonthlyAmountPoint(month=month, amount_usd=round(amount, 2))
         for month, amount in sorted(payout_trend_map.items())

@@ -45,9 +45,10 @@ from app.services import (
     booking_note_service,
     booking_service,
     email_service,
+    payment_config_service,
 )
 from app.services.availability_service import as_utc
-from app.services.booking_service import get_notice_hours
+from app.services.payment_config_service import PaymentConfig
 
 log = get_logger(__name__)
 
@@ -90,7 +91,7 @@ def _read(
     advisor_profile_photo_key: str | None = None,
     seeker_profile_photo_key: str | None = None,
     review_id: uuid.UUID | None = None,
-    cancellation_notice_hours: int = booking_service.DEFAULT_NOTICE_HOURS,
+    config: PaymentConfig,
     viewer_role: UserRole = UserRole.seeker,
     is_unread: bool = False,
 ) -> BookingRead:
@@ -102,7 +103,7 @@ def _read(
         advisor_profile_photo_key=advisor_profile_photo_key,
         seeker_profile_photo_key=seeker_profile_photo_key,
         review_id=review_id,
-        cancellation_notice_hours=cancellation_notice_hours,
+        config=config,
         viewer_role=viewer_role,
         is_unread=is_unread,
     )
@@ -121,7 +122,7 @@ async def _read_booking(
     advisor_photos = await booking_service.advisor_photo_keys(session, {booking.advisor_id})
     seeker_photos = await booking_service.seeker_photo_keys(session, {booking.seeker_id})
     review_ids = await booking_service.review_ids_by_booking(session, {booking.id})
-    notice_hours = await get_notice_hours(session, booking.advisor_id)
+    config = await payment_config_service.get_config(session)
     unread_flags = await booking_service.unread_flags_for_viewer(session, [booking], viewer_id)
     return _read(
         booking,
@@ -131,7 +132,7 @@ async def _read_booking(
         advisor_profile_photo_key=advisor_photos.get(booking.advisor_id),
         seeker_profile_photo_key=seeker_photos.get(booking.seeker_id),
         review_id=review_ids.get(booking.id),
-        cancellation_notice_hours=notice_hours,
+        config=config,
         viewer_role=viewer_role,
         is_unread=unread_flags.get(booking.id, False),
     )
@@ -139,7 +140,7 @@ async def _read_booking(
 
 async def _send_confirmations(session: SessionDep, booking: Booking, settings: SettingsDep) -> None:
     seeker, advisor = await _party_names(session, booking)
-    notice = await get_notice_hours(session, booking.advisor_id)
+    notice = (await payment_config_service.get_config(session)).seeker_reschedule_window_hours
     for recipient, other in ((seeker, advisor), (advisor, seeker)):
         if recipient is None:
             continue
@@ -166,7 +167,7 @@ async def _send_reschedule_notifications(
     session: SessionDep, booking: Booking, settings: SettingsDep
 ) -> None:
     seeker, advisor = await _party_names(session, booking)
-    notice = await get_notice_hours(session, booking.advisor_id)
+    notice = (await payment_config_service.get_config(session)).seeker_reschedule_window_hours
     for recipient, other in ((seeker, advisor), (advisor, seeker)):
         if recipient is None:
             continue
@@ -378,7 +379,7 @@ async def list_my_bookings(
     if chat_booking is not None:
         booking_ids.add(chat_booking.id)
     review_ids = await booking_service.review_ids_by_booking(session, booking_ids)
-    notice_map = await booking_service.notice_hours_by_advisor(session, advisor_ids)
+    config = await payment_config_service.get_config(session)
 
     unread_bookings = list(bookings)
     if next_booking is not None:
@@ -398,9 +399,7 @@ async def list_my_bookings(
             advisor_profile_photo_key=photos.get(b.advisor_id),
             seeker_profile_photo_key=seeker_photos.get(b.seeker_id),
             review_id=review_ids.get(b.id),
-            cancellation_notice_hours=notice_map.get(
-                b.advisor_id, booking_service.DEFAULT_NOTICE_HOURS
-            ),
+            config=config,
             viewer_role=role,
             is_unread=unread_flags.get(b.id, False),
         )
@@ -667,9 +666,10 @@ async def update_booking_interpreter(
         "Allowed only when status is ``pending`` or ``confirmed``; otherwise "
         '``400 invalid_state`` ("Booking is no longer active"). '
         "Not cancellable: ``completed``, ``cancelled``, ``rejected``, ``no_show``. "
-        "Seekers must act outside the advisor's ``cancellation_notice_hours`` "
-        "(default 24) or receive ``400 late_cancellation``. Advisors may cancel anytime. "
-        "Sets status to ``cancelled``."
+        "Seekers cannot cancel (``403 seeker_cannot_cancel``); they reschedule instead. "
+        "Advisors may cancel until the admin-configured cancellation window "
+        "(``400 cancellation_window_closed``) and never after the start "
+        "(``400 consultation_started``). Sets status to ``cancelled``."
     ),
 )
 async def cancel_booking(
