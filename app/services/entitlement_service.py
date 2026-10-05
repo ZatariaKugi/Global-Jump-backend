@@ -22,7 +22,7 @@ from app.models.pricing_plan import FeatureKind, FeatureValueType, PricingPlan
 from app.models.subscription import Subscription, SubscriptionStatus, SubscriptionUsage
 from app.models.user import User
 from app.schemas.subscription import EntitlementsRead, FeatureEntitlementRead
-from app.services import pricing_plan_service
+from app.services import payment_config_service, pricing_plan_service
 
 LIVE_STATUSES = (SubscriptionStatus.active, SubscriptionStatus.trialing)
 GRACE_STATUSES = (
@@ -50,9 +50,46 @@ def calendar_month(now: datetime) -> Period:
     return Period(start=start, end=nxt)
 
 
+def paid_through(sub: Subscription, grace_days: int) -> datetime | None:
+    """When a live subscription stops granting its plan, or ``None`` if unknowable.
+
+    ``access_until`` is deliberately not consulted here: it is written by two paths
+    that disagree (``on_invoice_paid`` adds the grace, ``_apply_stripe_subscription``
+    does not), and it exists to extend access to a subscription that has *ended* --
+    which is the ``GRACE_STATUSES`` branch below, not this one.
+
+    ``None`` means we hold no period end, so there is nothing to judge the row by.
+    Access is never removed on a guess.
+    """
+    end = _utc(sub.current_period_end)
+    return None if end is None else end + timedelta(days=grace_days)
+
+
+def has_lapsed(sub: Subscription, grace_days: int, now: datetime) -> bool:
+    """A row that still says ``active`` while the period it paid for is over.
+
+    Stripe's ending event is the only thing that would have corrected the status,
+    and it is the event this project has watched fail for a week at a time. So the
+    read path has to be able to tell -- nothing else ever will.
+    """
+    boundary = paid_through(sub, grace_days)
+    return boundary is not None and boundary <= now
+
+
+async def grace_days(session: AsyncSession) -> int:
+    config = await payment_config_service.get_config(session)
+    return int(getattr(config, "subscription_grace_days", 3))
+
+
 async def current_subscription(session: AsyncSession, user_id: uuid.UUID) -> Subscription | None:
-    """The subscription that currently grants access, if any."""
+    """The subscription that currently grants access, if any.
+
+    #145 [PAY-110] and #146 [PAY-111] both require that an expired or lapsed
+    subscription revokes access, so a live-looking row only counts while the period
+    it paid for (plus the configured grace) still holds.
+    """
     now = datetime.now(UTC)
+    days = await grace_days(session)
     rows = list(
         (
             await session.execute(
@@ -66,7 +103,9 @@ async def current_subscription(session: AsyncSession, user_id: uuid.UUID) -> Sub
     )
     for sub in rows:
         if sub.status in LIVE_STATUSES:
-            return sub
+            if not has_lapsed(sub, days, now):
+                return sub
+            continue
         until = _utc(sub.access_until)
         if sub.status in GRACE_STATUSES and until is not None and until > now:
             return sub

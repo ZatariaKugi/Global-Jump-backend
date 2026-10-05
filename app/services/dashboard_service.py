@@ -34,6 +34,7 @@ from app.schemas.dashboard import (
     DashboardSummaryRead,
     RevenueBreakdownSliceRead,
 )
+from app.services import analytics_service
 
 _GROSS_STATUSES = (
     TransactionStatus.succeeded,
@@ -214,19 +215,8 @@ async def _user_stat_counts(session: AsyncSession, since: datetime | None) -> di
 
 
 async def _revenue_today_usd(session: AsyncSession) -> float:
-    today = datetime.now(UTC).date()
-    today_start = datetime(today.year, today.month, today.day, tzinfo=UTC)
-    today_end = today_start + timedelta(days=1)
-    revenue_today_usd = (
-        await session.execute(
-            select(func.coalesce(func.sum(Transaction.amount_usd), 0.0)).where(
-                Transaction.status.in_(_GROSS_STATUSES),
-                Transaction.created_at >= today_start,
-                Transaction.created_at < today_end,
-            )
-        )
-    ).scalar_one()
-    return round(float(revenue_today_usd), 2)
+    # One definition, shared with the analytics overview so the two screens agree.
+    return await analytics_service.revenue_today(session)
 
 
 async def _grouped_timestamp_counts(

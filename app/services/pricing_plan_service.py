@@ -238,11 +238,14 @@ async def _validate_features(
 # ── Stripe sync ──────────────────────────────────────────────────────────────
 
 
-def _init_stripe() -> None:
-    settings = get_settings()
-    if not settings.STRIPE_SECRET_KEY:
+async def _init_stripe(session: AsyncSession) -> None:
+    """Point the SDK at the credentials in force: admin-saved, else the environment."""
+    from app.services import stripe_config_service
+
+    keys = await stripe_config_service.effective_keys(session, get_settings())
+    if not keys.secret_key:
         raise AppError("Payment processing is not configured", code="stripe_not_configured")
-    stripe.api_key = settings.STRIPE_SECRET_KEY
+    stripe.api_key = keys.secret_key
 
 
 def _metadata(plan: PricingPlan) -> dict[str, str]:
@@ -275,20 +278,95 @@ def _unit_amount(price: Decimal) -> int:
     return int((Decimal(str(price)) * 100).to_integral_value(rounding=ROUND_HALF_UP))
 
 
-async def _sync_to_stripe(session: AsyncSession, plan: PricingPlan) -> None:
-    """Create whatever Stripe object is missing; never duplicates thanks to the keys."""
+def _product_idempotency_key(plan: PricingPlan) -> str:
+    """Stable per plan, except after a repair.
+
+    Every plan keeps the key it has always had. Only a plan whose stale id we just
+    cleared gets a new generation, because Stripe would otherwise replay the earlier
+    response and hand back the very object the configured account cannot see.
+    """
+    version = plan.price_version or 1
+    base = f"plan_product_{plan.id}"
+    return base if version <= 1 else f"{base}_v{version}"
+
+
+async def _visible_to_account(kind: str, object_id: str) -> bool:
+    """Whether the configured account can actually see this object.
+
+    Every Stripe id belongs to the account that created it. After a key change the
+    ids we hold are still well-formed and still wrong — and a wrong id is not a
+    *missing* one, which is the only thing ``_sync_to_stripe`` used to look for.
+
+    A ``No such …`` answer is a fact about the object. Anything else (auth, network,
+    rate limit) is a fact about the connection, so it is re-raised for the caller's
+    handler to record — never treated as "the object is gone".
+    """
+    try:
+        if kind == "product":
+            await stripe.Product.retrieve_async(object_id)
+        else:
+            await stripe.Price.retrieve_async(object_id)
+    except stripe.InvalidRequestError:
+        return False
+    return True
+
+
+async def _drop_ids_the_account_cannot_see(session: AsyncSession, plan: PricingPlan) -> None:
+    """Clear stale Stripe ids so the create below genuinely repairs the plan.
+
+    Without this, a plan carrying another account's ids skipped both create branches
+    and still fell through to ``status = active`` with ``sync_error`` cleared: Retry
+    sync reported success on a plan no customer could buy, and erased the only clue.
+    """
+    if plan.stripe_product_id and not await _visible_to_account("product", plan.stripe_product_id):
+        log.warning(
+            "plan_stripe_product_unknown",
+            plan_id=str(plan.id),
+            stripe_product_id=plan.stripe_product_id,
+        )
+        # A price lives inside its product, so both are gone together.
+        plan.stripe_product_id = None
+        plan.stripe_price_id = None
+    elif plan.stripe_price_id and not await _visible_to_account("price", plan.stripe_price_id):
+        log.warning(
+            "plan_stripe_price_unknown",
+            plan_id=str(plan.id),
+            stripe_price_id=plan.stripe_price_id,
+        )
+        plan.stripe_price_id = None
+    else:
+        return
+    # The idempotency keys are derived from the plan id and price version, so the
+    # replacement needs a new generation or Stripe may replay the previous response.
+    plan.price_version = (plan.price_version or 1) + 1
+    await session.flush()
+
+
+async def _sync_to_stripe(
+    session: AsyncSession, plan: PricingPlan, *, verify_existing: bool = False
+) -> None:
+    """Create whatever Stripe object is missing; never duplicates thanks to the keys.
+
+    ``verify_existing`` additionally checks that the ids already stored are ones the
+    configured account can see. It costs a round trip per id, so it is reserved for
+    ``retry_sync`` — the admin pressing Retry is saying the plan is already wrong,
+    which is the only moment the stored ids are worth doubting. On create and update
+    we wrote them ourselves moments earlier.
+    """
     if Decimal(str(plan.price_usd)) <= 0:
         plan.status = PlanStatus.active
         plan.sync_error = None
         plan.last_synced_at = datetime.now(UTC)
         return
-    _init_stripe()
+    await _init_stripe(session)
     try:
+        if verify_existing:
+            await _drop_ids_the_account_cannot_see(session, plan)
         if not plan.stripe_product_id:
             product = await stripe.Product.create_async(
                 name=plan.name,
                 metadata=_metadata(plan),
-                idempotency_key=f"plan_product_{plan.id}",
+                idempotency_key=_product_idempotency_key(plan),
                 **_description_kwarg(plan),
             )
             plan.stripe_product_id = str(product.id)
@@ -361,7 +439,7 @@ async def retry_sync(session: AsyncSession, plan_id: uuid.UUID, admin_id: uuid.U
     plan = await get(session, plan_id)
     if plan.status == PlanStatus.inactive:
         raise AppError("Activate the plan before syncing it", code="plan_inactive")
-    await _sync_to_stripe(session, plan)
+    await _sync_to_stripe(session, plan, verify_existing=True)
     plan.updated_by = admin_id
     session.add(plan)
     await session.flush()
@@ -401,9 +479,9 @@ async def update(
         else:
             await _sync_to_stripe(session, plan)
         if old_price_id:
-            await _archive_price(old_price_id)
+            await _archive_price(session, old_price_id)
     elif text_changed and plan.stripe_product_id:
-        _init_stripe()
+        await _init_stripe(session)
         try:
             await stripe.Product.modify_async(
                 plan.stripe_product_id,
@@ -422,8 +500,8 @@ async def update(
     return plan
 
 
-async def _archive_price(price_id: str) -> None:
-    _init_stripe()
+async def _archive_price(session: AsyncSession, price_id: str) -> None:
+    await _init_stripe(session)
     try:
         await stripe.Price.modify_async(price_id, active=False)
     except stripe.StripeError as exc:
@@ -436,7 +514,7 @@ async def set_active(
     """Deactivate archives the Stripe objects (never deletes); activate restores them."""
     plan = await get(session, plan_id)
     if plan.stripe_product_id or plan.stripe_price_id:
-        _init_stripe()
+        await _init_stripe(session)
         try:
             if plan.stripe_product_id:
                 await stripe.Product.modify_async(plan.stripe_product_id, active=active)

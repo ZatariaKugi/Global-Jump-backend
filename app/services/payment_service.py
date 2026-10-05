@@ -124,10 +124,12 @@ def format_appointment_id(appointment_number: int) -> str:
     return f"#{appointment_number:07d}"
 
 
-def _init_stripe(settings: Settings) -> None:
-    if not settings.STRIPE_SECRET_KEY:
+async def _init_stripe(session: AsyncSession, settings: Settings) -> None:
+    """Point the SDK at the credentials in force: admin-saved, else the environment."""
+    keys = await stripe_config_service.effective_keys(session, settings)
+    if not keys.secret_key:
         raise AppError("Payment processing is not configured", code="stripe_not_configured")
-    stripe.api_key = settings.STRIPE_SECRET_KEY
+    stripe.api_key = keys.secret_key
 
 
 async def _log_event(
@@ -155,6 +157,53 @@ async def _get_advisor_profile(session: AsyncSession, advisor_id: uuid.UUID) -> 
     if profile is None:
         raise NotFoundError("Advisor profile not found")
     return profile
+
+
+def _account_unusable(exc: stripe.StripeError) -> bool:
+    """Whether Stripe has *told us* this connected account cannot be used from here.
+
+    ``PermissionError`` is the platform account not being a Connect platform at all;
+    ``InvalidRequestError`` is "No such account", which is what a connected account
+    created by a different platform looks like after a key change. Both are answers
+    about the account. Every other StripeError — auth, network, rate limit — is an
+    answer about the connection, and nothing may be concluded from it.
+    """
+    return isinstance(exc, stripe.PermissionError | stripe.InvalidRequestError)
+
+
+def _mark_connect_unusable(profile: AdvisorProfile) -> None:
+    """Drop the cached readiness so the checkout gate stops trusting it.
+
+    ``advisor_not_payable`` reads these columns, so while they say True a seeker
+    reaches the payment step for an advisor this platform cannot pay. The account id
+    is deliberately kept: it is evidence, and clearing it would destroy the only
+    record of what the advisor previously onboarded.
+    """
+    profile.stripe_charges_enabled = False
+    profile.stripe_payouts_enabled = False
+    profile.stripe_details_submitted = False
+    zoom_connection_service.sync_stripe_connect_flag(profile)
+
+
+def _connect_unavailable(exc: Exception, **context: str) -> AppError:
+    log.warning("stripe_connect_unavailable", error=str(exc)[:300], **context)
+    return AppError(
+        "Stripe could not be reached for your payout account. Please try again.",
+        code="stripe_connect_unavailable",
+    )
+
+
+def _connect_setup_failed(exc: Exception, **context: str) -> AppError:
+    """Onboarding could not even be started.
+
+    The Stripe text names the platform account and its missing capabilities, which
+    means nothing to an advisor, so it goes to the log and a code goes to the client.
+    """
+    log.warning("stripe_connect_setup_failed", error=str(exc)[:300], **context)
+    return AppError(
+        "Payouts cannot be set up right now. Please contact support.",
+        code="stripe_connect_setup_failed",
+    )
 
 
 def _sync_connect_flags(profile: AdvisorProfile, account: object) -> None:
@@ -208,7 +257,7 @@ async def create_checkout_session(
     seeker_id: uuid.UUID,
     settings: Settings,
 ) -> CheckoutResponse:
-    _init_stripe(settings)
+    await _init_stripe(session, settings)
 
     # Row lock (PAY-106): a concurrent cancel/reschedule waits for this checkout.
     booking = (
@@ -271,7 +320,8 @@ async def create_checkout_session(
     # Fee split from the admin payment settings, snapshotted on the transaction so a
     # later settings change never rewrites this payment's numbers.
     config = await payment_config_service.get_config(session)
-    stripe_config_service.assert_live_allowed(settings, config)
+    live_keys = await stripe_config_service.effective_keys(session, settings)
+    stripe_config_service.assert_live_allowed(live_keys, config)
     split = compute_consultation_split(booking.price_usd, config)
 
     advisor = await session.get(User, booking.advisor_id)
@@ -369,12 +419,13 @@ async def handle_webhook(
     settings: Settings,
     session: AsyncSession,
 ) -> None:
-    _init_stripe(settings)
+    await _init_stripe(session, settings)
 
-    if settings.STRIPE_WEBHOOK_SECRET:
+    keys = await stripe_config_service.effective_keys(session, settings)
+    if keys.webhook_secret:
         try:
             event = stripe.Webhook.construct_event(  # type: ignore[no-untyped-call]
-                payload, sig_header, settings.STRIPE_WEBHOOK_SECRET
+                payload, sig_header, keys.webhook_secret
             )
         except (ValueError, stripe.SignatureVerificationError) as exc:
             raise AppError("Invalid webhook signature", code="invalid_signature") from exc
@@ -385,7 +436,8 @@ async def handle_webhook(
             raise AppError("Stripe webhook secret is not configured", code="stripe_not_configured")
         event = json.loads(payload)
         log.warning(
-            "webhook_signature_verification_skipped", reason="STRIPE_WEBHOOK_SECRET not set"
+            "webhook_signature_verification_skipped",
+            reason="no webhook secret configured in the admin panel",
         )
 
     await process_event(session, event, settings)
@@ -1077,7 +1129,7 @@ async def run_due_transfers(session: AsyncSession, settings: Settings) -> int:
     the Stripe call and the DB commit returns the same transfer instead of creating
     a second one. Returns the number of transfers completed this pass.
     """
-    _init_stripe(settings)
+    await _init_stripe(session, settings)
 
     now = datetime.now(UTC)
     due = (
@@ -1207,7 +1259,7 @@ async def create_connect_account(
     advisor_user: User,
     settings: Settings,
 ) -> AdvisorConnectStatus:
-    _init_stripe(settings)
+    await _init_stripe(session, settings)
 
     if advisor_user.role != UserRole.advisor:
         raise AppError("Only advisors can connect a Stripe account", code="wrong_role")
@@ -1215,15 +1267,21 @@ async def create_connect_account(
     profile = await _get_advisor_profile(session, advisor_user.id)
 
     if not profile.stripe_account_id:
-        account = await stripe.Account.create_async(
-            type="express",
-            email=advisor_user.email,
-            capabilities={
-                "card_payments": {"requested": True},
-                "transfers": {"requested": True},
-            },
-            metadata={"user_id": str(advisor_user.id)},
-        )
+        try:
+            account = await stripe.Account.create_async(
+                type="express",
+                email=advisor_user.email,
+                capabilities={
+                    "card_payments": {"requested": True},
+                    "transfers": {"requested": True},
+                },
+                metadata={"user_id": str(advisor_user.id)},
+            )
+        except stripe.StripeError as exc:
+            # Most often the platform account has not finished its own Stripe setup,
+            # so it cannot act as a Connect platform at all. The advisor can do
+            # nothing about that, but they must be told rather than shown a 500.
+            raise _connect_setup_failed(exc, advisor_id=str(advisor_user.id)) from exc
         profile.stripe_account_id = account.id
         session.add(profile)
         await session.flush()
@@ -1231,12 +1289,15 @@ async def create_connect_account(
             "stripe_connect_account_created", advisor_id=str(advisor_user.id), account_id=account.id
         )
 
-    account_link = await stripe.AccountLink.create_async(
-        account=profile.stripe_account_id,
-        refresh_url=f"{settings.FRONTEND_URL}/advisor/connect/refresh",
-        return_url=f"{settings.FRONTEND_URL}/advisor/connect/return",
-        type="account_onboarding",
-    )
+    try:
+        account_link = await stripe.AccountLink.create_async(
+            account=profile.stripe_account_id,
+            refresh_url=f"{settings.FRONTEND_URL}/advisor/connect/refresh",
+            return_url=f"{settings.FRONTEND_URL}/advisor/connect/return",
+            type="account_onboarding",
+        )
+    except stripe.StripeError as exc:
+        raise _connect_setup_failed(exc, advisor_id=str(advisor_user.id)) from exc
     # Reflect any cached readiness for advisors resuming onboarding (the flags are
     # authoritatively refreshed by get_connect_status / the account.updated webhook).
     return AdvisorConnectStatus(
@@ -1260,12 +1321,20 @@ async def create_stripe_dashboard_url(
     Standard (OAuth) accounts are sent to the public Stripe Dashboard — they sign
     in with their own Stripe credentials there.
     """
-    _init_stripe(settings)
+    await _init_stripe(session, settings)
     profile = await _get_advisor_profile(session, advisor_user_id)
     if not profile.stripe_account_id:
         raise NotFoundError("No Stripe account connected")
 
-    account = await stripe.Account.retrieve_async(profile.stripe_account_id)
+    try:
+        account = await stripe.Account.retrieve_async(profile.stripe_account_id)
+    except stripe.StripeError as exc:
+        if _account_unusable(exc):
+            raise AppError(
+                "Your payout account is no longer connected. Please set it up again.",
+                code="stripe_connect_account_unusable",
+            ) from exc
+        raise _connect_unavailable(exc, advisor_user_id=str(advisor_user_id)) from exc
     account_type = _stripe_get(account, "type", None)
     if account_type == "express":
         try:
@@ -1307,7 +1376,7 @@ async def get_connect_status(
     advisor_user_id: uuid.UUID,
     settings: Settings,
 ) -> AdvisorConnectStatus:
-    _init_stripe(settings)
+    await _init_stripe(session, settings)
 
     profile = await _get_advisor_profile(session, advisor_user_id)
 
@@ -1318,7 +1387,31 @@ async def get_connect_status(
             onboarding_complete=False,
         )
 
-    account = await stripe.Account.retrieve_async(profile.stripe_account_id)
+    try:
+        account = await stripe.Account.retrieve_async(profile.stripe_account_id)
+    except stripe.StripeError as exc:
+        if not _account_unusable(exc):
+            raise _connect_unavailable(exc, advisor_user_id=str(advisor_user_id)) from exc
+        # Stripe has answered: this account cannot be used from the configured
+        # platform. Report it as not ready rather than failing the whole panel —
+        # the advisor needs to see the state and re-onboard, not a retry button
+        # for a call that cannot succeed.
+        log.warning(
+            "stripe_connect_account_unusable",
+            advisor_user_id=str(advisor_user_id),
+            stripe_account_id=profile.stripe_account_id,
+            error=str(exc)[:200],
+        )
+        _mark_connect_unusable(profile)
+        session.add(profile)
+        await session.flush()
+        return AdvisorConnectStatus(
+            stripe_account_id=profile.stripe_account_id,
+            charges_enabled=False,
+            payouts_enabled=False,
+            onboarding_complete=False,
+        )
+
     # Refresh the cached readiness flags on every live status check so the checkout
     # gate stays current even between account.updated webhook deliveries.
     _sync_connect_flags(profile, account)
@@ -1711,12 +1804,28 @@ async def seeker_payment_summary(
 
 
 async def platform_payment_summary(session: AsyncSession) -> PaymentSummaryRead:
+    # "Seeker Paid" answers one question -- how much did seekers hand over for
+    # consultations -- so a refund never reduces it. Refunds have their own card
+    # beside it, and `amount_usd` is never adjusted, so this figure only goes up.
+    #
+    # `refunded` is in the row set for that reason. Leaving it out meant a *full*
+    # refund silently removed the original price while a partial one changed
+    # nothing: $99 refunded off $100 moved the card by $0, the hundredth dollar
+    # moved it by $100. It also made `Paid - Refunded` subtract across two
+    # different row sets (QA bug 7); it now reconciles.
+    #
+    # `pending` and `failed` stay out: an abandoned or expired checkout is money
+    # that never arrived.
     paid = (
         await session.execute(
             select(func.coalesce(func.sum(Transaction.amount_usd), 0.0)).where(
                 Transaction.is_archived.is_(False),
                 Transaction.status.in_(
-                    (TransactionStatus.succeeded, TransactionStatus.partially_refunded)
+                    (
+                        TransactionStatus.succeeded,
+                        TransactionStatus.partially_refunded,
+                        TransactionStatus.refunded,
+                    )
                 ),
             )
         )
@@ -1749,11 +1858,52 @@ async def platform_payment_summary(session: AsyncSession) -> PaymentSummaryRead:
             )
         )
     ).scalar_one()
+    # Advisor earnings: the advisor share of every completed transfer, less anything
+    # reversed back off the connected account (QA bug 8). Two things differ from the
+    # four figures above and both are deliberate.
+    #
+    # The row set includes `refunded`. The cards above count `succeeded` +
+    # `partially_refunded` only, so a full refund drops the row out; subtracting the
+    # reversal from a sum that never included the payout would report *negative*
+    # earnings for a booking the advisor was simply never paid for. Counting the
+    # payout and letting the reversal cancel it reads zero, which is the truth.
+    #
+    # Reversals are attributed by `refunded_at`, matching how Financial Analytics
+    # attributes refunds. That keeps this figure equal to the "Advisor Earnings" card
+    # on Financial Analytics (`analytics_service._finance_window_totals`) over the same
+    # rows, so an admin cannot read two different earnings numbers off two screens.
+    # The agreement is pinned by test_qa_advisor_earnings_finance_card_red.py.
+    advisor_earned = (
+        await session.execute(
+            select(func.coalesce(func.sum(Transaction.advisor_payout_usd), 0.0)).where(
+                Transaction.is_archived.is_(False),
+                Transaction.transfer_status == TransferStatus.completed,
+                Transaction.status.in_(
+                    (
+                        TransactionStatus.succeeded,
+                        TransactionStatus.partially_refunded,
+                        TransactionStatus.refunded,
+                    )
+                ),
+            )
+        )
+    ).scalar_one()
+    advisor_reversed = (
+        await session.execute(
+            select(func.coalesce(func.sum(Transaction.advisor_reversed_usd), 0.0)).where(
+                Transaction.is_archived.is_(False),
+                Transaction.refunded_at.is_not(None),
+            )
+        )
+    ).scalar_one()
     return PaymentSummaryRead(
         total_paid_usd=round(float(paid or 0), 2),
         total_refunded_usd=round(float(refunded or 0), 2),
         total_commission_usd=round(float(commission or 0), 2),
         total_tax_usd=round(float(tax or 0), 2),
+        total_advisor_earnings_usd=round(
+            float(advisor_earned or 0) - float(advisor_reversed or 0), 2
+        ),
     )
 
 
@@ -1853,7 +2003,7 @@ async def retry_webhook_event(
         raise NotFoundError("Webhook event not found")
     if row.status in (WebhookEventStatus.processed, WebhookEventStatus.ignored):
         return row
-    _init_stripe(settings)
+    await _init_stripe(session, settings)
     event = await stripe.Event.retrieve_async(event_id)
     await process_event(session, event, settings)
     refreshed = await session.get(StripeWebhookEvent, event_id)

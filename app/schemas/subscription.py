@@ -115,6 +115,45 @@ class AdminSubscriptionRead(BaseModel):
     created_at: datetime
 
 
+class AdminSubscriptionPlanRevenueRead(BaseModel):
+    """One row of the Revenue by Plan breakdown."""
+
+    plan_id: uuid.UUID | None
+    plan_name: str
+    audience: Literal["seeker", "advisor"]
+    revenue_usd: float
+    change_pct: float | None
+    subscriber_count: int
+
+
+class AdminSubscriptionSummaryRead(BaseModel):
+    """The cards above the Subscriptions Finance table.
+
+    Counts are "right now" and carry no period. Revenue is money actually received
+    inside the selected period, so the two halves always add to the total and each
+    figure can be checked against the one beside it.
+    """
+
+    period: Literal["daily", "monthly", "yearly", "overall"]
+
+    # Row 1 — where we stand today. Derived status, so these agree with the table.
+    active_subscribers: int
+    active_seekers: int
+    active_advisors: int
+
+    # Row 2 — money received in the period. `overall` has no period before it, so
+    # every change is null rather than a meaningless 0%.
+    total_revenue_usd: float
+    total_revenue_change_pct: float | None
+    advisor_revenue_usd: float
+    advisor_revenue_change_pct: float | None
+    seeker_revenue_usd: float
+    seeker_revenue_change_pct: float | None
+
+    # Row 3 — the same money, split by the plan each invoice was charged for.
+    plans: list[AdminSubscriptionPlanRevenueRead]
+
+
 class FeatureEntitlementRead(BaseModel):
     key: str
     label: str

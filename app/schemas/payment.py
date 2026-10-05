@@ -180,6 +180,10 @@ class PaymentSummaryRead(BaseModel):
     total_refunded_usd: float
     total_commission_usd: float
     total_tax_usd: float
+    # Same definition as Financial Analytics' "Advisor Earnings" card, deliberately --
+    # see platform_payment_summary() for why it does not share the row set of the four
+    # figures above.
+    total_advisor_earnings_usd: float
 
 
 class AdvisorConnectStatus(BaseModel):

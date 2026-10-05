@@ -76,6 +76,42 @@ _GROSS_STATUSES = (
 )
 
 
+async def revenue_today(session: AsyncSession) -> float:
+    """Today's charges minus today's refunds.
+
+    The card is net (PM decision, 2026-10-01): a consultation bought and refunded on the
+    same day must not keep showing as revenue. Attribution matches the finance window --
+    a charge counts on the day it was created, a refund on the day it was refunded -- so
+    a refund today reduces today even when the charge is older.
+
+    Both the admin dashboard and the analytics overview call this, so the two screens
+    cannot drift apart.
+    """
+    today = datetime.now(UTC).date()
+    today_start = datetime(today.year, today.month, today.day, tzinfo=UTC)
+    today_end = today_start + timedelta(days=1)
+    charged = (
+        await session.execute(
+            select(func.coalesce(func.sum(Transaction.amount_usd), 0.0)).where(
+                Transaction.status.in_(_GROSS_STATUSES),
+                Transaction.created_at >= today_start,
+                Transaction.created_at < today_end,
+            )
+        )
+    ).scalar_one()
+    refunded = (
+        await session.execute(
+            select(func.coalesce(func.sum(Transaction.refunded_amount_usd), 0.0)).where(
+                Transaction.refunded_at.is_not(None),
+                Transaction.refunded_at >= today_start,
+                Transaction.refunded_at < today_end,
+            )
+        )
+    ).scalar_one()
+    # coalesce() guarantees a number, but the column is nullable so the type is not.
+    return round(float(charged or 0) - float(refunded or 0), 2)
+
+
 def _month_key(dt: datetime) -> str:
     return dt.strftime("%Y-%m")
 
@@ -147,18 +183,7 @@ async def get_overview_analytics(session: AsyncSession, days: int = 30) -> Overv
     ).scalar_one()
     booking_rate = round(100.0 * booked / assessed, 2) if assessed else 0.0
 
-    today = datetime.now(UTC).date()
-    today_start = datetime(today.year, today.month, today.day, tzinfo=UTC)
-    today_end = today_start + timedelta(days=1)
-    revenue_today_usd = (
-        await session.execute(
-            select(func.coalesce(func.sum(Transaction.amount_usd), 0.0)).where(
-                Transaction.status.in_(_GROSS_STATUSES),
-                Transaction.created_at >= today_start,
-                Transaction.created_at < today_end,
-            )
-        )
-    ).scalar_one()
+    revenue_today_usd = await revenue_today(session)
 
     country_rows = (
         await session.execute(
@@ -432,7 +457,10 @@ def _finance_window_totals(
         and t.status in _GROSS_STATUSES
         and window_start <= _as_utc(t.created_at) < window_end
     ]
-    advisor_payout = round(money_sum(t.advisor_payout_usd for t in paid_out), 2)
+    # Money reversed off the advisor is not earnings. Reversals are attributed the
+    # same way refunds are -- by when they happened, not when the charge was made.
+    reversed_out = money_sum(t.advisor_reversed_usd for t in refunded)
+    advisor_payout = round(money_sum(t.advisor_payout_usd for t in paid_out) - reversed_out, 2)
     return gross, refunds, net, advisor_payout
 
 

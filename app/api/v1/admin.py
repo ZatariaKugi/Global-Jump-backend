@@ -93,6 +93,8 @@ from app.schemas.payment_settings import (
     PaymentSettingChangeRead,
     PaymentSettingsRead,
     PaymentSettingsUpdate,
+    StripeKeyStatus,
+    StripeKeysUpdate,
 )
 from app.schemas.pre_registration import PreRegistrationRead
 from app.schemas.pricing_plan import (
@@ -110,7 +112,11 @@ from app.schemas.review import (
 from app.schemas.seeker_admin import SeekerCreate, SeekerDetailRead, SeekerListRead
 from app.schemas.seeker_document import SeekerDocumentRead, SeekerDocumentStatusUpdate
 from app.schemas.stripe_admin import StripeStatusRead, WebhookEventRead
-from app.schemas.subscription import AdminInvoiceRead, AdminSubscriptionRead
+from app.schemas.subscription import (
+    AdminInvoiceRead,
+    AdminSubscriptionRead,
+    AdminSubscriptionSummaryRead,
+)
 from app.schemas.support_ticket import TicketCreate, TicketRead, TicketUpdate
 from app.schemas.ticket_message import TicketMessageRead, TicketMessageSend
 from app.schemas.transaction_event import TransactionEventRead
@@ -1228,7 +1234,8 @@ async def update_payment_settings(
     """
     current = await payment_config_service.get_config(session)
     if body.live_payments_enabled and not current.live_payments_enabled:
-        status = await stripe_config_service.validate(settings)
+        keys = await stripe_config_service.effective_keys(session, settings)
+        status = await stripe_config_service.validate(keys)
         if not status.ok:
             raise AppError(
                 "Stripe configuration is incomplete; live payments cannot be enabled",
@@ -1266,7 +1273,8 @@ async def get_stripe_status(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[StripeStatusRead]:
     """Presence and probe checks. Never returns key material."""
-    status = await stripe_config_service.validate(settings)
+    keys = await stripe_config_service.effective_keys(session, settings)
+    status = await stripe_config_service.validate(keys)
     config = await payment_config_service.get_config(session)
     return ResponseEnvelope[StripeStatusRead](
         data=StripeStatusRead(
@@ -1275,6 +1283,42 @@ async def get_stripe_status(
             ok=status.ok,
             live_payments_enabled=config.live_payments_enabled,
         ),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.get("/stripe/keys", response_model=ResponseEnvelope[StripeKeyStatus])
+async def get_stripe_keys(
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[StripeKeyStatus]:
+    """What the Stripe Configuration form shows: presence, last four, mode, origin.
+
+    Never the secret key or the signing secret (PAY-108 AC 2).
+    """
+    return ResponseEnvelope[StripeKeyStatus](
+        data=await stripe_config_service.key_status(session, settings),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.put("/stripe/keys", response_model=ResponseEnvelope[StripeKeyStatus])
+async def update_stripe_keys(
+    body: StripeKeysUpdate,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[StripeKeyStatus]:
+    """Save Stripe credentials after checking them.
+
+    Every supplied value is validated before anything is written — the secret key
+    against Stripe itself — so a typo is refused here rather than discovered when a
+    customer tries to pay. Fields left out keep their stored value.
+    """
+    return ResponseEnvelope[StripeKeyStatus](
+        data=await stripe_config_service.save_keys(session, body, principal.id, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -1442,6 +1486,33 @@ async def activate_pricing_plan(
 # ── Subscriptions (EPIC 04 PAY-110 / 111) ────────────────────────────────────
 
 
+@router.get(
+    "/subscriptions/summary",
+    response_model=ResponseEnvelope[AdminSubscriptionSummaryRead],
+)
+async def subscriptions_finance_summary(
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+    period: Annotated[
+        Literal["daily", "monthly", "yearly", "overall"], Query()
+    ] = "monthly",
+) -> ResponseEnvelope[AdminSubscriptionSummaryRead]:
+    """Cards above the Subscriptions Finance table: who subscribes, and what they pay.
+
+    ``settings`` is passed so the read can repair invoices a missed ``invoice.paid``
+    webhook never recorded -- otherwise a subscriber who has genuinely paid shows as
+    Active beside $0 revenue, with nothing on the screen able to fix it.
+
+    Declared before ``/subscriptions/{subscription_id}/invoices`` so "summary" is not
+    parsed as a subscription id.
+    """
+    data = await subscription_service.admin_finance_summary(session, period, settings)
+    return ResponseEnvelope[AdminSubscriptionSummaryRead](
+        data=data, meta=Meta(request_id=request_id)
+    )
+
+
 @router.get("/subscriptions", response_model=ResponseEnvelope[list[AdminSubscriptionRead]])
 async def list_subscriptions_admin(
     params: PaginationDep,
@@ -1451,11 +1522,15 @@ async def list_subscriptions_admin(
     status: Annotated[str | None, Query()] = None,
     q: Annotated[str | None, Query(max_length=100)] = None,
 ) -> ResponseEnvelope[list[AdminSubscriptionRead]]:
-    stmt = subscription_service.admin_list_stmt(audience, status, q)
+    grace_days = await entitlement_service.grace_days(session)
+    stmt = subscription_service.admin_list_stmt(audience, status, q, grace_days)
     count_stmt = select(func.count()).select_from(stmt.order_by(None).subquery())
     total = (await session.scalar(count_stmt)) or 0
     result = await session.execute(stmt.offset(params.offset).limit(params.limit))
-    data = [subscription_service.admin_read(s, u, p, charged) for s, u, p, charged in result.all()]
+    data = [
+        subscription_service.admin_read(s, u, p, charged, grace_days)
+        for s, u, p, charged in result.all()
+    ]
     return ResponseEnvelope[list[AdminSubscriptionRead]](
         data=data, meta=page_meta(params, total, request_id)
     )
@@ -1476,7 +1551,7 @@ async def list_subscription_invoices_admin(
     rows, total = await paginate(
         session, subscription_service.admin_invoices_stmt(subscription_id), params
     )
-    data = [await subscription_service.admin_invoice_read(r, settings) for r in rows]
+    data = [await subscription_service.admin_invoice_read(session, r, settings) for r in rows]
     return ResponseEnvelope[list[AdminInvoiceRead]](
         data=data, meta=page_meta(params, total, request_id)
     )
@@ -1638,7 +1713,7 @@ async def get_payments_summary(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[PaymentSummaryRead]:
-    """Platform-wide payment summary cards (paid / refunded / commission / tax)."""
+    """Platform-wide payment summary cards (paid / refunded / commission / tax / advisor)."""
     data = await payment_service.platform_payment_summary(session)
     return ResponseEnvelope[PaymentSummaryRead](data=data, meta=Meta(request_id=request_id))
 

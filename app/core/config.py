@@ -117,9 +117,12 @@ class Settings(BaseSettings):
     S3_BUCKET_NAME: str | None = None
 
     # Stripe -----------------------------------------------------------------
-    STRIPE_SECRET_KEY: str | None = None
-    STRIPE_WEBHOOK_SECRET: str | None = None
-    STRIPE_PUBLISHABLE_KEY: str | None = None
+    # The Stripe credentials are deliberately NOT here. They are configured by an
+    # admin in the panel and stored encrypted on ``platform_payment_settings``; the
+    # only reader is ``stripe_config_service.effective_keys``. There is no
+    # environment fallback: keys the admin cannot see or change are how this project
+    # spent two days running against the wrong Stripe account, so "not configured"
+    # has to be loud rather than quietly wrong.
     # Seeds the first ``platform_payment_settings`` row only (0.15 -> 15 percent). After
     # that the admin panel owns the commission; nothing reads this at request time.
     PLATFORM_COMMISSION_RATE: float = 0.15
@@ -178,9 +181,6 @@ class Settings(BaseSettings):
         "IDENTITY_JWKS_URL",
         "SENTRY_DSN",
         "SMTP_HOST",
-        "STRIPE_SECRET_KEY",
-        "STRIPE_WEBHOOK_SECRET",
-        "STRIPE_PUBLISHABLE_KEY",
         "OPENAI_API_KEY",
         "GOOGLE_CLIENT_ID",
         "GOOGLE_CLIENT_SECRET",

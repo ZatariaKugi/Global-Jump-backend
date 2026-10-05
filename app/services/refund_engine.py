@@ -32,7 +32,7 @@ from app.models.transaction import ChargeModel, Transaction, TransactionStatus, 
 from app.models.transaction_event import TransactionEvent, TransactionEventType
 from app.models.transaction_refund import RefundKind, RefundStatus, TransactionRefund
 from app.models.user import User
-from app.services import email_service, notification_service
+from app.services import email_service, notification_service, stripe_config_service
 from app.services.payment_config_service import PaymentConfig
 
 log = structlog.get_logger()
@@ -191,9 +191,10 @@ async def execute_refund(
     settings: Settings,
 ) -> TransactionRefund:
     """Record, then call Stripe (refund, then reversal), then update the ledger."""
-    if not settings.STRIPE_SECRET_KEY:
+    keys = await stripe_config_service.effective_keys(session, settings)
+    if not keys.secret_key:
         raise AppError("Payment processing is not configured", code="stripe_not_configured")
-    stripe.api_key = settings.STRIPE_SECRET_KEY
+    stripe.api_key = keys.secret_key
 
     if txn.status not in (TransactionStatus.succeeded, TransactionStatus.partially_refunded):
         raise AppError(
@@ -385,9 +386,10 @@ async def retry_refund(
     txn = await session.get(Transaction, row.transaction_id)
     if txn is None:
         raise AppError("Transaction not found", code="not_found")
-    if not settings.STRIPE_SECRET_KEY:
+    keys = await stripe_config_service.effective_keys(session, settings)
+    if not keys.secret_key:
         raise AppError("Payment processing is not configured", code="stripe_not_configured")
-    stripe.api_key = settings.STRIPE_SECRET_KEY
+    stripe.api_key = keys.secret_key
     try:
         await _run_stripe_steps(txn, row)
     except stripe.StripeError as exc:

@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field, model_validator
 
 CommissionTypeLiteral = Literal["percent", "fixed"]
 FeeRefundBehaviorLiteral = Literal["retained", "refunded"]
+# Stripe has exactly two environments; the admin picks one rather than us guessing.
+StripeModeLiteral = Literal["test", "live"]
 
 # Windows are hours before the scheduled start; 30 days is a generous ceiling.
 MAX_WINDOW_HOURS = 720
@@ -56,3 +58,46 @@ class PaymentSettingChangeRead(BaseModel):
     changed_by: uuid.UUID | None
     changed_by_name: str | None = None
     changed_at: datetime
+
+
+# ── Stripe credentials (PAY-107 / PAY-108) ───────────────────────────────────
+
+
+class StripeKeysUpdate(BaseModel):
+    """What the admin typed into the Stripe Configuration form.
+
+    Every field is optional so the form can be saved without retyping a secret the
+    admin is not changing. ``None`` means "leave it as it is"; clearing a value is a
+    separate, deliberate action rather than an empty text box.
+    """
+
+    secret_key: str | None = Field(default=None, max_length=255)
+    publishable_key: str | None = Field(default=None, max_length=255)
+    webhook_secret: str | None = Field(default=None, max_length=255)
+    # The admin's declaration of which Stripe environment this platform is on. Every
+    # supplied key is checked against it, so a live key cannot arrive under "Test".
+    mode: StripeModeLiteral | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one(self) -> StripeKeysUpdate:
+        if not any((self.secret_key, self.publishable_key, self.webhook_secret, self.mode)):
+            raise ValueError("Provide at least one value to save")
+        return self
+
+
+class StripeKeyStatus(BaseModel):
+    """What the form is allowed to show back.
+
+    Never the secret key or the signing secret — only whether each is set, the last
+    four characters so an admin can tell which key is loaded, and where it came from
+    (PAY-108 AC 2).
+    """
+
+    source: Literal["database", "environment", "none"]
+    mode: Literal["test", "live", "unknown"]
+    mode_is_chosen: bool = False
+    secret_key_set: bool
+    secret_key_last4: str | None = None
+    publishable_key: str | None = None
+    webhook_secret_set: bool
+    webhook_secret_last4: str | None = None

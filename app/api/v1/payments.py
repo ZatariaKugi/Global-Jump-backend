@@ -24,7 +24,7 @@ from app.schemas.payment import (
     SeekerPaymentSummaryRead,
 )
 from app.schemas.response import Meta, ResponseEnvelope
-from app.services import payment_config_service, payment_service
+from app.services import payment_config_service, payment_service, stripe_config_service
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
@@ -81,12 +81,13 @@ async def get_payment_config(
 ) -> ResponseEnvelope[PaymentConfigRead]:
     """Stripe publishable key + the admin payment rules (never any secret)."""
     config = await payment_config_service.get_config(session)
+    keys = await stripe_config_service.effective_keys(session, settings)
     legacy_rate = (
         float(config.commission_value) / 100 if config.commission_type == "percent" else None
     )
     return ResponseEnvelope[PaymentConfigRead](
         data=PaymentConfigRead(
-            publishable_key=settings.STRIPE_PUBLISHABLE_KEY,
+            publishable_key=keys.publishable_key,
             commission_type=config.commission_type,
             commission_value=float(config.commission_value),
             seeker_reschedule_window_hours=config.seeker_reschedule_window_hours,

@@ -85,6 +85,13 @@ class SubscriptionInvoice(Base):
     subscription_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # Which plan this charge was for, snapshotted when the invoice is written.
+    # `subscriptions.plan_id` is the plan the subscriber is on *now*, so resolving
+    # through it would re-attribute every past payment the moment anyone upgrades.
+    # Nullable + SET NULL: a retired plan keeps its revenue history.
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("pricing_plans.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     stripe_invoice_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     stripe_invoice_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
     description: Mapped[str | None] = mapped_column(String(200), nullable=True)

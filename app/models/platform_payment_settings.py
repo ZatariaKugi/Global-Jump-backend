@@ -18,7 +18,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -70,6 +70,17 @@ class PlatformPaymentSettings(BaseModel):
     subscription_grace_days: Mapped[int] = mapped_column(
         Integer, nullable=False, default=3, server_default="3"
     )
+    # Stripe credentials, admin-configurable (PAY-107) and never in source control
+    # (PAY-108). The two secrets are AES-256-GCM ciphertext from ``encryption.py``;
+    # the publishable key is public by definition and is stored as it is. All three
+    # are null until an admin saves them, and the environment is used until then.
+    stripe_secret_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stripe_webhook_secret_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stripe_publishable_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # "test" or "live", chosen by the admin rather than inferred from a key prefix.
+    # Declaring it lets the save refuse keys that contradict it — a live key pasted
+    # while Test is selected is the one mistake here that costs real money.
+    stripe_mode: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
 
 class PlatformSettingChange(Base):
