@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -19,10 +20,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.exceptions import AppError, NotFoundError
 from app.core.file_storage import resolve_media_url
 from app.core.money import as_float
+from app.db.session import async_session_factory
 from app.models.advisor_profile import AdvisorProfile
 from app.models.booking import Booking, BookingStatus, PaymentStatus
 from app.models.notification import NotificationEntityType, NotificationType
@@ -859,6 +861,11 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
         await _log_event(session, txn.id, TransactionEventType.transfer_completed)
         await _recover_stripe_fee(session, txn, stripe_fee_cents)
         await _stamp_payment_metadata(txn)
+        if stripe_fee_cents <= 0 and balance_txn_id is None:
+            # Stripe writes the charge's balance transaction a beat after the charge,
+            # so at this instant it is sometimes not there yet. Two real payments on
+            # 2026-10-08 recorded $0 that way. PM's rule: check again after 30 seconds.
+            schedule_stripe_fee_check(txn.id)
     else:
         # Legacy separate-charge row: arm the hold for the sweep as before.
         txn.transfer_after = datetime.now(UTC) + timedelta(minutes=settings.PAYOUT_HOLD_MINUTES)
@@ -1007,6 +1014,107 @@ async def _recover_stripe_fee(session: AsyncSession, txn: Transaction, fee_cents
         return
     txn.stripe_fee_reversal_id = str(reversal.id)
     await _log_event(session, txn.id, TransactionEventType.stripe_fee_recovered)
+
+
+# Stripe's fee can be missing at ``checkout.session.completed``; it is read again
+# after this many seconds, this many times, in the background (PM, 2026-10-09).
+STRIPE_FEE_RETRY_SECONDS = 30
+STRIPE_FEE_RETRY_ATTEMPTS = 3
+
+_background_tasks: set[asyncio.Task[None]] = set()
+
+
+def pending_background_tasks() -> list[asyncio.Task[None]]:
+    """The fee checks still running (tests and shutdown await them)."""
+    return [t for t in _background_tasks if not t.done()]
+
+
+def schedule_stripe_fee_check(transaction_id: uuid.UUID) -> asyncio.Task[None] | None:
+    """Look at the charge again later, in the background, for the fee we could not read.
+
+    Fire-and-forget on the running loop, like ``email_service.schedule_email``; the
+    webhook response is never delayed. Nothing here depends on the (switched-off)
+    scheduler.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        log.warning("stripe_fee_check_no_loop", transaction_id=str(transaction_id))
+        return None
+    task = loop.create_task(_stripe_fee_check(transaction_id))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def _stripe_fee_check(transaction_id: uuid.UUID) -> None:
+    """Wait, re-read the charge with its balance transaction, record and recover the fee.
+
+    Each attempt opens its own session: the webhook's session is long gone. A Stripe
+    error on one attempt is logged and the next attempt still runs; after the last
+    attempt the row keeps $0 and says so in ``transfer_last_error`` so the admin sheet
+    shows the fee as unknown rather than silently absent.
+    """
+    settings = get_settings()
+    for attempt in range(1, STRIPE_FEE_RETRY_ATTEMPTS + 1):
+        await asyncio.sleep(STRIPE_FEE_RETRY_SECONDS)
+        try:
+            async with async_session_factory() as session:
+                txn = await session.get(Transaction, transaction_id)
+                if txn is None:
+                    return
+                if not txn.stripe_charge_id:
+                    continue  # the webhook's own write may not have landed yet
+                if txn.stripe_balance_transaction_id or as_float(txn.stripe_fee_usd) > 0:
+                    return  # someone else (a redelivered webhook) got there first
+                await _init_stripe(session, settings)
+                charge = await stripe.Charge.retrieve_async(
+                    str(txn.stripe_charge_id), expand=["balance_transaction"]
+                )
+                raw_bt = _stripe_get(charge, "balance_transaction")
+                fee_value = (
+                    _stripe_get(raw_bt, "fee")
+                    if raw_bt is not None and not isinstance(raw_bt, str)
+                    else None
+                )
+                if not isinstance(fee_value, (int, float)) or int(fee_value) <= 0:
+                    log.info(
+                        "stripe_fee_still_unknown",
+                        transaction_id=str(transaction_id),
+                        attempt=attempt,
+                    )
+                    if attempt == STRIPE_FEE_RETRY_ATTEMPTS:
+                        txn.transfer_last_error = (
+                            f"Stripe fee unknown after {attempt} checks; "
+                            "recorded as 0, not taken from the advisor"
+                        )[:500]
+                        session.add(txn)
+                        await session.commit()
+                    continue
+                fee_cents = int(fee_value)
+                txn.stripe_fee_usd = round(fee_cents / 100, 2)
+                txn.stripe_balance_transaction_id = str(_stripe_get(raw_bt, "id") or "") or None
+                session.add(txn)
+                await _recover_stripe_fee(session, txn, fee_cents)
+                await _stamp_payment_metadata(txn)
+                await session.commit()
+                log.info(
+                    "stripe_fee_recorded_late",
+                    transaction_id=str(transaction_id),
+                    attempt=attempt,
+                    fee_cents=fee_cents,
+                )
+                return
+        except stripe.StripeError as exc:
+            log.warning(
+                "stripe_fee_check_failed",
+                transaction_id=str(transaction_id),
+                attempt=attempt,
+                error=str(exc)[:200],
+            )
+        except Exception:  # noqa: BLE001 - a background check must never take the app down
+            log.exception("stripe_fee_check_crashed", transaction_id=str(transaction_id))
+            return
 
 
 async def _stamp_payment_metadata(txn: Transaction) -> None:
