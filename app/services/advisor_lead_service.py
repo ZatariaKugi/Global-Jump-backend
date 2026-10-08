@@ -25,7 +25,11 @@ from app.models.assessment import Assessment
 from app.models.booking import Booking
 from app.models.user import User
 from app.schemas.assessment import AdvisorMatchRead
-from app.services import advisor_matching_service, advisor_profile_service, review_service
+from app.services import (
+    advisor_matching_service,
+    advisor_profile_service,
+    review_service,
+)
 from app.services.advisor_profile_service import build_match_reasons
 from app.services.ai_advisor_match_service import AiMatchFailure
 
@@ -73,13 +77,20 @@ async def generate_for_assessment(
     profiles_by_id: dict[uuid.UUID, AdvisorProfile] = {}
     if advisor_ids:
         profile_rows = (
-            await session.execute(
-                select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
+            (
+                await session.execute(
+                    select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         profiles_by_id = {p.user_id: p for p in profile_rows}
 
     for item in ranked:
+        # Every matched advisor gets a row: the row is also the seeker's "View matches"
+        # list, which must include advisors on the free plan so the seeker can book
+        # (PM, 2026-10-09). The advisor's own access to leads is the ``leads`` gate.
         reasons = item.match_reasons
         if not reasons:
             profile = profiles_by_id.get(item.user_id)
@@ -218,7 +229,13 @@ async def matches_for_assessment(
     offset: int = 0,
     settings: Settings | None = None,
 ) -> tuple[list[AdvisorMatchRead], int]:
-    """Paginated persisted matches. ``limit <= 0`` returns only the total."""
+    """Paginated persisted matches. ``limit <= 0`` returns only the total.
+
+    These are the seeker's *matches*, not the AI recommendations: every matched
+    advisor is listed whatever their plan, so a seeker can always book (PM,
+    2026-10-09). ``ai_recommended`` filters only the AI paths
+    (``GET /advisors?recommended=true`` and the dashboard).
+    """
     stmt = list_for_assessment_stmt(assessment_id)
     total = int(
         (

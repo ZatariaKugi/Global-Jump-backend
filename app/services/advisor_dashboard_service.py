@@ -22,7 +22,7 @@ from app.models.advisor_profile import AdvisorProfile
 from app.models.booking import Booking
 from app.models.regulatory_update import RegulatoryUpdate
 from app.models.review import Review
-from app.models.transaction import Transaction, TransactionStatus
+from app.models.transaction import Transaction
 from app.models.user import User, UserRole
 from app.schemas.advisor_dashboard import (
     AdvisorDashboardRead,
@@ -33,6 +33,7 @@ from app.schemas.advisor_dashboard import (
     RegulatoryUpdateRead,
 )
 from app.services import (
+    advisor_earnings,
     booking_service,
     conversation_service,
 )
@@ -95,15 +96,11 @@ async def _new_leads_count(
 async def _total_earned_usd(
     session: AsyncSession, advisor_id: uuid.UUID, since: datetime | None
 ) -> float:
-    """Advisor payout on succeeded transactions in-window (matches earnings math)."""
+    """Payout minus reversals over completed transfers, the one earnings rule."""
     stmt = (
-        select(func.coalesce(func.sum(Transaction.advisor_payout_usd), 0.0))
+        select(func.coalesce(func.sum(advisor_earnings.ADVISOR_NET_EARNINGS), 0.0))
         .join(Booking, Booking.id == Transaction.booking_id)
-        .where(
-            Booking.advisor_id == advisor_id,
-            Transaction.status == TransactionStatus.succeeded,
-            Transaction.is_archived.is_(False),
-        )
+        .where(Booking.advisor_id == advisor_id, *advisor_earnings.advisor_earnings_filters())
     )
     if since is not None:
         stmt = stmt.where(Transaction.created_at >= since)

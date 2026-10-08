@@ -486,13 +486,22 @@ async def send_payment_receipt_email(
     amount_usd: float,
     invoice_number: str,
     settings: Settings,
+    consultation_usd: float | None = None,
+    tax_usd: float = 0.0,
+    tax_label: str | None = None,
 ) -> None:
-    ctx = {
+    """The seeker's receipt: Consultation + Tax = Total, the same three lines as the
+    checkout page and the invoice (QA 2026-10-08, section 4). No fee is ever named."""
+    consultation = consultation_usd if consultation_usd is not None else amount_usd
+    ctx: dict[str, object] = {
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
         "advisor_name": advisor_name,
         "name": name,
         "amount_usd": f"{amount_usd:.2f}",
+        "consultation_usd": f"{consultation:.2f}",
+        "tax_usd": f"{tax_usd:.2f}" if tax_usd > 0 else None,
+        "tax_label": tax_label or "Tax",
         "invoice_number": invoice_number,
         "year": datetime.now(UTC).year,
     }
@@ -998,15 +1007,22 @@ async def send_advisor_payment_notification_email(
     payout_usd: float,
     invoice_number: str,
     settings: Settings,
+    platform_fee_usd: float | None = None,
+    stripe_fee_usd: float = 0.0,
 ) -> None:
-    """Notify an advisor that a seeker has paid for their consultation."""
-    ctx = {
+    """Notify an advisor that a seeker has paid for their consultation.
+
+    ``amount_usd`` is the consultation (tax excluded: it is not the advisor's);
+    ``payout_usd`` is their net after the platform fee and Stripe's fee."""
+    ctx: dict[str, object] = {
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
         "seeker_name": seeker_name,
         "name": name,
         "amount_usd": f"{amount_usd:.2f}",
         "payout_usd": f"{payout_usd:.2f}",
+        "platform_fee_usd": f"{platform_fee_usd:.2f}" if platform_fee_usd is not None else None,
+        "stripe_fee_usd": f"{stripe_fee_usd:.2f}" if stripe_fee_usd > 0 else None,
         "invoice_number": invoice_number,
         "year": datetime.now(UTC).year,
     }

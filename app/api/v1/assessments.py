@@ -113,8 +113,9 @@ async def start_assessment(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AssessmentRead]:
     _require_seeker(current_user)
-    # EPIC 04: the plan's ``ai_assessments`` limit is enforced here (quota_exceeded).
-    await entitlement_service.consume(session, current_user, "ai_assessments")
+    # ``ai_assessments`` is counted when the assessment is completed (PM, 2026-10-09);
+    # starting only checks that an allowance is left (quota_exceeded otherwise).
+    await entitlement_service.check(session, current_user, "ai_assessments")
     assessment = await assessment_service.start(session, current_user.id, data)
     return ResponseEnvelope[AssessmentRead](
         data=await _build_read(session, assessment),
@@ -133,6 +134,7 @@ async def submit_answers(
 ) -> ResponseEnvelope[AssessmentRead]:
     _require_seeker(current_user)
     assessment = await assessment_service.get_for_user(session, assessment_id, current_user.id)
+    was_completed = assessment.status == AssessmentStatus.completed
     assessment = await assessment_service.submit_answers(
         session,
         assessment,
@@ -140,10 +142,33 @@ async def submit_answers(
         settings,
         complete=data.complete,
     )
+    if assessment.status == AssessmentStatus.completed and not was_completed:
+        # The results (score and AI narrative) are shown now: this is the moment the
+        # plan's ``ai_assessments`` allowance is spent (PM, 2026-10-09).
+        await entitlement_service.consume(session, current_user, "ai_assessments")
     return ResponseEnvelope[AssessmentRead](
         data=await _build_read(session, assessment),
         meta=Meta(request_id=request_id),
     )
+
+
+async def _assert_within_history(
+    session: SessionDep, current_user: User, assessment: Assessment
+) -> None:
+    """``assessment_history`` caps the list; it must cap direct access by id too
+    (QA BUG22), or the cap is a suggestion."""
+    try:
+        cap = await entitlement_service.limit_for(session, current_user, "assessment_history")
+    except AppError:
+        # No history on the plan still leaves the newest assessment readable: the
+        # completion screen re-reads it by id, and that is not "history".
+        cap = 1
+    if cap is None:
+        return
+    if not await assessment_service.is_within_newest(session, current_user.id, assessment, cap):
+        raise AppError(
+            "This assessment is outside your plan's history", code="subscription_required"
+        )
 
 
 @router.get("/{assessment_id}", response_model=ResponseEnvelope[AssessmentRead])
@@ -155,10 +180,9 @@ async def get_assessment(
 ) -> ResponseEnvelope[AssessmentRead]:
     _require_seeker(current_user)
     assessment = await assessment_service.get_for_user(session, assessment_id, current_user.id)
-    # EPIC 04: ``ai_insights`` is a plan feature — the score stays, the narrative locks.
-    locked = not await entitlement_service.allowed(session, current_user, "ai_insights")
+    await _assert_within_history(session, current_user, assessment)
     return ResponseEnvelope[AssessmentRead](
-        data=await _build_read(session, assessment, insights_locked=locked),
+        data=await _build_read(session, assessment),
         meta=Meta(request_id=request_id),
     )
 
@@ -186,6 +210,7 @@ async def list_matched_advisors(
             "Matched advisors are available after the assessment is completed",
             code="assessment_incomplete",
         )
+    await _assert_within_history(session, current_user, assessment)
     # EPIC 04: ``matched_advisors`` — off -> subscription_required; n -> top n only.
     cap = await entitlement_service.limit_for(session, current_user, "matched_advisors")
     await advisor_lead_service.ensure_for_assessment(session, assessment)

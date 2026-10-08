@@ -89,6 +89,11 @@ class PricingPlan(BaseModel):
     is_highlighted: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # The audience's designated free plan: every user of that audience without a paid
+    # subscription sits on it. One per audience; only a $0 plan may carry it.
+    is_default: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     stripe_product_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     stripe_price_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     price_version: Mapped[int] = mapped_column(

@@ -22,8 +22,13 @@ from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError
 from app.models.advisor_profile import AdvisorProfile
 from app.models.notification import NotificationEntityType, NotificationType
-from app.models.pricing_plan import PlanStatus, PricingPlan
-from app.models.subscription import Subscription, SubscriptionInvoice, SubscriptionStatus
+from app.models.pricing_plan import FeatureKind, PlanStatus, PricingPlan
+from app.models.subscription import (
+    Subscription,
+    SubscriptionFeature,
+    SubscriptionInvoice,
+    SubscriptionStatus,
+)
 from app.models.user import User, UserRole
 from app.schemas.payment import CheckoutResponse
 from app.schemas.subscription import (
@@ -56,26 +61,6 @@ _ACTIVE_LIKE = (
 _ENDED = (SubscriptionStatus.canceled, SubscriptionStatus.unpaid, SubscriptionStatus.expired)
 # Stripe's own status values that mean "this customer is already paying for a plan".
 _LIVE_STRIPE_STATUSES = ("trialing", "active", "past_due")
-
-
-async def _free_plan_grants(session: AsyncSession, audience: str, key: str) -> bool:
-    """Whether the audience's free plan keeps ``key`` on once a paid plan ends.
-
-    No free plan configured means nothing is restricted, so that counts as granted.
-    """
-    from app.models.pricing_plan import FeatureKind, FeatureValueType
-    from app.services import pricing_plan_service
-
-    free = await pricing_plan_service.free_plan_for(session, audience)
-    if free is None:
-        return True
-    for f in free.features:
-        if f.kind != FeatureKind.enforceable or f.feature_key != key or not f.is_enabled:
-            continue
-        if f.value_type == FeatureValueType.bool:
-            return (f.value or "true").strip().lower() != "false"
-        return True
-    return False
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -290,6 +275,59 @@ async def create_checkout(
     return CheckoutResponse(checkout_url=str(checkout.url), session_id=str(checkout.id))
 
 
+async def snapshot_features(session: AsyncSession, sub: Subscription, plan: PricingPlan) -> None:
+    """Copy the plan's perks onto the subscription (QA BUG21).
+
+    Taken when the subscription starts, changes plan, or renews. Entitlements read
+    this copy, so an admin edit of the plan reaches a live subscriber only at their
+    next renewal, never mid-period.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    from app.services import pricing_plan_service
+
+    if sa_inspect(sub).persistent:
+        # The collection must be loaded before it is replaced (delete-orphan).
+        await session.refresh(sub, attribute_names=["features"])
+    sub.features = [
+        SubscriptionFeature(
+            feature_key=pricing_plan_service.canonical_key(f.feature_key) or "",
+            label=f.label,
+            value_type=str(getattr(f.value_type, "value", f.value_type)),
+            value=f.value,
+            is_enabled=f.is_enabled,
+        )
+        for f in plan.features
+        if f.kind == FeatureKind.enforceable and f.feature_key
+    ]
+    sub.plan_version = max(int(plan.price_version or 1), 1)
+    sub.price_usd = Decimal(str(plan.price_usd))
+
+
+async def _acknowledge_plan_choice(session: AsyncSession, user_id: uuid.UUID) -> None:
+    user = await session.get(User, user_id)
+    if user is not None and user.plan_choice_acknowledged_at is None:
+        user.plan_choice_acknowledged_at = datetime.now(UTC)
+        session.add(user)
+
+
+async def choose_free(session: AsyncSession, user: User) -> None:
+    """The first-time plans page: the user picked the free plan.
+
+    Nothing is created — the free plan is never a subscription row (discussion §5) —
+    so repeated clicks are harmless. Only the acknowledgement is recorded.
+    """
+    from app.services import entitlement_service, pricing_plan_service
+
+    audience = entitlement_service.audience_of(user)
+    if audience is None:
+        return
+    if await pricing_plan_service.free_plan_for(session, audience) is None:
+        raise AppError("No free plan is configured for your account type", code="no_default_plan")
+    await _acknowledge_plan_choice(session, user.id)
+    await session.flush()
+
+
 # ── webhook side ─────────────────────────────────────────────────────────────
 
 
@@ -351,15 +389,40 @@ async def _sync_advisor_flag(session: AsyncSession, sub: Subscription) -> None:
     if profile is None:
         return
     profile.subscription_status = sub.status.value
-    if (
-        profile.is_featured
-        and sub.status in _ENDED
-        and not await _free_plan_grants(session, "advisor", "featured_listing")
-    ):
-        # EPIC 04: ``featured_listing`` lapses with the subscription that granted it
-        # (an ended subscription, not a past-due one still inside its grace days).
-        profile.is_featured = False
     session.add(profile)
+    if sub.status in _ENDED:
+        # Whatever ``ai_recommended`` the plan granted is gone with it: cached AI
+        # results must not keep naming the advisor (discussion §31).
+        from app.services import seeker_recommendation_service
+
+        await seeker_recommendation_service.clear_for_advisor(session, user.id)
+
+
+async def _follow_price(session: AsyncSession, sub: Subscription) -> None:
+    """Keep ``plan_id`` equal to the price Stripe is now billing.
+
+    This is how a scheduled downgrade lands: at the period end the schedule moves
+    the subscription onto the cheaper price, the event arrives with that price, and
+    the plan, the perk snapshot and the pending-change fields follow. A plan switch
+    made in the Billing Portal lands the same way. An ended subscription has nothing
+    pending any more either.
+    """
+    if sub.status in _ENDED:
+        _clear_pending(sub)
+        return
+    if not sub.stripe_price_id:
+        return
+    billed = (
+        await session.execute(
+            select(PricingPlan).where(PricingPlan.stripe_price_id == sub.stripe_price_id)
+        )
+    ).scalar_one_or_none()
+    if billed is None or billed.id == sub.plan_id:
+        return
+    sub.plan_id = billed.id
+    await snapshot_features(session, sub, billed)
+    if sub.scheduled_plan_id == billed.id or sub.scheduled_plan_id is None:
+        _clear_pending(sub)
 
 
 async def _find_by_stripe_id(session: AsyncSession, stripe_sub_id: str) -> Subscription | None:
@@ -380,8 +443,11 @@ async def on_checkout_completed(session: AsyncSession, cs: Any, settings: Settin
         log.warning("subscription_checkout_missing_metadata", session_id=str(_get(cs, "id")))
         return
     await _init_stripe(session, settings)
+    # ``latest_invoice`` too: the first charge is known at this moment, and writing
+    # it now means the admin never sees an Active subscriber beside $0 for the minute
+    # until ``invoice.paid`` lands (QA BUG15).
     stripe_sub = await stripe.Subscription.retrieve_async(
-        str(stripe_sub_id), expand=["default_payment_method"]
+        str(stripe_sub_id), expand=["default_payment_method", "latest_invoice"]
     )
     sub = await _find_by_stripe_id(session, str(stripe_sub_id))
     if sub is None:
@@ -393,12 +459,25 @@ async def on_checkout_completed(session: AsyncSession, cs: Any, settings: Settin
         )
         session.add(sub)
     _apply_stripe_subscription(sub, stripe_sub)
+    plan = await session.get(PricingPlan, sub.plan_id)
+    if plan is not None:
+        await snapshot_features(session, sub, plan)
     customer = _get(cs, "customer")
     if customer:
         user = await session.get(User, sub.user_id)
         if user is not None and not user.stripe_customer_id:
             user.stripe_customer_id = str(customer)
             session.add(user)
+    await _acknowledge_plan_choice(session, sub.user_id)
+    await session.flush()
+    latest = _get(stripe_sub, "latest_invoice")
+    if (
+        latest is not None
+        and not isinstance(latest, str)
+        and _get(latest, "id")
+        and str(_get(latest, "status") or "") == "paid"
+    ):
+        await _upsert_invoice_row(session, sub, latest)
     await _sync_advisor_flag(session, sub)
     await session.flush()
 
@@ -420,12 +499,19 @@ async def on_subscription_event(session: AsyncSession, stripe_sub: Any, settings
         )
         session.add(sub)
     was = sub.status
+    chose_to_end = _has_pending_change(sub)
     _apply_stripe_subscription(sub, stripe_sub)
+    await _follow_price(session, sub)
     pm = _get(stripe_sub, "default_payment_method")
     if isinstance(pm, str):
         await _refresh_card(session, sub, pm, settings)
     if sub.status == SubscriptionStatus.canceled and was != SubscriptionStatus.canceled:
-        if sub.access_until is None and sub.current_period_end is not None:
+        if chose_to_end:
+            # The subscriber scheduled this ending themselves (cancel, or the free
+            # plan): Stripe ends it at the period end, and the free plan applies
+            # from that moment. No grace days on a chosen ending.
+            sub.access_until = datetime.now(UTC)
+        elif sub.access_until is None and sub.current_period_end is not None:
             sub.access_until = sub.current_period_end
         await notification_service.notify(
             session,
@@ -533,9 +619,7 @@ def _invoice_description(lines: list[Any], amount: Decimal) -> str | None:
     return str(_get(lines[0], "description") or "") or None
 
 
-async def _upsert_invoice_row(
-    session: AsyncSession, sub: Subscription, invoice: Any
-) -> Decimal:
+async def _upsert_invoice_row(session: AsyncSession, sub: Subscription, invoice: Any) -> Decimal:
     """Write (or refresh) one Billing History row. Returns the amount paid.
 
     Deliberately silent: the webhook handler adds the notification and email on top,
@@ -583,9 +667,7 @@ async def _upsert_invoice_row(
     return amount
 
 
-async def reconcile_invoices(
-    session: AsyncSession, sub: Subscription, settings: Settings
-) -> None:
+async def reconcile_invoices(session: AsyncSession, sub: Subscription, settings: Settings) -> None:
     """Rebuild Billing History from Stripe while we hold nothing for this subscription.
 
     A webhook that was missed, deduped or mishandled leaves the subscriber looking at
@@ -637,7 +719,13 @@ async def on_invoice_paid(session: AsyncSession, invoice: Any, settings: Setting
     period_end = _ts(_get(invoice, "period_end"))
     lines = _get(_get(invoice, "lines"), "data") or []
     billing_line = next((line for line in lines if not _is_proration_line(line)), None)
-    if billing_line is not None:
+    reason = str(_get(invoice, "billing_reason") or "")
+    if reason and reason not in ("subscription_create", "subscription_cycle"):
+        # A one-off invoice (the flat upgrade difference is ``manual``) carries its own
+        # instant as its period; writing that in would reset metering and the renewal.
+        billing_line = None
+        period_start = period_end = None
+    elif billing_line is not None:
         lp = _get(billing_line, "period")
         period_start = _ts(_get(lp, "start")) or period_start
         period_end = _ts(_get(lp, "end")) or period_end
@@ -651,10 +739,18 @@ async def on_invoice_paid(session: AsyncSession, invoice: Any, settings: Setting
         period_start = period_end = None
     first_invoice = sub.status != SubscriptionStatus.active
     sub.status = SubscriptionStatus.active
+    previous_start = _utc(sub.current_period_start)
+    renewed = bool(period_start and previous_start and period_start > previous_start)
     if period_start:
         sub.current_period_start = period_start
     if period_end:
         sub.current_period_end = period_end
+    if renewed:
+        # A new period starts on the plan as it is configured today (QA BUG21: edits
+        # reach existing subscribers at renewal, never mid-period).
+        plan_now = await session.get(PricingPlan, sub.plan_id)
+        if plan_now is not None:
+            await snapshot_features(session, sub, plan_now)
     config = await payment_config_service.get_config(session)
     grace = timedelta(days=getattr(config, "subscription_grace_days", 3))
     if sub.current_period_end is not None:
@@ -821,25 +917,170 @@ async def _require_stripe_sub(session: AsyncSession, user: User) -> Subscription
     return sub
 
 
-async def cancel(
-    session: AsyncSession, user: User, settings: Settings, *, at_period_end: bool = True
+def _has_pending_change(sub: Subscription) -> bool:
+    return sub.scheduled_plan_id is not None or bool(sub.cancel_at_period_end)
+
+
+def _clear_pending(sub: Subscription) -> None:
+    sub.scheduled_plan_id = None
+    sub.scheduled_change_at = None
+    sub.stripe_schedule_id = None
+
+
+async def _release_schedule(sub: Subscription) -> None:
+    """Detach the Stripe schedule, leaving the subscription on its current phase."""
+    if not sub.stripe_schedule_id:
+        return
+    try:
+        await stripe.SubscriptionSchedule.release_async(str(sub.stripe_schedule_id))
+    except stripe.InvalidRequestError as exc:
+        # Already released or completed: the subscription is exactly where we want it.
+        log.info("schedule_release_noop", schedule_id=sub.stripe_schedule_id, error=str(exc)[:200])
+    sub.stripe_schedule_id = None
+
+
+_LIVE_SCHEDULE_STATUSES = ("not_started", "active")
+
+
+def _plan_change_failed(exc: Exception, **ctx: Any) -> AppError:
+    log.warning("plan_change_failed", error=str(exc)[:300], **ctx)
+    return AppError(
+        "Your plan could not be changed. Check your payment method and try again.",
+        code="plan_change_failed",
+    )
+
+
+async def _usable_schedule(sub: Subscription) -> str:
+    """A subscription schedule Stripe will let us update, creating one when needed.
+
+    Stripe replays an idempotent create for 24 hours, so a schedule that was released
+    (undo, or an upgrade over a pending downgrade) came back from the next create with
+    the old key and the phase update was refused — found against real Stripe on
+    2026-10-08. Every create therefore carries a fresh key, and a schedule that is not
+    ``not_started`` / ``active`` — stored or just returned — is thrown away.
+    """
+    if sub.stripe_schedule_id:
+        try:
+            existing = await stripe.SubscriptionSchedule.retrieve_async(str(sub.stripe_schedule_id))
+            if str(_get(existing, "status") or "") in _LIVE_SCHEDULE_STATUSES:
+                return str(sub.stripe_schedule_id)
+        except stripe.InvalidRequestError:
+            pass  # gone on Stripe's side; make a new one
+        sub.stripe_schedule_id = None
+    for _attempt in range(2):
+        schedule = await stripe.SubscriptionSchedule.create_async(
+            from_subscription=str(sub.stripe_subscription_id),
+            idempotency_key=f"subsched_{sub.id}_{uuid.uuid4().hex[:12]}",
+        )
+        status = str(_get(schedule, "status") or "not_started")
+        if status in _LIVE_SCHEDULE_STATUSES:
+            sub.stripe_schedule_id = str(_get(schedule, "id") or "")
+            return sub.stripe_schedule_id
+        log.warning(
+            "schedule_create_returned_dead",
+            schedule_id=str(_get(schedule, "id") or ""),
+            status=status,
+        )
+    raise AppError("Stripe did not return a usable schedule", code="plan_change_failed")
+
+
+async def _undo_pending(session: AsyncSession, sub: Subscription) -> Subscription:
+    """The subscriber chose their current plan again: keep it, keep billing."""
+    try:
+        await _release_schedule(sub)
+        if sub.cancel_at_period_end:
+            await stripe.Subscription.modify_async(
+                str(sub.stripe_subscription_id),
+                cancel_at_period_end=False,
+                idempotency_key=f"subresume_{sub.id}_{sub.current_period_end}",
+            )
+            sub.cancel_at_period_end = False
+    except stripe.StripeError as exc:
+        raise _plan_change_failed(exc, subscription_id=str(sub.id), step="undo") from exc
+    _clear_pending(sub)
+    session.add(sub)
+    await session.flush()
+    return sub
+
+
+async def _schedule_free(
+    session: AsyncSession, sub: Subscription, free: PricingPlan | None
 ) -> Subscription:
-    sub = await _require_stripe_sub(session, user)
-    await _init_stripe(session, settings)
-    if at_period_end:
-        result = await stripe.Subscription.modify_async(
+    """Cancel = a scheduled move to the free plan at the period end."""
+    try:
+        await _release_schedule(sub)
+        await stripe.Subscription.modify_async(
             str(sub.stripe_subscription_id),
             cancel_at_period_end=True,
             idempotency_key=f"subcancel_{sub.id}_{sub.current_period_end}",
         )
-        sub.cancel_at_period_end = bool(_get(result, "cancel_at_period_end", True))
-    else:
-        result = await stripe.Subscription.cancel_async(str(sub.stripe_subscription_id))
-        _apply_stripe_subscription(sub, result)
-        sub.status = SubscriptionStatus.canceled
+    except stripe.StripeError as exc:
+        raise _plan_change_failed(exc, subscription_id=str(sub.id), step="cancel") from exc
+    # The call did not raise, so Stripe holds the flag; it is not re-read from the
+    # response because some SDK paths echo the pre-change object.
+    sub.cancel_at_period_end = True
+    sub.scheduled_plan_id = free.id if free is not None else None
+    sub.scheduled_change_at = sub.current_period_end
     session.add(sub)
     await session.flush()
     return sub
+
+
+async def _schedule_downgrade(
+    session: AsyncSession, sub: Subscription, plan: PricingPlan
+) -> Subscription:
+    """A cheaper plan starts at the period end, through a Stripe subscription schedule.
+
+    Stripe performs the switch itself, so nothing here depends on the background
+    scheduler; the rollover event (``customer.subscription.updated`` carrying the new
+    price) moves ``plan_id`` and clears the pending change. Nothing is written locally
+    until Stripe has accepted the schedule.
+    """
+    start = int(sub.current_period_start.timestamp()) if sub.current_period_start else None
+    end = int(sub.current_period_end.timestamp()) if sub.current_period_end else None
+    current_phase: dict[str, Any] = {"items": [{"price": sub.stripe_price_id, "quantity": 1}]}
+    if start is not None:
+        current_phase["start_date"] = start
+    if end is not None:
+        current_phase["end_date"] = end
+    next_phase: dict[str, Any] = {"items": [{"price": plan.stripe_price_id, "quantity": 1}]}
+    phases: Any = [current_phase, next_phase]
+    try:
+        if sub.cancel_at_period_end:
+            # A pending cancel is replaced by the downgrade: Stripe must keep billing.
+            await stripe.Subscription.modify_async(
+                str(sub.stripe_subscription_id),
+                cancel_at_period_end=False,
+                idempotency_key=f"subresume_{sub.id}_{sub.current_period_end}",
+            )
+            sub.cancel_at_period_end = False
+        schedule_id = await _usable_schedule(sub)
+        await stripe.SubscriptionSchedule.modify_async(
+            schedule_id,
+            phases=phases,
+            end_behavior="release",
+            metadata={"user_id": str(sub.user_id), "plan_id": str(plan.id)},
+        )
+    except stripe.StripeError as exc:
+        raise _plan_change_failed(
+            exc, subscription_id=str(sub.id), plan_id=str(plan.id), step="downgrade"
+        ) from exc
+    sub.scheduled_plan_id = plan.id
+    sub.scheduled_change_at = sub.current_period_end
+    session.add(sub)
+    await session.flush()
+    return sub
+
+
+async def cancel(session: AsyncSession, user: User, settings: Settings) -> Subscription:
+    """Schedule the move to the free plan at the period end; never an immediate cancel."""
+    from app.services import entitlement_service, pricing_plan_service
+
+    sub = await _require_stripe_sub(session, user)
+    await _init_stripe(session, settings)
+    audience = entitlement_service.audience_of(user) or "seeker"
+    free = await pricing_plan_service.free_plan_for(session, audience)
+    return await _schedule_free(session, sub, free)
 
 
 async def portal_url(session: AsyncSession, user: User, settings: Settings) -> str:
@@ -865,38 +1106,63 @@ async def change_plan(
 ) -> Subscription:
     sub = await _require_stripe_sub(session, user)
     plan = await _plan_for_purchase(session, user, plan_id)
-    if plan.id == sub.plan_id:
-        raise AppError("You are already on this plan", code="already_subscribed")
     await _init_stripe(session, settings)
+    if plan.id == sub.plan_id:
+        if _has_pending_change(sub):
+            # "Keep my plan": the pending downgrade or cancel is undone.
+            return await _undo_pending(session, sub)
+        raise AppError("You are already on this plan", code="already_subscribed")
     if Decimal(str(plan.price_usd)) <= 0 or not plan.stripe_price_id:
-        # Downgrade to free: the paid subscription ends at period end.
-        return await cancel(session, user, settings, at_period_end=True)
+        # The free plan: the paid subscription ends at the period end.
+        return await _schedule_free(session, sub, plan)
     if await _is_downgrade(session, sub, plan):
-        # Client rule (2026-09-28): no mid-period downgrades. The subscriber keeps
-        # what they paid for until the period ends, then chooses a plan afresh —
-        # which also means entitlements never drop underneath someone's usage.
-        raise AppError(
-            "You can move to a lower plan once your current subscription ends",
-            code="downgrade_not_allowed",
-        )
+        # PM rule (2026-10-08): a cheaper plan is scheduled for the period end. The
+        # subscriber keeps what they paid for until then, so entitlements never drop
+        # underneath someone's usage mid-period.
+        return await _schedule_downgrade(session, sub, plan)
+    # An upgrade overrides whatever was pending: it is bought now and live at once.
+    await _release_schedule(sub)
     current = await stripe.Subscription.retrieve_async(str(sub.stripe_subscription_id))
     items = _get(_get(current, "items"), "data") or []
     if not items:
         raise AppError("Subscription has no billable item", code="invalid_state")
+    customer_id = str(_get(current, "customer") or user.stripe_customer_id or "")
     try:
+        # PM rule (2026-10-09): an upgrade costs the flat difference between the two
+        # plan prices, charged today — never Stripe's time-based proration. The money
+        # moves first; only a paid difference switches the plan.
+        difference = await upgrade_difference_cents(session, sub, plan)
+        if difference > 0:
+            await stripe.InvoiceItem.create_async(
+                customer=customer_id,
+                subscription=str(sub.stripe_subscription_id),
+                amount=difference,
+                currency=plan.currency or "usd",
+                description=f"Upgrade to {plan.name}",
+                metadata={"gj_kind": "upgrade_difference", "plan_id": str(plan.id)},
+                idempotency_key=f"subupgrade_item_{sub.id}_{plan.id}_{plan.price_version}",
+            )
+            invoice = await stripe.Invoice.create_async(
+                customer=customer_id,
+                subscription=str(sub.stripe_subscription_id),
+                auto_advance=False,
+                description=f"Upgrade to {plan.name}",
+                metadata={"gj_kind": "upgrade_difference", "plan_id": str(plan.id)},
+                idempotency_key=f"subupgrade_inv_{sub.id}_{plan.id}_{plan.price_version}",
+            )
+            await stripe.Invoice.pay_async(str(_get(invoice, "id")))
         result = await stripe.Subscription.modify_async(
             str(sub.stripe_subscription_id),
             items=[{"id": str(_get(items[0], "id")), "price": plan.stripe_price_id}],
-            # Bill the prorated difference now: the upgrade is live immediately, so the
-            # money moves immediately too. ``create_prorations`` would defer it to the
-            # next invoice and make "Total due today" a lie.
-            proration_behavior="always_invoice",
+            # The difference was just charged in full; the renewal date and the
+            # billing period must not move, and nothing is prorated.
+            proration_behavior="none",
+            cancel_at_period_end=False,
             metadata={"user_id": str(user.id), "plan_id": str(plan.id)},
             idempotency_key=f"subchange_{sub.id}_{plan.id}_{plan.price_version}",
         )
     except stripe.StripeError as exc:
-        # ``always_invoice`` bills during this call, so a declined card surfaces here
-        # rather than on a later invoice. Left uncaught it would be a 500.
+        # A declined card fails on ``Invoice.pay``, before anything is switched.
         log.warning(
             "plan_change_failed",
             user_id=str(user.id),
@@ -909,9 +1175,24 @@ async def change_plan(
         ) from exc
     sub.plan_id = plan.id
     _apply_stripe_subscription(sub, result)
+    _clear_pending(sub)
+    await snapshot_features(session, sub, plan)
     session.add(sub)
     await session.flush()
     return sub
+
+
+async def upgrade_difference_cents(
+    session: AsyncSession, sub: Subscription, plan: PricingPlan
+) -> int:
+    """What an upgrade costs today: the new plan's price minus the price the subscriber
+    signed up for (the snapshot, else the current plan's price), in cents, never below 0."""
+    current: Decimal | None = Decimal(str(sub.price_usd)) if sub.price_usd is not None else None
+    if current is None:
+        current_plan = await session.get(PricingPlan, sub.plan_id)
+        current = Decimal(str(current_plan.price_usd)) if current_plan is not None else Decimal(0)
+    diff = Decimal(str(plan.price_usd)) - current
+    return max(0, int((diff * 100).to_integral_value()))
 
 
 def _is_proration_line(line: Any) -> bool:
@@ -938,55 +1219,30 @@ async def preview_change(
         return ChangePlanPreviewRead(
             plan=brief,
             amount_due_today_usd=Decimal("0"),
-            note="Your paid plan ends at the period end.",
+            note="Your paid plan stays active until the period ends, then you move to Free.",
             direction="cancel",
+            effective_at=sub.current_period_end,
         )
     if await _is_downgrade(session, sub, plan):
         return ChangePlanPreviewRead(
             plan=brief,
             amount_due_today_usd=Decimal("0"),
             note=(
-                "You keep your current plan until it ends, then you can choose this one. "
-                "Cancel your subscription to stop it renewing."
+                "Nothing to pay today. You keep your current plan until the period ends, "
+                "then this plan starts."
             ),
             direction="downgrade",
+            effective_at=sub.current_period_end,
         )
-    await _init_stripe(session, settings)
-    try:
-        current = await stripe.Subscription.retrieve_async(str(sub.stripe_subscription_id))
-        items = _get(_get(current, "items"), "data") or []
-        preview = await stripe.Invoice.create_preview_async(
-            customer=str(_get(current, "customer")),
-            subscription=str(sub.stripe_subscription_id),
-            subscription_details={
-                "items": [{"id": str(_get(items[0], "id")), "price": plan.stripe_price_id}],
-                "proration_behavior": "always_invoice",
-            },
-        )
-        # Only the proration lines are what this change costs: under some
-        # proration behaviours ``amount_due`` also carries the next period's charge.
-        lines = _get(_get(preview, "lines"), "data") or []
-        prorations = [line for line in lines if _is_proration_line(line)]
-        cents = (
-            sum(int(_get(line, "amount", 0) or 0) for line in prorations)
-            if prorations
-            # Nothing recognisable: trust Stripe's total rather than show 0.00.
-            else int(_get(preview, "amount_due", 0) or 0)
-        )
-        return ChangePlanPreviewRead(
-            plan=brief,
-            amount_due_today_usd=Decimal(cents) / Decimal(100),
-            note="Prorated for the rest of the current period.",
-            direction="upgrade",
-        )
-    except stripe.StripeError as exc:
-        log.warning("change_plan_preview_failed", error=str(exc)[:200])
-        return ChangePlanPreviewRead(
-            plan=brief,
-            amount_due_today_usd=None,
-            note="Stripe will prorate the change.",
-            direction="upgrade",
-        )
+    # PM rule (2026-10-09): the flat difference between the two prices, no proration,
+    # so no Stripe preview is needed and the figure never depends on the day.
+    cents = await upgrade_difference_cents(session, sub, plan)
+    return ChangePlanPreviewRead(
+        plan=brief,
+        amount_due_today_usd=Decimal(cents) / Decimal(100),
+        note="You pay the difference today and your new plan starts immediately.",
+        direction="upgrade",
+    )
 
 
 # ── reads ────────────────────────────────────────────────────────────────────
@@ -1041,6 +1297,9 @@ async def read(session: AsyncSession, sub: Subscription) -> SubscriptionRead:
         if sub.payment_method_last4
         else None
     )
+    scheduled = (
+        await session.get(PricingPlan, sub.scheduled_plan_id) if sub.scheduled_plan_id else None
+    )
     return SubscriptionRead(
         id=sub.id,
         plan=plan_brief(plan),
@@ -1052,6 +1311,8 @@ async def read(session: AsyncSession, sub: Subscription) -> SubscriptionRead:
         access_until=sub.access_until,
         payment_method=pm,
         latest_invoice=invoice_read(latest) if latest else None,
+        scheduled_plan=plan_brief(scheduled) if scheduled else None,
+        scheduled_change_at=sub.scheduled_change_at if scheduled else None,
     )
 
 
@@ -1163,6 +1424,7 @@ def admin_read(
     plan: PricingPlan,
     total_charged: Decimal | float | int | None = None,
     grace_days: int = 3,
+    scheduled_plan_name: str | None = None,
 ) -> AdminSubscriptionRead:
     """One row for the admin list.
 
@@ -1187,11 +1449,14 @@ def admin_read(
         audience=plan.audience.value,
         plan_id=plan.id,
         plan_name=plan.name,
-        price_usd=Decimal(str(plan.price_usd)),
+        price_usd=Decimal(str(sub.price_usd if sub.price_usd is not None else plan.price_usd)),
         total_charged_usd=Decimal(str(total_charged or 0)),
+        plan_version=int(sub.plan_version or 1),
         status=status,
         current_period_end=sub.current_period_end,
         cancel_at_period_end=sub.cancel_at_period_end,
+        scheduled_plan_name=scheduled_plan_name,
+        scheduled_change_at=sub.scheduled_change_at,
         stripe_subscription_id=sub.stripe_subscription_id,
         created_at=sub.created_at,
     )
@@ -1252,9 +1517,7 @@ def _period_bounds(period: str, now: datetime) -> tuple[datetime | None, datetim
         return start, start + timedelta(days=1)
     if period == "monthly":
         start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        end = (start + timedelta(days=32)).replace(
-            day=1, hour=0, minute=0, second=0, microsecond=0
-        )
+        end = (start + timedelta(days=32)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         return start, end
     if period == "yearly":
         start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -1402,7 +1665,7 @@ async def _repair_missing_invoices(session: AsyncSession, settings: Settings) ->
                 subscription_id=str(sub.id),
                 error=str(exc)[:200],
             )
-            return
+            continue
 
 
 async def admin_finance_summary(

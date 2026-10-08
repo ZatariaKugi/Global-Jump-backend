@@ -4,7 +4,7 @@ tabs (Overview, Session History, Earnings, Reviews)."""
 from __future__ import annotations
 
 import uuid
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from sqlalchemy import Select, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,9 +17,9 @@ from app.core.file_storage import resolve_media_url, resolve_url
 from app.core.money import as_float
 from app.models.advisor_credential import AdvisorCredential, CredentialStatus
 from app.models.advisor_profile import AdvisorProfile, AdvisorVisaSpecialization
-from app.models.booking import Booking, BookingStatus
+from app.models.booking import Booking, BookingStatus, PaymentStatus
 from app.models.seeker_profile import SeekerProfile
-from app.models.transaction import Transaction, TransactionStatus
+from app.models.transaction import Transaction
 from app.models.user import User, UserRole, VerificationStatus
 from app.models.visa_type import VisaType
 from app.schemas.advisor_admin import (
@@ -33,12 +33,26 @@ from app.schemas.advisor_admin import (
 from app.schemas.advisor_credential import AdvisorCredentialRead
 from app.schemas.advisor_profile import LanguageEntry
 from app.services import (
+    advisor_earnings,
     booking_service,
     payment_config_service,
     payment_service,
     review_service,
     user_admin_service,
 )
+
+# "Total Sessions" counts consultations that were paid for and went ahead (QA doc,
+# phase-2 bug 4): paid, and confirmed or completed. Pending, rejected, cancelled,
+# refunded and no-show rows are out, as is a paid request the advisor never accepted.
+COUNTED_SESSION_STATUSES = (BookingStatus.confirmed, BookingStatus.completed)
+
+
+def counted_session_filters() -> list[Any]:
+    return [
+        Booking.payment_status == PaymentStatus.paid,
+        Booking.status.in_(COUNTED_SESSION_STATUSES),
+    ]
+
 
 _LanguageProficiency = Literal["basic", "conversational", "fluent", "native"]
 
@@ -120,7 +134,7 @@ async def build_list_read(
     session_rows = (
         await session.execute(
             select(Booking.advisor_id, func.count())
-            .where(Booking.advisor_id.in_(ids))
+            .where(Booking.advisor_id.in_(ids), *counted_session_filters())
             .group_by(Booking.advisor_id)
         )
     ).all()
@@ -134,13 +148,10 @@ async def build_list_read(
         await session.execute(
             select(
                 Booking.advisor_id,
-                func.coalesce(func.sum(Transaction.advisor_payout_usd), 0.0),
+                func.coalesce(func.sum(advisor_earnings.ADVISOR_NET_EARNINGS), 0.0),
             )
             .join(Transaction, Transaction.booking_id == Booking.id)
-            .where(
-                Booking.advisor_id.in_(ids),
-                Transaction.status == TransactionStatus.succeeded,
-            )
+            .where(Booking.advisor_id.in_(ids), *advisor_earnings.advisor_earnings_filters())
             .group_by(Booking.advisor_id)
         )
     ).all()
@@ -222,7 +233,7 @@ async def get_advisor_detail(
     total_sessions, completed_sessions = (
         await session.execute(
             select(
-                func.count(Booking.id),
+                func.count(Booking.id).filter(*counted_session_filters()),
                 func.count(Booking.id).filter(Booking.status == BookingStatus.completed),
             ).where(Booking.advisor_id == advisor_id)
         )
@@ -233,12 +244,11 @@ async def get_advisor_detail(
     total_earned_usd = as_float(
         (
             await session.execute(
-                select(func.coalesce(func.sum(Transaction.advisor_payout_usd), 0))
+                select(func.coalesce(func.sum(advisor_earnings.ADVISOR_NET_EARNINGS), 0))
                 .join(Booking, Booking.id == Transaction.booking_id)
                 .where(
                     Booking.advisor_id == advisor_id,
-                    Transaction.status == TransactionStatus.succeeded,
-                    Transaction.is_archived.is_(False),
+                    *advisor_earnings.advisor_earnings_filters(),
                 )
             )
         ).scalar_one()
@@ -472,7 +482,7 @@ async def _build_earning_rows(
                 created_at=txn.created_at,
                 amount_paid=round(float(txn.amount_usd), 2),
                 platform_fee=round(float(txn.commission_usd), 2),
-                advisor_earnings=round(float(txn.advisor_payout_usd), 2),
+                advisor_earnings=advisor_earnings.advisor_net_earnings(txn),
                 status=payment_service.display_status(txn),
             )
         )

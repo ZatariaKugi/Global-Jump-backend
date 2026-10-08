@@ -49,5 +49,8 @@ class UserRead(BaseModel):
     is_active: bool
     is_email_verified: bool
     profile_photo_url: str | None = None
+    # True until a seeker/advisor has chosen a plan (the free one, or paid). The web
+    # client keeps them on the plans page while it is true. Admins: always false.
+    plan_choice_required: bool = False
     created_at: datetime
     updated_at: datetime

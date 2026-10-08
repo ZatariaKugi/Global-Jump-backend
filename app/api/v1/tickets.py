@@ -36,14 +36,11 @@ async def create_my_ticket(
     seeker or advisor on that booking); its session context is snapshotted onto
     the ticket. The ``description`` becomes the opening thread message.
     """
-    # EPIC 04: ``priority_support`` (seeker or advisor plan) opens the ticket as high.
-    priority = (
-        TicketPriority.high
-        if await entitlement_service.granted(session, current_user, "priority_support")
-        else TicketPriority.medium
-    )
+    # Support is a plan perk for seekers and advisors (PM, 2026-10-08): the whole
+    # module locks without it. There is no priority tier any more.
+    await entitlement_service.check(session, current_user, "support")
     ticket = await support_ticket_service.create_for_user(
-        session, body, current_user, priority=priority
+        session, body, current_user, priority=TicketPriority.medium
     )
     return ResponseEnvelope[TicketRead](
         data=await support_ticket_service.ticket_read(session, ticket, settings),
@@ -68,6 +65,7 @@ async def list_my_tickets(
     """
     from app.core.exceptions import AppError
 
+    await entitlement_service.check(session, current_user, "support")
     try:
         status_filter = support_ticket_service.coerce_status_filter(status)
     except ValueError as exc:
@@ -91,6 +89,7 @@ async def get_my_ticket(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[TicketRead]:
+    await entitlement_service.check(session, current_user, "support")
     ticket = await support_ticket_service.get_for_user(session, ticket_id, current_user.id)
     return ResponseEnvelope[TicketRead](
         data=await support_ticket_service.ticket_read(
@@ -112,6 +111,7 @@ async def list_my_ticket_messages(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[TicketMessageRead]]:
+    await entitlement_service.check(session, current_user, "support")
     ticket = await support_ticket_service.get_for_user(session, ticket_id, current_user.id)
     stmt = ticket_message_service.list_messages_stmt(ticket.id)
     messages, total = await paginate(session, stmt, params)
@@ -138,6 +138,7 @@ async def send_my_ticket_message(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[TicketMessageRead]:
+    await entitlement_service.check(session, current_user, "support")
     ticket = await support_ticket_service.get_for_user(session, ticket_id, current_user.id)
     support_ticket_service.assert_repliable(ticket)
 

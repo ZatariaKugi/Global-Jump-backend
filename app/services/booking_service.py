@@ -48,7 +48,6 @@ from app.services import (
     booking_document_service,
     booking_meeting_service,
     booking_note_service,
-    entitlement_service,
     notification_service,
     payment_config_service,
     payment_service,
@@ -569,10 +568,8 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
 
     await _resolve_advisor(session, data.advisor_id)
     await assert_advisor_payable(session, data.advisor_id)
-    # Decision D5: the plan's "consultations" limit is an enforced quota for seeker
-    # bookings (free plan value applies without a subscription). Never for advisor-
-    # created bookings.
-    await entitlement_service.consume(session, seeker, "consultations")
+    # Booking is a core platform feature (PM, 2026-10-08): no plan quota applies to
+    # the marketplace transaction itself, for seekers or advisors.
     service = await _resolve_service(session, data.advisor_id, service_id=data.service_id)
 
     if data.scheduled_start.tzinfo is None and data.timezone:
@@ -629,11 +626,7 @@ async def create_by_advisor(
     if seeker is None or seeker.role != UserRole.seeker or not seeker.is_active:
         raise NotFoundError("Client not found")
 
-    # EPIC 04: the advisor plan's ``client_bookings`` limit (a plan quota on how
-    # many clients the advisor may book per period). Nothing here is a payment:
-    # advisor-created bookings stay free for the seeker.
-    await entitlement_service.consume(session, advisor, "client_bookings")
-
+    # Advisor-created bookings are free for the seeker and never a plan quota.
     service = await _assert_service_offered(session, advisor.id, service_id=data.service_id)
     duration_minutes = service.duration_minutes or data.duration_minutes
 
@@ -963,9 +956,10 @@ async def cancel(
     booking.updated_by = actor_id
     session.add(booking)
     await session.flush()
-    refund_kind = "advisor_cancel" if actor_id == booking.advisor_id else "admin_full"
+    # Only the advisor reaches this point (seekers are refused above, admins have no
+    # cancel path: business decision, 2026-10-07), so the refund kind is fixed.
     refund_amount = await payment_service.auto_refund_booking_if_paid(
-        session, booking, actor_id, reason, settings, kind=refund_kind
+        session, booking, actor_id, reason, settings, kind="advisor_cancel"
     )
     await booking_meeting_service.remove_meeting(session, booking, settings)
     await _notify_booking(

@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Query
 
-from app.api.deps import CurrentUser, RequestIdDep
+from app.api.deps import OptionalPrincipal, RequestIdDep
 from app.db.session import SessionDep
 from app.schemas.pricing_plan import PricingPlanPublicRead
 from app.schemas.response import Meta, ResponseEnvelope
@@ -17,15 +17,18 @@ router = APIRouter(prefix="/pricing-plans", tags=["pricing-plans"])
 
 @router.get("", response_model=ResponseEnvelope[list[PricingPlanPublicRead]])
 async def list_pricing_plans(
-    current_user: CurrentUser,
+    principal: OptionalPrincipal,
     session: SessionDep,
     request_id: RequestIdDep,
     audience: Annotated[Literal["seeker", "advisor"] | None, Query()] = None,
 ) -> ResponseEnvelope[list[PricingPlanPublicRead]]:
-    """Active plans for one audience (defaults to the caller's role). No Stripe ids."""
-    resolved = audience or (
-        current_user.role.value if current_user.role.value in ("seeker", "advisor") else "seeker"
-    )
+    """Active plans for one audience (defaults to the caller's role, else seeker).
+
+    Public: the landing page shows the admin's plans to visitors (QA BUG10).
+    No Stripe ids.
+    """
+    role = principal.role if principal is not None else None
+    resolved = audience or (role if role in ("seeker", "advisor") else "seeker")
     plans = await pricing_plan_service.list_public(session, resolved)
     return ResponseEnvelope[list[PricingPlanPublicRead]](
         data=[pricing_plan_service.public_read(p) for p in plans],

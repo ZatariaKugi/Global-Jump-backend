@@ -16,6 +16,8 @@ from typing import Any
 import stripe
 import structlog
 from sqlalchemy import Select, func, select
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -49,20 +51,14 @@ log = structlog.get_logger()
 # each key; the admin decides per plan whether a key is included and with what value.
 CATALOG: tuple[dict[str, object], ...] = (
     {
+        # Counted when an assessment is COMPLETED (results and insights shown), not
+        # when it is started; the AI narrative is part of the assessment, not a perk.
         "key": "ai_assessments",
         "label": "AI assessments per month",
         "module": "ai_assessment",
         "audience": "seeker",
         "limit_type": "number",
         "display_order": 10,
-    },
-    {
-        "key": "ai_insights",
-        "label": "AI insights on results",
-        "module": "ai_assessment",
-        "audience": "seeker",
-        "limit_type": "bool",
-        "display_order": 20,
     },
     {
         "key": "assessment_history",
@@ -81,14 +77,6 @@ CATALOG: tuple[dict[str, object], ...] = (
         "display_order": 40,
     },
     {
-        "key": "find_advisor",
-        "label": "Find Advisor search",
-        "module": "advisors",
-        "audience": "seeker",
-        "limit_type": "bool",
-        "display_order": 50,
-    },
-    {
         "key": "bookmarks",
         "label": "Bookmarked advisors",
         "module": "bookmarks",
@@ -97,24 +85,16 @@ CATALOG: tuple[dict[str, object], ...] = (
         "display_order": 60,
     },
     {
-        "key": "consultations",
-        "label": "Consultations per month",
-        "module": "bookings",
-        "audience": "seeker",
-        "limit_type": "number",
-        "display_order": 70,
-    },
-    {
         "key": "chats",
-        "label": "Chat with advisors",
+        "label": "Chat",
         "module": "conversations",
-        "audience": "seeker",
+        "audience": "both",
         "limit_type": "bool",
         "display_order": 80,
     },
     {
         "key": "documents",
-        "label": "Document uploads",
+        "label": "Documents",
         "module": "documents",
         "audience": "seeker",
         "limit_type": "number",
@@ -129,8 +109,8 @@ CATALOG: tuple[dict[str, object], ...] = (
         "display_order": 100,
     },
     {
-        "key": "priority_support",
-        "label": "Priority support",
+        "key": "support",
+        "label": "Support",
         "module": "support",
         "audience": "both",
         "limit_type": "bool",
@@ -145,22 +125,45 @@ CATALOG: tuple[dict[str, object], ...] = (
         "display_order": 120,
     },
     {
-        "key": "featured_listing",
-        "label": "Featured listing",
+        "key": "profile_edits",
+        "label": "Profile edits",
         "module": "advisors",
         "audience": "advisor",
-        "limit_type": "bool",
-        "display_order": 130,
+        "limit_type": "number",
+        "display_order": 125,
     },
     {
-        "key": "client_bookings",
-        "label": "Client bookings per month",
-        "module": "bookings",
+        "key": "ai_recommended",
+        "label": "Appears in AI recommendations",
+        "module": "matching",
         "audience": "advisor",
-        "limit_type": "number",
-        "display_order": 140,
+        "limit_type": "bool",
+        "display_order": 135,
     },
 )
+CATALOG_KEYS: frozenset[str] = frozenset(str(entry["key"]) for entry in CATALOG)
+
+# Keys retired on 2026-10-08. Plans written before then may still carry the old
+# spelling; ``canonical_key`` maps it forward and ``get_catalog`` rewrites the rows.
+RENAMED_KEYS: dict[str, str] = {"priority_support": "support"}
+
+# What the admin can never put behind a plan: the marketplace transaction itself
+# (discussion sections 33-36). Shown read-only in the plan editor.
+CORE_FEATURES: tuple[tuple[str, str], ...] = (
+    ("consultations", "Consultation"),
+    ("bookings", "Booking"),
+    ("appointments", "Appointments"),
+    ("availability", "Availability"),
+    ("booking_management", "Booking management"),
+)
+
+
+def canonical_key(key: str | None) -> str | None:
+    """A stored feature key under its current name."""
+    if key is None:
+        return None
+    return RENAMED_KEYS.get(key, key)
+
 
 _CENT = Decimal("0.01")
 
@@ -174,14 +177,47 @@ def _val(value: object) -> str:
 
 
 async def get_catalog(session: AsyncSession) -> list[PlanFeatureCatalog]:
-    """The seeded catalog; inserts any key the migration seed is missing."""
+    """The seeded catalog, kept equal to ``CATALOG``.
+
+    Inserts any key the migration seed is missing, applies the renames to stored
+    rows, and drops retired keys so an environment migrated from an older catalog
+    never keeps selling a perk the code no longer gates.
+    """
     rows = list((await session.execute(select(PlanFeatureCatalog))).scalars().all())
-    known = {r.key for r in rows}
-    missing = [PlanFeatureCatalog(**entry) for entry in CATALOG if entry["key"] not in known]
-    if missing:
-        session.add_all(missing)
+    changed = False
+    for old, new in RENAMED_KEYS.items():
+        await session.execute(
+            sa_update(PricingPlanFeature)
+            .where(PricingPlanFeature.feature_key == old)
+            .values(feature_key=new)
+        )
+    retired = [r for r in rows if r.key not in CATALOG_KEYS]
+    for r in retired:
+        await session.delete(r)
+        rows.remove(r)
+        changed = True
+    if retired:
+        await session.execute(
+            sa_delete(PricingPlanFeature).where(
+                PricingPlanFeature.feature_key.in_([r.key for r in retired])
+            )
+        )
+    by_key = {r.key: r for r in rows}
+    for entry in CATALOG:
+        key = str(entry["key"])
+        row = by_key.get(key)
+        if row is None:
+            row = PlanFeatureCatalog(**entry)
+            session.add(row)
+            rows.append(row)
+            changed = True
+            continue
+        for field in ("label", "module", "audience", "limit_type", "display_order"):
+            if getattr(row, field) != entry[field]:
+                setattr(row, field, entry[field])
+                changed = True
+    if changed:
         await session.flush()
-        rows.extend(missing)
     rows.sort(key=lambda r: r.display_order)
     return rows
 
@@ -413,6 +449,8 @@ async def create(
 ) -> PricingPlan:
     audience = PlanAudience(data.audience)
     features = await _validate_features(session, audience, data.features)
+    if data.is_default and Decimal(str(data.price_usd)) > 0:
+        raise AppError("Only a free plan can be the default plan", code="default_plan_must_be_free")
     plan = PricingPlan(
         audience=audience,
         name=data.name,
@@ -421,6 +459,7 @@ async def create(
         price_usd=Decimal(str(data.price_usd)).quantize(_CENT),
         billing_interval=BillingInterval(data.billing_interval),
         is_highlighted=data.is_highlighted,
+        is_default=False,
         status=PlanStatus.draft,
         price_version=1,
         created_by=admin_id,
@@ -428,6 +467,8 @@ async def create(
     )
     session.add(plan)
     await session.flush()
+    if data.is_default:
+        await _make_default(session, plan)
     await _sync_to_stripe(session, plan)
     session.add(plan)
     await session.flush()
@@ -465,10 +506,26 @@ async def update(
     if data.features is not None:
         plan.features = await _validate_features(session, plan.audience, data.features)
         text_changed = True
+    if data.is_default is True:
+        new_price = (
+            Decimal(str(fields["price_usd"])) if fields.get("price_usd") is not None else None
+        )
+        if (new_price if new_price is not None else Decimal(str(plan.price_usd))) > 0:
+            raise AppError(
+                "Only a free plan can be the default plan", code="default_plan_must_be_free"
+            )
+        await _make_default(session, plan)
+    elif data.is_default is False and plan.is_default:
+        raise AppError("Mark another free plan as the default first", code="default_plan_in_use")
     plan.updated_by = admin_id
     await session.flush()
 
     if price_changed:
+        if plan.is_default and Decimal(str(fields["price_usd"])) > 0:
+            raise AppError(
+                "The default plan must stay free; mark another plan as the default first",
+                code="default_plan_in_use",
+            )
         old_price_id = plan.stripe_price_id
         plan.price_usd = Decimal(str(fields["price_usd"])).quantize(_CENT)
         plan.price_version = (plan.price_version or 0) + 1
@@ -500,6 +557,18 @@ async def update(
     return plan
 
 
+async def _make_default(session: AsyncSession, plan: PricingPlan) -> None:
+    """Exactly one default per audience: the flag moves, it is never shared."""
+    await session.execute(
+        sa_update(PricingPlan)
+        .where(PricingPlan.audience == plan.audience, PricingPlan.id != plan.id)
+        .values(is_default=False)
+    )
+    plan.is_default = True
+    session.add(plan)
+    await session.flush()
+
+
 async def _archive_price(session: AsyncSession, price_id: str) -> None:
     await _init_stripe(session)
     try:
@@ -513,6 +582,13 @@ async def set_active(
 ) -> PricingPlan:
     """Deactivate archives the Stripe objects (never deletes); activate restores them."""
     plan = await get(session, plan_id)
+    if not active and plan.is_default:
+        # Everyone without a paid subscription sits on this plan; without it the
+        # audience is locked out of every perk, not let into them.
+        raise AppError(
+            "The default free plan cannot be deactivated; mark another plan as the default first",
+            code="default_plan_in_use",
+        )
     if plan.stripe_product_id or plan.stripe_price_id:
         await _init_stripe(session)
         try:
@@ -566,15 +642,17 @@ async def list_public(session: AsyncSession, audience: str) -> list[PricingPlan]
 
 
 async def free_plan_for(session: AsyncSession, audience: str) -> PricingPlan | None:
-    """The active zero-price plan for an audience, if the admin configured one."""
+    """The audience's designated default free plan, if the admin configured one.
+
+    A $0 plan that is not the default is just a plan nobody is on (BUG12).
+    """
     stmt = (
         select(PricingPlan)
         .where(
             PricingPlan.audience == PlanAudience(audience),
             PricingPlan.status == PlanStatus.active,
-            PricingPlan.price_usd <= 0,
+            PricingPlan.is_default.is_(True),
         )
-        .order_by(PricingPlan.created_at)
         .limit(1)
     )
     return (await session.execute(stmt)).scalar_one_or_none()
@@ -605,6 +683,7 @@ def public_read(plan: PricingPlan) -> PricingPlanPublicRead:
         billing_interval=_val(plan.billing_interval),
         is_highlighted=plan.is_highlighted,
         is_free=Decimal(str(plan.price_usd)) <= 0,
+        is_default=plan.is_default,
         features=[feature_read(f) for f in plan.features],
     )
 

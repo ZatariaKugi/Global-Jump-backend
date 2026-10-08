@@ -94,6 +94,7 @@ async def get_payment_config(
             advisor_cancellation_window_hours=config.advisor_cancellation_window_hours,
             platform_fee_refund_behavior=config.platform_fee_refund_behavior,
             platform_commission_rate=legacy_rate,
+            automatic_tax_enabled=config.automatic_tax_enabled,
         ),
         meta=Meta(request_id=request_id),
     )

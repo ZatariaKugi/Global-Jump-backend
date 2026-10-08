@@ -366,6 +366,7 @@ async def upload_document(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[SeekerDocumentRead]:
     _require_seeker(current_user)
+    await entitlement_service.check(session, current_user, "documents")
     expected_prefix = f"seeker_document/{current_user.id}/"
     if not data.file_key.startswith(expected_prefix):
         raise PermissionDeniedError("Invalid attachment key")
@@ -410,6 +411,7 @@ async def get_my_documents_summary(
     visa_type: Annotated[OptionalVisaType, Query()] = None,
 ) -> ResponseEnvelope[DocumentPortfolioSummary]:
     _require_seeker(current_user)
+    await entitlement_service.check(session, current_user, "documents")
     summary = await seeker_document_service.portfolio_summary(
         session, current_user.id, settings, visa_type=visa_type
     )
@@ -448,6 +450,7 @@ async def list_my_documents(
     expires_before: Annotated[date | None, Query()] = None,
 ) -> ResponseEnvelope[list[SeekerDocumentRead]]:
     _require_seeker(current_user)
+    await entitlement_service.check(session, current_user, "documents")
     await seeker_document_service.refresh_expired_statuses(session, current_user.id)
     stmt = seeker_document_service.list_by_seeker_stmt(
         current_user.id,
@@ -480,6 +483,7 @@ async def update_my_document(
 ) -> ResponseEnvelope[SeekerDocumentRead]:
     """Update metadata and/or replace the file in place (same document id)."""
     _require_seeker(current_user)
+    await entitlement_service.check(session, current_user, "documents")
     document = await seeker_document_service.get_for_seeker(session, document_id, current_user.id)
     file_url: str | None = None
     if data.file_key is not None:
@@ -511,6 +515,7 @@ async def delete_my_document(
 ) -> None:
     """Soft-archive the document (removed from list/summary; file retained)."""
     _require_seeker(current_user)
+    await entitlement_service.check(session, current_user, "documents")
     document = await seeker_document_service.get_for_seeker(session, document_id, current_user.id)
     await seeker_document_service.archive_document(session, document, current_user.id)
 
@@ -523,6 +528,7 @@ async def mark_document_comments_read(
 ) -> None:
     """Clear the unread-comments dot. Idempotent. Does not run on GET comments."""
     _require_seeker(current_user)
+    await entitlement_service.check(session, current_user, "documents")
     document = await seeker_document_service.get_for_seeker(session, document_id, current_user.id)
     await seeker_document_service.mark_comments_read(session, document, current_user.id)
 
@@ -540,6 +546,7 @@ async def add_document_comment(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[DocumentCommentRead]:
     _require_seeker(current_user)
+    await entitlement_service.check(session, current_user, "documents")
     document = await seeker_document_service.get_for_seeker(session, document_id, current_user.id)
     comment = await seeker_document_service.add_comment(
         session, document, current_user.id, data.body
@@ -562,6 +569,7 @@ async def list_document_comments(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[DocumentCommentRead]]:
     _require_seeker(current_user)
+    await entitlement_service.check(session, current_user, "documents")
     document = await seeker_document_service.get_for_seeker(session, document_id, current_user.id)
     stmt = seeker_document_service.list_comments_stmt(document.id)
     comments, total = await paginate(session, stmt, params)

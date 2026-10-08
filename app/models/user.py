@@ -107,6 +107,11 @@ class User(BaseModel):
     stripe_customer_id: Mapped[str | None] = mapped_column(
         String(255), unique=True, nullable=True, sort_order=110
     )
+    # When the seeker/advisor first chose a plan (the free one, or paid at checkout).
+    # Until set, the web client keeps them on the plans page.
+    plan_choice_acknowledged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, sort_order=111
+    )
 
     @property
     def is_email_verified(self) -> bool:

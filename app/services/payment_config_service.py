@@ -47,6 +47,7 @@ SETTING_KEYS: tuple[str, ...] = (
     "platform_fee_refund_behavior",
     "live_payments_enabled",
     "subscription_grace_days",
+    "automatic_tax_enabled",
 )
 
 
@@ -59,6 +60,8 @@ class PaymentConfig:
     platform_fee_refund_behavior: str  # "retained" | "refunded"
     live_payments_enabled: bool
     subscription_grace_days: int = 3
+    # Stripe Tax adds tax at checkout from the seeker's billing address (PM, 2026-10-08).
+    automatic_tax_enabled: bool = False
 
 
 _cache: tuple[PaymentConfig, float] | None = None
@@ -78,6 +81,7 @@ def _from_row(row: PlatformPaymentSettings) -> PaymentConfig:
         platform_fee_refund_behavior=FeeRefundBehavior(row.platform_fee_refund_behavior).value,
         live_payments_enabled=bool(row.live_payments_enabled),
         subscription_grace_days=int(row.subscription_grace_days),
+        automatic_tax_enabled=bool(row.automatic_tax_enabled),
     )
 
 
@@ -190,6 +194,7 @@ async def get_read(session: AsyncSession) -> PaymentSettingsRead:
         platform_fee_refund_behavior=FeeRefundBehavior(row.platform_fee_refund_behavior).value,
         live_payments_enabled=row.live_payments_enabled,
         subscription_grace_days=row.subscription_grace_days,
+        automatic_tax_enabled=bool(row.automatic_tax_enabled),
         updated_at=row.updated_at,
         updated_by=row.updated_by,
     )

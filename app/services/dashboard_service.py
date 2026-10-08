@@ -34,7 +34,7 @@ from app.schemas.dashboard import (
     DashboardSummaryRead,
     RevenueBreakdownSliceRead,
 )
-from app.services import analytics_service
+from app.services import advisor_earnings, analytics_service
 
 _GROSS_STATUSES = (
     TransactionStatus.succeeded,
@@ -147,16 +147,18 @@ async def get_dashboard_summary(
     session: AsyncSession, days: int | None = None
 ) -> DashboardSummaryRead:
     since = _dashboard_since(days)
+    consultation_today, subscription_today = await asyncio.gather(
+        analytics_service.consultation_revenue_today(session),
+        analytics_service.subscription_revenue_today(session),
+    )
     (
         stats,
-        revenue_today_usd,
         user_registration_trend,
         ai_assessment_volume,
         revenue_breakdown,
         recent_activities,
     ) = await asyncio.gather(
         _user_stat_counts(session, since),
-        _revenue_today_usd(session),
         _user_registration_trend(session, since, days),
         _ai_assessment_volume(session, since, days),
         _revenue_breakdown(session, since),
@@ -170,7 +172,9 @@ async def get_dashboard_summary(
         total_advisors=stats["total_advisors"],
         verified_advisors=stats["verified_advisors"],
         active_advisors=stats["active_advisors"],
-        revenue_today_usd=revenue_today_usd,
+        revenue_today_usd=round(consultation_today + subscription_today, 2),
+        consultation_revenue_today_usd=consultation_today,
+        subscription_revenue_today_usd=subscription_today,
         user_registration_trend=user_registration_trend,
         ai_assessment_volume=ai_assessment_volume,
         revenue_breakdown=revenue_breakdown,
@@ -212,11 +216,6 @@ async def _user_stat_counts(session: AsyncSession, since: datetime | None) -> di
         "verified_advisors": int(row.verified_advisors),
         "active_advisors": int(row.active_advisors),
     }
-
-
-async def _revenue_today_usd(session: AsyncSession) -> float:
-    # One definition, shared with the analytics overview so the two screens agree.
-    return await analytics_service.revenue_today(session)
 
 
 async def _grouped_timestamp_counts(
@@ -271,17 +270,20 @@ async def _ai_assessment_volume(
 async def _revenue_breakdown(
     session: AsyncSession, since: datetime | None
 ) -> list[RevenueBreakdownSliceRead]:
-    """Platform vs advisor share of gross booking revenue (commission+tax vs payout)."""
-    stmt = select(
-        func.coalesce(
-            func.sum(Transaction.commission_usd + Transaction.tax_usd),
-            0.0,
-        ),
-        func.coalesce(func.sum(Transaction.advisor_payout_usd), 0.0),
-    ).where(Transaction.status.in_(_REVENUE_BREAKDOWN_STATUSES))
+    """Platform vs advisor share of booking revenue, net of what each side gave back.
+
+    Uses the shared earnings rule so the Advisors slice equals the advisor's own
+    dashboard, the admin advisor views and both finance screens.
+    """
+    platform_total_expr = func.coalesce(func.sum(advisor_earnings.PLATFORM_NET_FEE), 0.0)
+    advisor_total_expr = func.coalesce(func.sum(advisor_earnings.ADVISOR_NET_EARNINGS), 0.0)
+    platform_stmt = select(platform_total_expr).where(*advisor_earnings.charged_filters())
+    advisor_stmt = select(advisor_total_expr).where(*advisor_earnings.advisor_earnings_filters())
     if since is not None:
-        stmt = stmt.where(Transaction.created_at >= since)
-    platform_total, advisor_total = (await session.execute(stmt)).one()
+        platform_stmt = platform_stmt.where(Transaction.created_at >= since)
+        advisor_stmt = advisor_stmt.where(Transaction.created_at >= since)
+    platform_total = (await session.execute(platform_stmt)).scalar_one()
+    advisor_total = (await session.execute(advisor_stmt)).scalar_one()
     totals = {
         "Platform": float(platform_total),
         "Advisors": float(advisor_total),

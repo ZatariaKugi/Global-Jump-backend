@@ -6,7 +6,8 @@ window, the platform commission (percent or fixed USD), whether the platform fee
 refunded when an advisor cancels, and the live-payments switch. Nothing here is
 read from ``.env`` after the first seed — see ``payment_config_service``.
 
-Tax withholding is deliberately absent (client decision 2026-09-23).
+Tax is Stripe's job (PM, 2026-10-08): ``automatic_tax_enabled`` asks Stripe Tax to add
+tax at checkout from the seeker's billing address; no rate is configured here.
 
 ``platform_setting_changes`` is the audit trail: one row per changed key per save.
 """
@@ -64,6 +65,11 @@ class PlatformPaymentSettings(BaseModel):
         server_default=FeeRefundBehavior.retained.value,
     )
     live_payments_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # Stripe Tax at checkout. Requires Stripe Tax to be activated on the platform account
+    # (Dashboard → Settings → Tax: origin address, registrations, product tax code).
+    automatic_tax_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
     # Days of access kept after a failed renewal (decision D8).

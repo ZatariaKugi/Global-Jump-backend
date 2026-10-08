@@ -21,6 +21,8 @@ from app.db.base import Base
 
 class RefundKind(StrEnum):
     advisor_cancel = "advisor_cancel"  # document §3.2: advisor share back, fee per policy
+    # Historical only: the admin refund action was removed on 2026-10-07 (business
+    # decision). Nothing creates these; they stay so old ledger rows still load.
     admin_full = "admin_full"
     admin_partial = "admin_partial"
     expiry = "expiry"  # advisor never accepted: platform fault, full refund

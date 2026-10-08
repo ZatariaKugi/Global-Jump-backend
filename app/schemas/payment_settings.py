@@ -27,6 +27,8 @@ class PaymentSettingsUpdate(BaseModel):
     platform_fee_refund_behavior: FeeRefundBehaviorLiteral
     live_payments_enabled: bool
     subscription_grace_days: int = Field(default=3, ge=0, le=90)
+    # Stripe Tax at checkout. Stripe Tax must be activated on the Stripe account first.
+    automatic_tax_enabled: bool = False
 
     @model_validator(mode="after")
     def _percent_ceiling(self) -> PaymentSettingsUpdate:
@@ -46,6 +48,7 @@ class PaymentSettingsRead(BaseModel):
     platform_fee_refund_behavior: FeeRefundBehaviorLiteral
     live_payments_enabled: bool
     subscription_grace_days: int = 3
+    automatic_tax_enabled: bool = False
     updated_at: datetime | None = None
     updated_by: uuid.UUID | None = None
 

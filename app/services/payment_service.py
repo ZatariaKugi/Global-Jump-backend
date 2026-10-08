@@ -22,7 +22,7 @@ from sqlalchemy.orm import aliased
 from app.core.config import Settings
 from app.core.exceptions import AppError, NotFoundError
 from app.core.file_storage import resolve_media_url
-from app.core.money import as_float, money_sum
+from app.core.money import as_float
 from app.models.advisor_profile import AdvisorProfile
 from app.models.booking import Booking, BookingStatus, PaymentStatus
 from app.models.notification import NotificationEntityType, NotificationType
@@ -51,6 +51,7 @@ from app.schemas.payment import (
     TransactionRefundRead,
 )
 from app.services import (
+    advisor_earnings,
     booking_meeting_service,
     email_service,
     notification_service,
@@ -58,6 +59,7 @@ from app.services import (
     refund_engine,
     stripe_config_service,
     subscription_service,
+    tax_service,
     zoom_connection_service,
 )
 from app.services.payment_config_service import PaymentConfig, compute_platform_fee
@@ -221,10 +223,16 @@ def _sync_connect_flags(profile: AdvisorProfile, account: object) -> None:
 
 @dataclass(frozen=True, slots=True)
 class ConsultationSplit:
-    """How one consultation price divides between advisor and platform.
+    """How one consultation divides (QA 2026-10-08, section 27):
 
-    ``tax_usd`` is always 0: tax withholding is out of scope (client decision
-    2026-09-23). The columns stay on ``transactions`` for historical rows only.
+        seeker pays   = price + tax                 (``total_usd``)
+        price         = commission + advisor gross  (``commission_usd`` + ``advisor_payout_usd``)
+
+    Tax is Stripe Tax's job: it is added on top of the price at checkout from the seeker's
+    billing address, recorded when the session completes (``tax_usd``), held by the
+    platform, and never revenue nor the advisor's. Stripe's processing fee is likewise
+    only known once the charge exists (``stripe_fee_usd``). So at creation ``tax_usd`` is
+    0 and ``total_usd`` equals the price.
     """
 
     price_usd: Decimal
@@ -233,6 +241,8 @@ class ConsultationSplit:
     advisor_payout_usd: Decimal
     tax_usd: Decimal
     commission_rate: Decimal  # effective fee / price, stored for reporting
+    tax_rate: Decimal = Decimal("0.0000")  # fraction, for ``transactions.tax_rate``
+    total_usd: Decimal = Decimal("0.00")
 
 
 def compute_consultation_split(
@@ -248,6 +258,7 @@ def compute_consultation_split(
         advisor_payout_usd=(price - fee).quantize(Decimal("0.01")),
         tax_usd=Decimal("0.00"),
         commission_rate=rate,
+        total_usd=price,
     )
 
 
@@ -327,51 +338,85 @@ async def create_checkout_session(
     advisor = await session.get(User, booking.advisor_id)
     advisor_name = advisor.full_name if advisor else "Advisor"
 
-    # Destination charge (document §2.1): the advisor's share lands on their connected
-    # account in the same charge; the platform keeps ``application_fee_amount``.
-    # A zero fee omits the application fee and lets the advisor's account bear
-    # Stripe's processing fee (on_behalf_of) instead of the platform balance.
+    # Destination charge. The seeker is charged the price (plus whatever Stripe Tax adds
+    # when the admin switch is on) on the platform; Stripe moves exactly the advisor's
+    # gross share to the connected account (``transfer_data.amount``), so commission and
+    # tax both stay on the platform without ever appearing as an "application fee" on
+    # the advisor's Stripe. Stripe's own processing fee is debited from the platform
+    # whatever we send here (its docs are explicit, with or without on_behalf_of); the
+    # advisor bears it by a reversal of the real fee once the charge exists -- see
+    # ``_recover_stripe_fee``.
     fee_cents = int(round(float(split.application_fee_usd) * 100))
-    payment_intent_data: Any = {
-        "transfer_data": {"destination": advisor_profile.stripe_account_id},
-        "metadata": {"booking_id": str(booking_id)},
+    advisor_cents = int(round(float(split.advisor_payout_usd) * 100))
+    txn_id = uuid.uuid4()
+    money_meta = {
+        "booking_id": str(booking_id),
+        "transaction_id": str(txn_id),
+        "appointment_id": format_appointment_id(booking.appointment_number),
+        "seeker_id": str(seeker_id),
+        "advisor_id": str(booking.advisor_id),
+        "advisor_stripe_account_id": advisor_profile.stripe_account_id or "",
+        "payment_type": "consultation",
+        "consultation_amount": f"{split.price_usd:.2f}",
+        # Tax and the total are Stripe's to decide; both are stamped on completion.
+        "tax_mode": "stripe_tax" if config.automatic_tax_enabled else "none",
+        "platform_commission": f"{split.commission_usd:.2f}",
+        "advisor_gross": f"{split.advisor_payout_usd:.2f}",
+        "currency": "usd",
     }
-    if fee_cents > 0:
-        payment_intent_data["application_fee_amount"] = fee_cents
-    else:
-        payment_intent_data["on_behalf_of"] = advisor_profile.stripe_account_id
+    payment_intent_data: Any = {"metadata": dict(money_meta)}
+    if advisor_cents > 0:
+        payment_intent_data["transfer_data"] = {
+            "destination": advisor_profile.stripe_account_id,
+            "amount": advisor_cents,
+        }
+        if fee_cents <= 0:
+            # Unchanged from before: with no commission the advisor is the settlement
+            # merchant (their descriptor on the seeker's statement).
+            payment_intent_data["on_behalf_of"] = advisor_profile.stripe_account_id
+    # Otherwise the commission swallowed the whole price: nothing to transfer, and
+    # Stripe rejects a zero transfer amount.
+    price_data: dict[str, Any] = {
+        "currency": "usd",
+        "product_data": {
+            "name": f"{booking.name} with {advisor_name}",
+            "description": f"{booking.duration_minutes}-minute session",
+        },
+        "unit_amount": int(round(float(split.price_usd) * 100)),
+    }
+    session_params: dict[str, Any] = {}
+    if config.automatic_tax_enabled:
+        # Stripe Tax: the price is tax-exclusive, Stripe adds the tax line from the
+        # seeker's billing address and the platform's registrations (Dashboard → Tax).
+        # The product tax code is the Dashboard's preset unless one is set here.
+        # Address collection is "auto" (PM, 2026-10-08): Stripe asks for the billing
+        # address only when it needs it to place the seeker for tax.
+        price_data["tax_behavior"] = "exclusive"
+        session_params["automatic_tax"] = {"enabled": True}
+        session_params["billing_address_collection"] = "auto"
+    line_items: Any = [{"price_data": price_data, "quantity": 1}]
     # Same key within a minute -> Stripe returns the same session on a retry.
     checkout_key = f"checkout_{booking_id}_{datetime.now(UTC):%Y%m%d%H%M}"
     try:
         checkout_session = await stripe.checkout.Session.create_async(
-            line_items=[
-                {
-                    "price_data": {
-                        "currency": "usd",
-                        "product_data": {
-                            "name": f"{booking.name} with {advisor_name}",
-                            "description": f"{booking.duration_minutes}-minute session",
-                        },
-                        "unit_amount": int(booking.price_usd * 100),
-                    },
-                    "quantity": 1,
-                }
-            ],
+            line_items=line_items,
             mode="payment",
             success_url=f"{settings.FRONTEND_URL}/bookings/{booking_id}?payment=success",
             cancel_url=f"{settings.FRONTEND_URL}/bookings/{booking_id}?payment=cancelled",
-            metadata={"booking_id": str(booking_id)},
+            metadata=dict(money_meta),
             payment_intent_data=payment_intent_data,
             managed_payments={"enabled": False},
             idempotency_key=checkout_key,
+            **session_params,
         )
     except stripe.StripeError as exc:
         raise stripe_config_service.checkout_failed(exc, booking_id=str(booking_id)) from exc
 
     txn = Transaction(
+        id=txn_id,
         booking_id=booking_id,
         stripe_checkout_session_id=checkout_session.id,
-        amount_usd=booking.price_usd,
+        amount_usd=float(split.total_usd),
         commission_rate=float(split.commission_rate),
         commission_usd=float(split.commission_usd),
         charge_model=ChargeModel.destination,
@@ -408,7 +453,8 @@ async def create_checkout_session(
         "checkout_session_created",
         booking_id=str(booking_id),
         session_id=checkout_session.id,
-        amount_usd=booking.price_usd,
+        amount_usd=float(split.total_usd),
+        automatic_tax=config.automatic_tax_enabled,
     )
     return CheckoutResponse(checkout_url=checkout_session.url, session_id=checkout_session.id)
 
@@ -739,9 +785,13 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
     card_last4: str | None = None
     transfer_id: str | None = None
     app_fee_id: str | None = None
+    stripe_fee_cents = 0
+    balance_txn_id: str | None = None
     if pi_id:
         try:
-            pi = await stripe.PaymentIntent.retrieve_async(pi_id, expand=["latest_charge"])
+            pi = await stripe.PaymentIntent.retrieve_async(
+                pi_id, expand=["latest_charge", "latest_charge.balance_transaction"]
+            )
             latest_charge = _stripe_get(pi, "latest_charge")
             if latest_charge:
                 charge_id = (
@@ -755,6 +805,15 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
                 )
                 raw_fee = _stripe_get(latest_charge, "application_fee")
                 app_fee_id = str(_stripe_get(raw_fee, "id") or raw_fee) if raw_fee else None
+                # Stripe's own processing fee, from the charge's balance transaction.
+                # Only an expanded object carries it; a bare id means "unknown" -> 0.
+                raw_bt = _stripe_get(latest_charge, "balance_transaction")
+                if raw_bt is not None and not isinstance(raw_bt, str):
+                    fee_value = _stripe_get(raw_bt, "fee")
+                    if isinstance(fee_value, (int, float)):
+                        stripe_fee_cents = int(fee_value)
+                    bt_id = _stripe_get(raw_bt, "id")
+                    balance_txn_id = str(bt_id) if bt_id else None
                 # Extract card brand + last-4 from charge payment_method_details.
                 pmd = _stripe_get(latest_charge, "payment_method_details")
                 if pmd is not None:
@@ -765,11 +824,27 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
         except stripe.StripeError as exc:
             log.warning("webhook_pi_retrieve_failed", pi_id=pi_id, error=str(exc))
 
+    # What Stripe Tax added, if anything: the seeker paid price + tax, and every later
+    # screen reads the tax, its label and jurisdiction from the row.
+    tax = await tax_service.snapshot_for_session(cs, session_id)
+    if tax.applies:
+        price = advisor_earnings.consultation_usd(txn)
+        txn.tax_usd = float(tax.amount_usd)
+        txn.tax_rate = float(tax.rate) if tax.rate_percent > 0 else 0.0
+        txn.tax_label = tax.label
+        txn.tax_country = tax.country
+        txn.tax_jurisdiction = tax.jurisdiction
+        txn.amount_usd = (
+            float(tax.total_usd) if tax.total_usd else round(price + float(tax.amount_usd), 2)
+        )
+
     txn.status = TransactionStatus.succeeded
     txn.stripe_payment_intent_id = pi_id
     txn.stripe_charge_id = charge_id
     txn.card_brand = card_brand
     txn.card_last4 = card_last4
+    txn.stripe_fee_usd = round(stripe_fee_cents / 100, 2)
+    txn.stripe_balance_transaction_id = balance_txn_id
     txn.invoice_number = await _next_invoice_number(session)
     session.add(txn)
     await _log_event(session, txn.id, TransactionEventType.authorized)
@@ -782,6 +857,8 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
         txn.transfer_status = TransferStatus.completed
         txn.transfer_after = None
         await _log_event(session, txn.id, TransactionEventType.transfer_completed)
+        await _recover_stripe_fee(session, txn, stripe_fee_cents)
+        await _stamp_payment_metadata(txn)
     else:
         # Legacy separate-charge row: arm the hold for the sweep as before.
         txn.transfer_after = datetime.now(UTC) + timedelta(minutes=settings.PAYOUT_HOLD_MINUTES)
@@ -822,6 +899,9 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
                     amount_usd=txn.amount_usd,
                     invoice_number=f"{txn.invoice_number:08d}",
                     settings=settings,
+                    consultation_usd=advisor_earnings.consultation_usd(txn),
+                    tax_usd=as_float(txn.tax_usd),
+                    tax_label=txn.tax_label,
                 )
             )
         if advisor is not None:
@@ -831,10 +911,12 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
                     advisor.full_name or advisor.email,
                     seeker.full_name if seeker and seeker.full_name else "A client",
                     name=booking.name,
-                    amount_usd=txn.amount_usd,
-                    payout_usd=txn.advisor_payout_usd,
+                    amount_usd=advisor_earnings.consultation_usd(txn),
+                    payout_usd=advisor_earnings.advisor_net_earnings(txn),
                     invoice_number=f"{txn.invoice_number:08d}",
                     settings=settings,
+                    platform_fee_usd=as_float(txn.commission_usd),
+                    stripe_fee_usd=as_float(txn.stripe_fee_usd),
                 )
             )
         await _notify_payment(
@@ -882,6 +964,71 @@ async def _handle_checkout_completed(session: AsyncSession, cs: object, settings
         await booking_meeting_service.maybe_provision_meeting(session, booking, settings)
     await _log_event(session, txn.id, TransactionEventType.receipt_sent)
     await _log_event(session, txn.id, TransactionEventType.closed)
+
+
+async def _recover_stripe_fee(session: AsyncSession, txn: Transaction, fee_cents: int) -> None:
+    """Pull Stripe's processing fee back from the advisor (QA 2026-10-08, section 9).
+
+    On a destination charge the platform's balance pays Stripe's fee. The business rule
+    is that the advisor bears it, so exactly the real fee is reversed off their transfer
+    the moment the payment is confirmed. Advisor net = gross share - this fee; the
+    platform keeps its full commission.
+
+    Best effort on purpose: the seeker has paid and the advisor has been paid, so a
+    failed recovery (the advisor already paid out, an account restriction) must not
+    leave the booking unpaid. The fee is still recorded; ``stripe_fee_reversal_id``
+    stays NULL, the failure is on the row and the timeline, and the refund engine then
+    treats the gross share as still with the advisor.
+    """
+    if fee_cents <= 0 or not txn.stripe_transfer_id or txn.stripe_fee_reversal_id:
+        return
+    try:
+        reversal = await stripe.Transfer.create_reversal_async(
+            txn.stripe_transfer_id,
+            amount=fee_cents,
+            metadata={
+                "transaction_id": str(txn.id),
+                "booking_id": str(txn.booking_id),
+                "reason": "stripe_processing_fee",
+                "stripe_fee": f"{fee_cents / 100:.2f}",
+            },
+            idempotency_key=f"stripe_fee_{txn.id}",
+        )
+    except stripe.StripeError as exc:
+        txn.transfer_last_error = f"Stripe fee recovery failed: {exc}"[:500]
+        await _log_event(session, txn.id, TransactionEventType.transfer_failed)
+        log.warning(
+            "stripe_fee_recovery_failed",
+            transaction_id=str(txn.id),
+            transfer_id=txn.stripe_transfer_id,
+            fee_cents=fee_cents,
+            error=str(exc),
+        )
+        return
+    txn.stripe_fee_reversal_id = str(reversal.id)
+    await _log_event(session, txn.id, TransactionEventType.stripe_fee_recovered)
+
+
+async def _stamp_payment_metadata(txn: Transaction) -> None:
+    """Put the figures that were unknown at checkout time on the PaymentIntent, so the
+    platform's Stripe shows tax, total, Stripe fee and advisor net next to the payment
+    (QA section 8). Best effort: the books are already right."""
+    if not txn.stripe_payment_intent_id:
+        return
+    try:
+        await stripe.PaymentIntent.modify_async(
+            txn.stripe_payment_intent_id,
+            metadata={
+                "tax_amount": f"{as_float(txn.tax_usd):.2f}",
+                "tax_label": txn.tax_label or "",
+                "tax_jurisdiction": txn.tax_jurisdiction or "",
+                "total_amount": f"{as_float(txn.amount_usd):.2f}",
+                "stripe_fee": f"{as_float(txn.stripe_fee_usd):.2f}",
+                "advisor_net": f"{advisor_earnings.advisor_net_earnings(txn):.2f}",
+            },
+        )
+    except stripe.StripeError as exc:
+        log.warning("payment_metadata_stamp_failed", transaction_id=str(txn.id), error=str(exc))
 
 
 async def _handle_checkout_expired(session: AsyncSession, cs: object) -> None:
@@ -958,11 +1105,13 @@ async def _handle_charge_refunded(session: AsyncSession, charge: object) -> None
         if isinstance(amount_refunded_cents, (int, float))
         else as_float(txn.amount_usd)
     )
-    is_full = refunded_amount_usd >= as_float(txn.amount_usd)
+    # Tax and Stripe's fee never come back, so "fully refunded" is measured against
+    # what could come back (QA 2026-10-08), the same rule the engine applies.
+    is_full = Decimal(str(refunded_amount_usd)) >= refund_engine.refundable_total(txn)
 
-    # Idempotent against duplicate webhook delivery and against an admin-initiated
-    # refund that already moved the row (refund_transaction sets these same fields):
-    # Stripe may redeliver charge.refunded, and an admin refund also triggers one.
+    # Idempotent against duplicate webhook delivery and against a refund the engine
+    # already settled (it sets these same fields): Stripe may redeliver
+    # charge.refunded, and an engine refund also triggers one.
     # Only proceed when this event reflects *more* refunded than we've recorded
     # (e.g. a genuine partial→larger escalation from the dashboard); otherwise the
     # refund is already accounted for — don't re-notify the seeker or re-log events.
@@ -1075,43 +1224,6 @@ async def auto_refund_booking_if_paid(
         return None
     log.info("booking_auto_refunded", booking_id=str(booking.id), kind=kind)
     return Decimal(str(row.refund_to_seeker_usd))
-
-
-async def refund_transaction(
-    session: AsyncSession,
-    transaction_id: uuid.UUID,
-    admin_id: uuid.UUID,
-    reason: str | None,
-    settings: Settings,
-    amount_usd: float | None = None,
-    *,
-    reverse_advisor_share: bool = True,
-    refund_platform_fee: bool | None = None,
-) -> Transaction:
-    """Admin refund. ``amount_usd=None`` refunds everything that is left."""
-    txn = (
-        await session.execute(
-            select(Transaction).where(Transaction.id == transaction_id).with_for_update()
-        )
-    ).scalar_one_or_none()
-    if txn is None:
-        raise NotFoundError("Transaction not found")
-    config = await payment_config_service.get_config(session)
-    kind = "admin_partial" if amount_usd is not None else "admin_full"
-    plan = refund_engine.compute_refund(
-        txn,
-        kind,
-        config,
-        Decimal(str(amount_usd)) if amount_usd is not None else None,
-        refund_platform_fee=refund_platform_fee,
-        reverse_advisor_share=reverse_advisor_share,
-    )
-    await refund_engine.execute_refund(session, txn, plan, admin_id, reason, settings)
-    await session.refresh(txn)
-    log.info(
-        "payment_refunded_by_admin", transaction_id=str(transaction_id), admin_id=str(admin_id)
-    )
-    return txn
 
 
 # After this many failed transfer attempts the sweep gives up and marks the txn
@@ -1436,17 +1548,36 @@ async def get_advisor_earnings(
     result = await session.execute(list_for_advisor_stmt(advisor_user_id))
     txns = list(result.scalars().all())
 
-    total_earned = money_sum(
-        t.advisor_payout_usd for t in txns if t.status == TransactionStatus.succeeded
-    )
-    total_commission = money_sum(
-        t.commission_usd for t in txns if t.status == TransactionStatus.succeeded
-    )
+    # The five-line breakdown plus Total Refunded (QA 2026-10-08, sections 5 and 17),
+    # over the same rows every other earnings surface uses: charged, transfer complete.
+    sums = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(advisor_earnings.CONSULTATION_USD), 0.0),
+                func.coalesce(func.sum(Transaction.commission_usd), 0.0),
+                func.coalesce(func.sum(Transaction.advisor_payout_usd), 0.0),
+                func.coalesce(func.sum(Transaction.stripe_fee_usd), 0.0),
+                func.coalesce(func.sum(Transaction.advisor_reversed_usd), 0.0),
+                func.coalesce(func.sum(advisor_earnings.ADVISOR_NET_EARNINGS), 0.0),
+            )
+            .join(Booking, Booking.id == Transaction.booking_id)
+            .where(
+                Booking.advisor_id == advisor_user_id,
+                *advisor_earnings.advisor_earnings_filters(),
+            )
+        )
+    ).one()
+    gross, platform_fee, advisor_gross, stripe_fee, reversed_, net = (float(v) for v in sums)
 
     return {
-        "total_earned_usd": round(total_earned, 2),
-        "total_commission_paid_usd": round(total_commission, 2),
+        "total_earned_usd": round(net, 2),
+        "total_commission_paid_usd": round(platform_fee, 2),
         "transactions": txns,
+        "total_gross_revenue_usd": round(gross, 2),
+        "total_platform_fee_usd": round(platform_fee, 2),
+        "total_advisor_gross_usd": round(advisor_gross, 2),
+        "total_stripe_fee_usd": round(stripe_fee, 2),
+        "total_refunded_usd": round(reversed_, 2),
     }
 
 
@@ -1557,7 +1688,20 @@ async def build_invoice(
     from_phone = getattr(settings, "INVOICE_FROM_PHONE", None)
     to_phone = None  # no phone column on users/profiles yet
 
+    consultation = advisor_earnings.consultation_usd(txn)
+    tax_amount = round(as_float(txn.tax_usd), 2)
+    tax_rate_percent = round(as_float(txn.tax_rate) * 100, 2) if tax_amount > 0 else 0.0
+    tax_label = txn.tax_label if tax_amount > 0 else None
+    line_items = [
+        InvoiceLineItem(
+            description=booking.name,
+            quantity=1,
+            unit_price_usd=consultation,
+            total_usd=consultation,
+        )
+    ]
     if perspective == "advisor":
+        # The advisor's copy is their consultation only: the tax is the platform's.
         from_name = (advisor.full_name if advisor else None) or "Advisor"
         from_address = None
         if advisor_profile and advisor_profile.country_of_residence:
@@ -1565,33 +1709,21 @@ async def build_invoice(
 
             code = advisor_profile.country_of_residence
             from_address = country_name(code) or code
-        line_items = [
-            InvoiceLineItem(
-                description=booking.name,
-                quantity=1,
-                unit_price_usd=txn.amount_usd,
-                total_usd=txn.amount_usd,
-            )
-        ]
-        subtotal = txn.amount_usd
+        subtotal = consultation
         tax = 0.0
-        total = txn.amount_usd
+        total = consultation
+        tax_rate_percent, tax_label = 0.0, None
     else:
-        # seeker / admin — platform invoice split
+        # seeker / admin: Consultation + Tax = Total, exactly what was charged (QA §4).
         from_name = settings.EMAILS_FROM_NAME
         from_address = getattr(settings, "INVOICE_FROM_ADDRESS", None)
-        line_items = [
-            InvoiceLineItem(
-                description=booking.name,
-                quantity=1,
-                unit_price_usd=txn.amount_usd,
-                total_usd=txn.amount_usd,
-            )
-        ]
-        subtotal = txn.amount_usd
-        tax = 0.0
-        total = txn.amount_usd
+        subtotal = consultation
+        tax = tax_amount
+        total = round(as_float(txn.amount_usd), 2)
 
+    # The invoice names the refunded amount only. It deliberately never itemises the
+    # platform fee, the Stripe fee or a "retained" figure (PM, 2026-10-07): the status
+    # badge ("Partially refunded") carries that fact, and none of it is the seeker's.
     return InvoiceRead(
         invoice_number=f"{txn.invoice_number:08d}",
         invoice_id=invoice_id,
@@ -1609,6 +1741,8 @@ async def build_invoice(
         line_items=line_items,
         subtotal_usd=subtotal,
         tax_usd=tax,
+        tax_rate_percent=tax_rate_percent,
+        tax_label=tax_label,
         total_usd=total,
         status=txn.status,
         display_status=display_status(txn),
@@ -1838,26 +1972,30 @@ async def platform_payment_summary(session: AsyncSession) -> PaymentSummaryRead:
             )
         )
     ).scalar_one()
+    # Platform Commission = fee collected minus fee returned (QA bug 7, second half,
+    # 2026-10-07). Same row set as Seeker Paid: a full refund that kept the fee still
+    # collected it, and a partial refund that returned part of the fee gives it back.
     commission = (
         await session.execute(
-            select(func.coalesce(func.sum(Transaction.commission_usd), 0.0)).where(
-                Transaction.is_archived.is_(False),
-                Transaction.status.in_(
-                    (TransactionStatus.succeeded, TransactionStatus.partially_refunded)
-                ),
-            )
+            select(
+                func.coalesce(
+                    func.sum(Transaction.commission_usd - Transaction.platform_fee_refunded_usd),
+                    0.0,
+                )
+            ).where(*advisor_earnings.charged_filters())
         )
     ).scalar_one()
-    tax = (
+    # Tax is collected on every charged row and never refunded (QA 2026-10-08), so it
+    # is summed over the same row set as Seeker Paid. It is held for the authority and
+    # is not platform revenue; the Stripe fee card below is the advisors' cost.
+    tax, stripe_fee = (
         await session.execute(
-            select(func.coalesce(func.sum(Transaction.tax_usd), 0.0)).where(
-                Transaction.is_archived.is_(False),
-                Transaction.status.in_(
-                    (TransactionStatus.succeeded, TransactionStatus.partially_refunded)
-                ),
-            )
+            select(
+                func.coalesce(func.sum(Transaction.tax_usd), 0.0),
+                func.coalesce(func.sum(Transaction.stripe_fee_usd), 0.0),
+            ).where(*advisor_earnings.charged_filters())
         )
-    ).scalar_one()
+    ).one()
     # Advisor earnings: the advisor share of every completed transfer, less anything
     # reversed back off the connected account (QA bug 8). Two things differ from the
     # four figures above and both are deliberate.
@@ -1873,9 +2011,14 @@ async def platform_payment_summary(session: AsyncSession) -> PaymentSummaryRead:
     # on Financial Analytics (`analytics_service._finance_window_totals`) over the same
     # rows, so an admin cannot read two different earnings numbers off two screens.
     # The agreement is pinned by test_qa_advisor_earnings_finance_card_red.py.
+    # Gross share less Stripe's fee, which the advisor bears (QA 2026-10-08).
     advisor_earned = (
         await session.execute(
-            select(func.coalesce(func.sum(Transaction.advisor_payout_usd), 0.0)).where(
+            select(
+                func.coalesce(
+                    func.sum(Transaction.advisor_payout_usd - Transaction.stripe_fee_usd), 0.0
+                )
+            ).where(
                 Transaction.is_archived.is_(False),
                 Transaction.transfer_status == TransferStatus.completed,
                 Transaction.status.in_(
@@ -1904,6 +2047,7 @@ async def platform_payment_summary(session: AsyncSession) -> PaymentSummaryRead:
         total_advisor_earnings_usd=round(
             float(advisor_earned or 0) - float(advisor_reversed or 0), 2
         ),
+        total_stripe_fee_usd=round(float(stripe_fee or 0), 2),
     )
 
 
@@ -1943,6 +2087,16 @@ def list_all_stmt(
     return stmt.order_by(Transaction.created_at.desc())
 
 
+def _refund_rule(r: TransactionRefund) -> Any:
+    """The QA name of the rule a ledger row applied (section 20, "Refund Rule")."""
+    kind = r.kind.value
+    if kind == "advisor_cancel":
+        return "seeker_keeps_fee" if r.fee_policy_refunded else "admin_keeps_fee"
+    if kind in ("rejection", "expiry"):
+        return "platform_fault"
+    return "admin"
+
+
 def refund_read(r: TransactionRefund) -> TransactionRefundRead:
     return TransactionRefundRead(
         id=r.id,
@@ -1953,6 +2107,7 @@ def refund_read(r: TransactionRefund) -> TransactionRefundRead:
         advisor_reversed_usd=as_float(r.advisor_reversed_usd),
         platform_fee_refunded_usd=as_float(r.platform_fee_refunded_usd),
         fee_policy_refunded=r.fee_policy_refunded,
+        refund_rule=_refund_rule(r),
         stripe_refund_id=r.stripe_refund_id,
         stripe_reversal_id=r.stripe_reversal_id,
         reason=r.reason,
@@ -2039,6 +2194,14 @@ async def finance_read(
         commission_usd=txn.commission_usd,
         tax_rate=txn.tax_rate,
         tax_usd=txn.tax_usd,
+        tax_label=txn.tax_label,
+        tax_country=txn.tax_country,
+        tax_jurisdiction=txn.tax_jurisdiction,
+        stripe_fee_usd=as_float(txn.stripe_fee_usd),
+        stripe_fee_recovered=bool(txn.stripe_fee_reversal_id),
+        stripe_fee_reversal_id=txn.stripe_fee_reversal_id,
+        stripe_balance_transaction_id=txn.stripe_balance_transaction_id,
+        advisor_net_usd=advisor_earnings.advisor_net_earnings(txn),
         advisor_payout_usd=txn.advisor_payout_usd,
         payment_method=txn.payment_method,
         invoice_number=txn.invoice_number,
@@ -2121,9 +2284,15 @@ async def advisor_earnings_payment_read(
         display_id=_build_display_id(txn),
         display_status=display_status(txn),
         seeker_photo_url=seeker_profile.profile_photo_url if seeker_profile else None,
+        tax_label=txn.tax_label,
+        tax_country=txn.tax_country,
+        tax_jurisdiction=txn.tax_jurisdiction,
+        stripe_fee_usd=as_float(txn.stripe_fee_usd),
         platform_fee_usd=txn.commission_usd,
         consultant_fee_usd=txn.advisor_payout_usd,
-        net_amount_usd=txn.advisor_payout_usd,
+        advisor_gross_usd=as_float(txn.advisor_payout_usd),
+        advisor_reversed_usd=as_float(txn.advisor_reversed_usd),
+        net_amount_usd=advisor_earnings.advisor_net_earnings(txn),
     )
 
 

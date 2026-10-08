@@ -28,6 +28,7 @@ class TransactionEventType(StrEnum):
     refund_requested = "refund_requested"  # EPIC 04 refund engine started
     transfer_reversed = "transfer_reversed"  # advisor share pulled back
     refund_failed = "refund_failed"  # a Stripe refund/reversal call failed
+    stripe_fee_recovered = "stripe_fee_recovered"  # Stripe's fee reversed off the advisor
 
 
 class TransactionEvent(Base):

@@ -44,6 +44,23 @@ async def create_subscription_checkout(
     return ResponseEnvelope[CheckoutResponse](data=result, meta=Meta(request_id=request_id))
 
 
+@router.post("/me/choose-free", response_model=ResponseEnvelope[dict[str, bool]])
+async def choose_free_plan(
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[dict[str, bool]]:
+    """The first-time plans page: record that the user chose the free plan.
+
+    Creates no subscription row and is safe to call repeatedly. Clears
+    ``plan_choice_required`` on ``GET /users/me``.
+    """
+    await subscription_service.choose_free(session, current_user)
+    return ResponseEnvelope[dict[str, bool]](
+        data={"acknowledged": True}, meta=Meta(request_id=request_id)
+    )
+
+
 @router.get("/me", response_model=ResponseEnvelope[SubscriptionRead | None])
 async def get_my_subscription(
     current_user: CurrentUser,
@@ -60,16 +77,15 @@ async def get_my_subscription(
 
 @router.post("/me/cancel", response_model=ResponseEnvelope[SubscriptionRead])
 async def cancel_my_subscription(
-    data: SubscriptionCancel,
     current_user: CurrentUser,
     session: SessionDep,
     settings: SettingsDep,
     request_id: RequestIdDep,
+    data: SubscriptionCancel | None = None,
 ) -> ResponseEnvelope[SubscriptionRead]:
-    """Default: keep access until the period end, then stop billing."""
-    sub = await subscription_service.cancel(
-        session, current_user, settings, at_period_end=data.at_period_end
-    )
+    """Schedule the move to the free plan at the period end (no immediate cancel)."""
+    _ = data
+    sub = await subscription_service.cancel(session, current_user, settings)
     return ResponseEnvelope[SubscriptionRead](
         data=await subscription_service.read(session, sub), meta=Meta(request_id=request_id)
     )

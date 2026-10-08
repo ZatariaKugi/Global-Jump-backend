@@ -28,7 +28,7 @@ from app.core.config import Settings
 from app.core.exceptions import AppError, ConflictError
 from app.models.booking import Booking, BookingRefundStatus, PaymentStatus
 from app.models.notification import NotificationEntityType, NotificationType
-from app.models.transaction import ChargeModel, Transaction, TransactionStatus, TransferStatus
+from app.models.transaction import Transaction, TransactionStatus, TransferStatus
 from app.models.transaction_event import TransactionEvent, TransactionEventType
 from app.models.transaction_refund import RefundKind, RefundStatus, TransactionRefund
 from app.models.user import User
@@ -49,6 +49,40 @@ def _cents(value: Decimal) -> int:
     return int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
 
 
+class ReversalUnavailable(Exception):
+    """A reversal is due but the advisor's transfer cannot be found on Stripe."""
+
+
+def _field(obj: object, key: str) -> object:
+    """Read a field from a StripeObject or a plain dict."""
+    if isinstance(obj, dict):
+        return obj.get(key)
+    try:
+        return obj[key]  # type: ignore[index]
+    except (KeyError, TypeError, AttributeError):
+        return getattr(obj, key, None)
+
+
+async def _ensure_transfer_id(txn: Transaction) -> str | None:
+    """The transfer id captured at checkout, or recovered from the charge.
+
+    ``_handle_checkout_completed`` is allowed to lose the PaymentIntent lookup (it logs
+    ``webhook_pi_retrieve_failed`` and carries on), so a destination charge can sit with
+    a NULL ``stripe_transfer_id`` even though the advisor was paid. The charge always
+    knows its transfer; ask it before giving up.
+    """
+    if txn.stripe_transfer_id:
+        return str(txn.stripe_transfer_id)
+    if not txn.stripe_charge_id:
+        return None
+    charge = await stripe.Charge.retrieve_async(str(txn.stripe_charge_id))
+    raw = _field(charge, "transfer")
+    transfer_id = str(_field(raw, "id") or raw) if raw else None
+    if transfer_id:
+        txn.stripe_transfer_id = transfer_id
+    return transfer_id
+
+
 @dataclass(frozen=True, slots=True)
 class RefundPlan:
     kind: str
@@ -56,31 +90,57 @@ class RefundPlan:
     advisor_reversed_usd: Decimal
     platform_fee_refunded_usd: Decimal
     fee_policy_refunded: bool
+    # What the seeker does not get back: tax, Stripe's fee and (per policy) the commission.
+    retained_usd: Decimal = Decimal("0.00")
 
 
 def _fee_total(txn: object) -> Decimal:
-    """Application fee on a destination charge; commission on a legacy charge."""
-    model = getattr(txn, "charge_model", None)
-    model = getattr(model, "value", model)
-    if model == ChargeModel.destination.value:
-        return _money(getattr(txn, "application_fee_usd", 0))
+    """The platform commission on this payment: the one part of the seeker's money that
+    the fee policy decides about. Tax and Stripe's fee are never on the table."""
     return _money(getattr(txn, "commission_usd", 0))
+
+
+def refundable_total(txn: object) -> Decimal:
+    """Everything a seeker can ever get back on this payment.
+
+    Tax is never reversed and Stripe's processing fee is never reversed (QA 2026-10-08,
+    section 24), so ``amount - tax - stripe_fee`` is the ceiling: commission plus the
+    advisor's net. A payment is ``refunded`` when this much has gone back, and
+    ``partially_refunded`` while the platform still holds its commission.
+    """
+    return _money(
+        _money(txn.amount_usd)  # type: ignore[attr-defined]
+        - _money(getattr(txn, "tax_usd", 0))
+        - _money(getattr(txn, "stripe_fee_usd", 0))
+    )
+
+
+def _stripe_fee_taken(txn: object) -> Decimal:
+    """The Stripe fee only counts as taken from the advisor once Stripe confirmed the
+    reversal; if that recovery failed the advisor still holds the gross share."""
+    if getattr(txn, "stripe_fee_reversal_id", None):
+        return _money(getattr(txn, "stripe_fee_usd", 0))
+    return Decimal(0)
 
 
 def compute_refund(
     txn: object,
     kind: str | RefundKind,
     config: PaymentConfig,
-    amount_usd: Decimal | float | None = None,
-    *,
-    refund_platform_fee: bool | None = None,
-    reverse_advisor_share: bool | None = None,
 ) -> RefundPlan:
-    """Pure calculation. ``txn`` only needs the stored split attributes."""
+    """Pure calculation. ``txn`` only needs the stored split attributes.
+
+    Only the system refunds: an advisor cancellation (share back, fee per policy) or a
+    platform fault (rejection, expiry: everything back). Admin-initiated refunds were
+    removed on 2026-10-07 as a business decision; their enum values remain only so
+    historical ledger rows still load.
+    """
     kind = RefundKind(kind)
-    remaining_total = _money(txn.amount_usd) - _money(getattr(txn, "refunded_amount_usd", 0))  # type: ignore[attr-defined]
-    remaining_advisor = _money(txn.advisor_payout_usd) - _money(  # type: ignore[attr-defined]
-        getattr(txn, "advisor_reversed_usd", 0)
+    remaining_total = refundable_total(txn) - _money(getattr(txn, "refunded_amount_usd", 0))
+    remaining_advisor = (
+        _money(txn.advisor_payout_usd)  # type: ignore[attr-defined]
+        - _stripe_fee_taken(txn)
+        - _money(getattr(txn, "advisor_reversed_usd", 0))
     )
     remaining_fee = _fee_total(txn) - _money(getattr(txn, "platform_fee_refunded_usd", 0))
     remaining_advisor = max(Decimal(0), remaining_advisor)
@@ -99,38 +159,14 @@ def compute_refund(
         advisor, fee = remaining_advisor, remaining_fee
         seeker = advisor + fee
         fee_policy = True
-    elif kind == RefundKind.admin_full:
-        reverse = True if reverse_advisor_share is None else reverse_advisor_share
-        refund_fee = True if refund_platform_fee is None else refund_platform_fee
-        advisor = remaining_advisor if reverse else Decimal(0)
-        fee = remaining_fee if refund_fee else Decimal(0)
-        seeker = remaining_total if (reverse and refund_fee) else advisor + fee
-        fee_policy = refund_fee
-    else:  # admin_partial
-        if amount_usd is None:
-            raise AppError("A partial refund needs an amount", code="refund_amount_required")
-        seeker = _money(amount_usd)
-        if seeker <= 0:
-            raise AppError("Refund amount must be positive", code="refund_amount_required")
-        reverse = True if reverse_advisor_share is None else reverse_advisor_share
-        refund_fee = False if refund_platform_fee is None else refund_platform_fee
-        if reverse:
-            advisor = min(seeker, remaining_advisor)
-            rest = seeker - advisor
-            fee = min(rest, remaining_fee) if refund_fee else Decimal(0)
-            if rest - fee > 0:
-                raise AppError(
-                    "Refund exceeds the advisor share; enable the platform fee refund "
-                    "or lower the amount",
-                    code="refund_amount_too_large",
-                )
-        else:
-            advisor = Decimal(0)
-            # Platform-funded: take the fee first, the remainder from the platform balance.
-            fee = min(seeker, remaining_fee) if refund_fee else Decimal(0)
-        fee_policy = refund_fee
+    else:
+        raise AppError("Refunds are issued by the system only", code="not_refundable")
 
     seeker = _money(seeker)
+    if seeker <= 0:
+        # e.g. a second advisor cancel under "retained": the advisor share is already
+        # back and the commission is not on offer, so there is nothing to send.
+        raise AppError("Nothing left to refund on this payment", code="not_refundable")
     if seeker > remaining_total:
         raise AppError(
             "Refund would exceed what is left of the payment", code="refund_amount_too_large"
@@ -141,6 +177,7 @@ def compute_refund(
         advisor_reversed_usd=_money(advisor),
         platform_fee_refunded_usd=_money(fee),
         fee_policy_refunded=fee_policy,
+        retained_usd=_money(_money(txn.amount_usd) - seeker),  # type: ignore[attr-defined]
     )
 
 
@@ -236,7 +273,7 @@ async def execute_refund(
 
     try:
         await _run_stripe_steps(txn, row)
-    except stripe.StripeError as exc:
+    except (stripe.StripeError, ReversalUnavailable) as exc:
         await _fail(session, row, txn, exc)
         raise AppError("Refund could not be processed", code="refund_failed") from exc
 
@@ -269,16 +306,18 @@ async def _settle(
     half-way lands in exactly the same end state once it succeeds.
     """
     row.last_error = None
+    # Only a reversal Stripe confirmed goes into the books. The advisor's connected
+    # balance is the one figure they can check for themselves, and it must agree.
+    reversed_amount = _money(row.advisor_reversed_usd) if row.stripe_reversal_id else Decimal(0)
+    row.advisor_reversed_usd = reversed_amount
     txn.refunded_amount_usd = float(
         _money(txn.refunded_amount_usd) + _money(row.refund_to_seeker_usd)
     )
-    txn.advisor_reversed_usd = float(
-        _money(txn.advisor_reversed_usd) + _money(row.advisor_reversed_usd)
-    )
+    txn.advisor_reversed_usd = float(_money(txn.advisor_reversed_usd) + reversed_amount)
     txn.platform_fee_refunded_usd = float(
         _money(txn.platform_fee_refunded_usd) + _money(row.platform_fee_refunded_usd)
     )
-    fully = _money(txn.refunded_amount_usd) >= _money(txn.amount_usd)
+    fully = _money(txn.refunded_amount_usd) >= refundable_total(txn)
     txn.status = TransactionStatus.refunded if fully else TransactionStatus.partially_refunded
     txn.refunded_at = datetime.now(UTC)
     txn.refunded_by = initiated_by
@@ -326,7 +365,27 @@ async def _settle(
 
 
 async def _run_stripe_steps(txn: Transaction, row: TransactionRefund) -> None:
-    """The two calls, each skipped when its id is already recorded (resumable)."""
+    """The two calls, each skipped when its id is already recorded (resumable).
+
+    The reversal is checked *before* the seeker refund is issued: a refund that cannot
+    be completed must not half-run, and a reversal that never happened is never
+    recorded. Silently skipping it (as before 2026-10-07) left the advisor's Stripe
+    balance untouched while every internal figure said the money had come back.
+    """
+    if txn.transfer_status != TransferStatus.completed:
+        # Legacy separate-charge row whose hold never released: the advisor never
+        # received the share, so there is nothing to claw back and nothing to record.
+        row.advisor_reversed_usd = Decimal(0)
+    reversal_due = _money(row.advisor_reversed_usd) > 0 and row.stripe_reversal_id is None
+    transfer_id: str | None = None
+    if reversal_due:
+        transfer_id = await _ensure_transfer_id(txn)
+        if not transfer_id:
+            raise ReversalUnavailable(
+                "The advisor's transfer could not be found on Stripe, so the advisor share "
+                "cannot be reversed; the seeker refund was not issued"
+            )
+
     if row.stripe_refund_id is None:
         params: dict[str, object] = {
             "amount": _cents(_money(row.refund_to_seeker_usd)),
@@ -349,14 +408,9 @@ async def _run_stripe_steps(txn: Transaction, row: TransactionRefund) -> None:
         row.stripe_refund_id = str(refund.id)
         row.status = RefundStatus.refunded
 
-    needs_reversal = (
-        _money(row.advisor_reversed_usd) > 0
-        and bool(txn.stripe_transfer_id)
-        and txn.transfer_status == TransferStatus.completed
-    )
-    if needs_reversal and row.stripe_reversal_id is None:
+    if reversal_due and transfer_id:
         reversal = await stripe.Transfer.create_reversal_async(
-            str(txn.stripe_transfer_id),
+            transfer_id,
             amount=_cents(_money(row.advisor_reversed_usd)),
             metadata={"transaction_id": str(txn.id), "refund_id": str(row.id)},
             idempotency_key=f"reversal_{row.id}",
@@ -392,7 +446,7 @@ async def retry_refund(
     stripe.api_key = keys.secret_key
     try:
         await _run_stripe_steps(txn, row)
-    except stripe.StripeError as exc:
+    except (stripe.StripeError, ReversalUnavailable) as exc:
         await _fail(session, row, txn, exc)
         raise AppError("Refund could not be processed", code="refund_failed") from exc
     await _settle(

@@ -93,6 +93,7 @@ from app.services import (
     payment_service,
     review_service,
     seeker_document_service,
+    seeker_profile_service,
     seeker_recommendation_service,
 )
 from app.services.advisor_search_service import AdvisorSearchFilters, SortOption
@@ -168,13 +169,20 @@ async def update_my_advisor_profile(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorProfileRead]:
-    """Update editable profile fields. ``successful_applications`` is not accepted."""
+    """Update editable profile fields. ``successful_applications`` is not accepted.
+
+    ``profile_edits`` is an advisor plan quota (one free save on the free plan,
+    discussion §20): checked before the save and counted only after it succeeds, so
+    a rejected payload or a failed save never costs the advisor their edit.
+    """
+    await entitlement_service.check(session, current_user, "profile_edits")
     profile = await advisor_profile_service.get_or_create(session, current_user.id)
     if profile.public_profile_slug is None and data.public_profile_slug is None:
         profile.public_profile_slug = await advisor_search_service.generate_unique_slug(
             session, current_user.full_name
         )
     profile = await advisor_profile_service.update(session, profile, data)
+    await entitlement_service.consume(session, current_user, "profile_edits")
     return ResponseEnvelope[AdvisorProfileRead](
         data=await advisor_profile_service.build_enriched_read(
             session, profile, current_user, settings
@@ -233,9 +241,10 @@ async def list_advisors(
         recommended=recommended,
         sort=sort,
     )
-    # EPIC 04: Find Advisor search is a seeker plan feature (``find_advisor``).
-    if principal.user is not None and principal.user.role == UserRole.seeker:
-        await entitlement_service.check(session, principal.user, "find_advisor")
+    # Advisor discovery is free for every seeker (PM, 2026-10-08). The AI path
+    # below (``recommended=true``) is the seeker perk ``matched_advisors``.
+    if recommended and principal.user is not None and principal.user.role == UserRole.seeker:
+        await entitlement_service.limit_for(session, principal.user, "matched_advisors")
     stmt = advisor_search_service.build_search_stmt(filters)
     destination, match_visa = await _seeker_match_context(session, principal)
     blended_pct: dict[uuid.UUID, int] = {}
@@ -254,6 +263,12 @@ async def list_advisors(
             from app.services.ai_advisor_match_service import ai_match_status
 
             ai_match_meta = ai_match_status(ai_failure, attempted=True)
+        # Only advisors whose current plan grants ``ai_recommended`` may appear
+        # in AI results (discussion §29-§31); the rest stay ordinary matches.
+        recs = await seeker_recommendation_service.only_ai_eligible(session, recs)
+        # The seeker has now *used* AI recommendations: the journey chart's first bar
+        # follows this, never the existence of matches (PM, 2026-10-09).
+        await seeker_profile_service.mark_ai_recommendations_viewed(session, principal.id)
         score_by_id = {r.advisor_id: int(round(r.match_score)) for r in recs}
         ordered_ids = [r.advisor_id for r in recs]
         all_users = list((await session.execute(stmt)).scalars().all())
@@ -947,6 +962,11 @@ async def get_my_earnings(
         data=AdvisorEarnings(
             total_earned_usd=data["total_earned_usd"],
             total_commission_paid_usd=data["total_commission_paid_usd"],
+            total_gross_revenue_usd=data["total_gross_revenue_usd"],
+            total_platform_fee_usd=data["total_platform_fee_usd"],
+            total_advisor_gross_usd=data["total_advisor_gross_usd"],
+            total_stripe_fee_usd=data["total_stripe_fee_usd"],
+            total_refunded_usd=data["total_refunded_usd"],
             transactions=[
                 TransactionRead.model_validate(t)
                 for t in data["transactions"]  # type: ignore[attr-defined]
@@ -1023,9 +1043,10 @@ async def list_my_leads(
 ) -> ResponseEnvelope[list[AdvisorLeadRead]]:
     """AI-matched customer leads for this advisor, ranked by match score.
 
-    EPIC 04: the advisor plan's ``leads`` feature caps the list at the top *n*
-    matches (off -> ``subscription_required``).
+    The advisor plan's ``leads`` feature is a lock (off or absent ->
+    ``subscription_required``) and, when numeric, caps the list at the top *n*.
     """
+    await entitlement_service.check(session, current_user, "leads")
     cap = await entitlement_service.limit_for(session, current_user, "leads")
     stmt = advisor_lead_service.list_for_advisor_stmt(
         current_user.id,
@@ -1052,6 +1073,7 @@ async def get_my_lead(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorLeadRead]:
     """Lead detail, including the AI-generated match reasons. Marks the lead as viewed."""
+    await entitlement_service.check(session, current_user, "leads")
     lead = await advisor_lead_service.get_for_advisor(session, lead_id, current_user.id)
     lead = await advisor_lead_service.mark_viewed(session, lead)
     return ResponseEnvelope[AdvisorLeadRead](
@@ -1073,6 +1095,7 @@ async def contact_my_lead(
 ) -> ResponseEnvelope[AdvisorLeadRead]:
     """Record that the advisor reached out to this lead (status marker only —
     in-app chat requires an actual booking per PRD §3.7.1)."""
+    await entitlement_service.check(session, current_user, "leads")
     lead = await advisor_lead_service.get_for_advisor(session, lead_id, current_user.id)
     lead = await advisor_lead_service.mark_contacted(session, lead, current_user.id)
     seeker = await session.get(User, lead.seeker_id)
@@ -1111,6 +1134,7 @@ async def dismiss_my_lead(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorLeadRead]:
+    await entitlement_service.check(session, current_user, "leads")
     lead = await advisor_lead_service.get_for_advisor(session, lead_id, current_user.id)
     lead = await advisor_lead_service.dismiss(session, lead, current_user.id)
     return ResponseEnvelope[AdvisorLeadRead](

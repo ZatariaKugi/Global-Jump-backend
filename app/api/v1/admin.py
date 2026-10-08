@@ -24,13 +24,14 @@ from app.models.booking import BookingStatus
 from app.models.country_rule import RulePublishStatus
 from app.models.eligibility_rule import EligibilityRule
 from app.models.pre_registration import PreRegistrationInterest
+from app.models.pricing_plan import PricingPlan
 from app.models.review import Review
 from app.models.support_ticket import TicketPriority
 from app.models.ticket_message import TicketMessageAttachment
 from app.models.transaction import TransactionStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.ab_variant import AbVariantCreate, AbVariantRead, AbVariantUpdate
-from app.schemas.admin import FeatureFlagUpdate, VerificationStatusUpdate
+from app.schemas.admin import VerificationStatusUpdate
 from app.schemas.advisor import AdvisorRead
 from app.schemas.advisor_admin import (
     AdvisorEarningsSummaryRead,
@@ -42,7 +43,6 @@ from app.schemas.advisor_admin import (
 )
 from app.schemas.advisor_credential import AdvisorCredentialRead, CredentialStatusUpdate
 from app.schemas.advisor_dashboard import DashboardWindow
-from app.schemas.advisor_profile import AdvisorProfileRead
 from app.schemas.analytics import (
     AdvisorAnalyticsRead,
     AIAnalyticsRead,
@@ -85,7 +85,6 @@ from app.schemas.matching_weights import MatchingWeightsRead, MatchingWeightsUpd
 from app.schemas.payment import (
     InvoiceRead,
     PaymentSummaryRead,
-    RefundCreate,
     TransactionFinanceRead,
     TransactionRefundRead,
 )
@@ -98,6 +97,7 @@ from app.schemas.payment_settings import (
 )
 from app.schemas.pre_registration import PreRegistrationRead
 from app.schemas.pricing_plan import (
+    CoreFeatureRead,
     FeatureCatalogRead,
     PricingPlanAdminRead,
     PricingPlanCreate,
@@ -125,7 +125,6 @@ from app.services import (
     ab_variant_service,
     advisor_admin_service,
     advisor_credential_service,
-    advisor_profile_service,
     analytics_service,
     assessment_service,
     booking_service,
@@ -303,39 +302,6 @@ async def update_advisor_verification(
 
     return ResponseEnvelope[AdvisorRead](
         data=AdvisorRead.model_validate(advisor),
-        meta=Meta(request_id=request_id),
-    )
-
-
-@router.patch(
-    "/advisors/{advisor_id}/feature",
-    response_model=ResponseEnvelope[AdvisorProfileRead],
-)
-async def update_advisor_featured(
-    advisor_id: uuid.UUID,
-    body: FeatureFlagUpdate,
-    session: SessionDep,
-    settings: SettingsDep,
-    request_id: RequestIdDep,
-) -> ResponseEnvelope[AdvisorProfileRead]:
-    """Feature or un-feature an advisor on the homepage (admin-curated, PRD §3.5)."""
-    from app.core.exceptions import NotFoundError
-
-    advisor = await session.get(User, advisor_id)
-    if advisor is None or advisor.role != UserRole.advisor:
-        raise NotFoundError("Advisor not found")
-
-    profile = await advisor_profile_service.get_or_create(session, advisor_id)
-    if body.is_featured:
-        # EPIC 04: featuring needs the advisor's plan to include ``featured_listing``
-        # (open when no advisor plan is configured).
-        await entitlement_service.check(session, advisor, "featured_listing")
-    profile.is_featured = body.is_featured
-    session.add(profile)
-    await session.flush()
-    await session.refresh(profile)
-    return ResponseEnvelope[AdvisorProfileRead](
-        data=await advisor_profile_service.build_enriched_read(session, profile, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -1380,6 +1346,15 @@ async def get_feature_catalog(
     )
 
 
+@router.get("/pricing-plans/core-features", response_model=ResponseEnvelope[list[CoreFeatureRead]])
+async def get_core_features(request_id: RequestIdDep) -> ResponseEnvelope[list[CoreFeatureRead]]:
+    """Marketplace features no plan may restrict (shown read-only in the plan editor)."""
+    return ResponseEnvelope[list[CoreFeatureRead]](
+        data=[CoreFeatureRead(key=k, label=v) for k, v in pricing_plan_service.CORE_FEATURES],
+        meta=Meta(request_id=request_id),
+    )
+
+
 @router.get("/pricing-plans", response_model=ResponseEnvelope[list[PricingPlanAdminRead]])
 async def list_pricing_plans_admin(
     params: PaginationDep,
@@ -1494,9 +1469,7 @@ async def subscriptions_finance_summary(
     session: SessionDep,
     settings: SettingsDep,
     request_id: RequestIdDep,
-    period: Annotated[
-        Literal["daily", "monthly", "yearly", "overall"], Query()
-    ] = "monthly",
+    period: Annotated[Literal["daily", "monthly", "yearly", "overall"], Query()] = "monthly",
 ) -> ResponseEnvelope[AdminSubscriptionSummaryRead]:
     """Cards above the Subscriptions Finance table: who subscribes, and what they pay.
 
@@ -1526,10 +1499,21 @@ async def list_subscriptions_admin(
     stmt = subscription_service.admin_list_stmt(audience, status, q, grace_days)
     count_stmt = select(func.count()).select_from(stmt.order_by(None).subquery())
     total = (await session.scalar(count_stmt)) or 0
-    result = await session.execute(stmt.offset(params.offset).limit(params.limit))
+    rows = (await session.execute(stmt.offset(params.offset).limit(params.limit))).all()
+    pending_ids = {s.scheduled_plan_id for s, _u, _p, _c in rows if s.scheduled_plan_id}
+    pending_names: dict[uuid.UUID, str] = {}
+    if pending_ids:
+        pending_names = {
+            pl.id: pl.name
+            for pl in (
+                await session.execute(select(PricingPlan).where(PricingPlan.id.in_(pending_ids)))
+            ).scalars()
+        }
     data = [
-        subscription_service.admin_read(s, u, p, charged, grace_days)
-        for s, u, p, charged in result.all()
+        subscription_service.admin_read(
+            s, u, p, charged, grace_days, scheduled_plan_name=pending_names.get(s.scheduled_plan_id)
+        )
+        for s, u, p, charged in rows
     ]
     return ResponseEnvelope[list[AdminSubscriptionRead]](
         data=data, meta=page_meta(params, total, request_id)
@@ -1848,36 +1832,6 @@ async def get_payment_timeline(
     events = await payment_service.list_events(session, transaction_id)
     return ResponseEnvelope[list[TransactionEventRead]](
         data=[TransactionEventRead.build(e) for e in events],
-        meta=Meta(request_id=request_id),
-    )
-
-
-@router.post(
-    "/payments/{transaction_id}/refund",
-    response_model=ResponseEnvelope[TransactionFinanceRead],
-)
-async def refund_payment(
-    transaction_id: uuid.UUID,
-    body: RefundCreate,
-    principal: CurrentPrincipal,
-    settings: SettingsDep,
-    session: SessionDep,
-    request_id: RequestIdDep,
-) -> ResponseEnvelope[TransactionFinanceRead]:
-    """Issue a full or partial refund for a completed payment."""
-    txn = await payment_service.refund_transaction(
-        session,
-        transaction_id,
-        principal.id,
-        body.reason,
-        settings,
-        body.amount_usd,
-        reverse_advisor_share=body.reverse_advisor_share,
-        refund_platform_fee=body.refund_platform_fee,
-    )
-    data = await payment_service.finance_read(session, txn, settings)
-    return ResponseEnvelope[TransactionFinanceRead](
-        data=data,
         meta=Meta(request_id=request_id),
     )
 

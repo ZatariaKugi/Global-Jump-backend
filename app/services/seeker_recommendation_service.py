@@ -9,6 +9,7 @@ in ``advisor_leads`` and ``GET /assessments/{id}/matched-advisors``.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -112,12 +113,43 @@ async def list_for_seeker(
         )
     )
     if destination:
-        stmt = stmt.where(
-            SeekerAdvisorRecommendation.destination_country == destination.upper()
-        )
+        stmt = stmt.where(SeekerAdvisorRecommendation.destination_country == destination.upper())
     if visa_type:
         stmt = stmt.where(SeekerAdvisorRecommendation.visa_type == visa_type)
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def only_ai_eligible(session: AsyncSession, rows: list[Any]) -> list[Any]:
+    """Keep the advisors whose current plan grants ``ai_recommended``.
+
+    AI recommendations are a paid advisor perk; ordinary matches and the directory
+    are not filtered (PM, 2026-10-09), so this is applied only on the AI paths.
+    """
+    from app.services import entitlement_service
+
+    eligible: dict[uuid.UUID, bool] = {}
+    out = []
+    for r in rows:
+        aid = r.advisor_id
+        if aid not in eligible:
+            eligible[aid] = await entitlement_service.can_use(session, aid, "ai_recommended")
+        if eligible[aid]:
+            out.append(r)
+    return out
+
+
+async def clear_for_advisor(session: AsyncSession, advisor_id: uuid.UUID) -> None:
+    """Forget every cached recommendation naming this advisor.
+
+    Called when the advisor's subscription ends or changes plan, so an advisor who
+    stopped paying for ``ai_recommended`` drops out of AI results at once rather
+    than when each seeker's cache happens to refresh (discussion §31).
+    """
+    await session.execute(
+        delete(SeekerAdvisorRecommendation).where(
+            SeekerAdvisorRecommendation.advisor_id == advisor_id
+        )
+    )
 
 
 async def clear_for_seeker(session: AsyncSession, seeker_id: uuid.UUID) -> None:
@@ -150,10 +182,14 @@ async def replace_from_matches(
     profiles_by_id: dict[uuid.UUID, AdvisorProfile] = {}
     if advisor_ids:
         profile_rows = (
-            await session.execute(
-                select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
+            (
+                await session.execute(
+                    select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         profiles_by_id = {p.user_id: p for p in profile_rows}
 
     rows: list[SeekerAdvisorRecommendation] = []
@@ -259,9 +295,9 @@ async def as_match_reads(
     advisor_ids = [r.advisor_id for r in recs]
     users = {
         u.id: u
-        for u in (
-            await session.execute(select(User).where(User.id.in_(advisor_ids)))
-        ).scalars().all()
+        for u in (await session.execute(select(User).where(User.id.in_(advisor_ids))))
+        .scalars()
+        .all()
     }
     profiles = {
         p.user_id: p
@@ -269,7 +305,9 @@ async def as_match_reads(
             await session.execute(
                 select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     }
     ratings = await review_service.rating_summaries(session, advisor_ids)
     reads: list[AdvisorMatchRead] = []
@@ -290,15 +328,11 @@ async def as_match_reads(
                     if profile is not None
                     else None
                 ),
-                years_of_experience=(
-                    profile.years_of_experience if profile is not None else None
-                ),
+                years_of_experience=(profile.years_of_experience if profile is not None else None),
                 average_rating=avg,
                 starting_price_usd=advisor_profile_service.starting_price_usd(profile),
                 match_score=rec.match_score,
-                public_profile_slug=(
-                    profile.public_profile_slug if profile is not None else None
-                ),
+                public_profile_slug=(profile.public_profile_slug if profile is not None else None),
                 match_reasons=rec.match_reasons,
                 rule_score=rec.rule_score,
                 ai_score=rec.ai_score,
@@ -335,9 +369,8 @@ async def matches_for_dashboard(
     """
     ai_failure: AiMatchFailure | None = None
     ai_attempted = False
-    recs, ai_failure, ai_attempted = await refresh_for_seeker(
-        session, seeker_id, settings=settings
-    )
+    recs, ai_failure, ai_attempted = await refresh_for_seeker(session, seeker_id, settings=settings)
+    recs = await only_ai_eligible(session, recs)
     if country is not None:
         dest = country.upper()
         recs = [r for r in recs if r.destination_country == dest]

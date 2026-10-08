@@ -7,7 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 SubscriptionStatusLiteral = Literal[
     "incomplete", "trialing", "active", "past_due", "canceled", "unpaid", "expired"
@@ -19,7 +19,10 @@ class SubscriptionCheckoutCreate(BaseModel):
 
 
 class SubscriptionCancel(BaseModel):
-    at_period_end: bool = True
+    """Cancelling is a scheduled move to the free plan at the period end (PM,
+    2026-10-08). There is no immediate cancel, so the body carries nothing."""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class SubscriptionChangePlan(BaseModel):
@@ -81,15 +84,20 @@ class SubscriptionRead(BaseModel):
     access_until: datetime | None
     payment_method: PaymentMethodSummary | None
     latest_invoice: SubscriptionInvoiceRead | None = None
+    # A downgrade or cancel waiting for the period end: the plan it moves to (the
+    # free plan for a cancel) and when. Choosing the current plan again undoes it.
+    scheduled_plan: SubscriptionPlanBrief | None = None
+    scheduled_change_at: datetime | None = None
 
 
 class ChangePlanPreviewRead(BaseModel):
     plan: SubscriptionPlanBrief
     amount_due_today_usd: Decimal | None
     note: str
-    # "upgrade" is the only change allowed mid-period; "downgrade" is refused and
-    # waits for the period to end; "cancel" is the free plan, which stops renewal.
+    # "upgrade" is billed now and live at once; "downgrade" and "cancel" (the free
+    # plan) are scheduled for ``effective_at``, the current period end.
     direction: Literal["upgrade", "downgrade", "cancel"] = "upgrade"
+    effective_at: datetime | None = None
 
 
 class PortalLinkRead(BaseModel):
@@ -108,9 +116,14 @@ class AdminSubscriptionRead(BaseModel):
     # What the subscriber has actually paid across every settled invoice — the plan's
     # monthly price says nothing about mid-period upgrades or failed renewals.
     total_charged_usd: Decimal = Decimal("0")
+    # Which version of the plan the subscriber holds (QA BUG21); ``price_usd`` above
+    # is what they signed up for, not necessarily the plan's price today.
+    plan_version: int = 1
     status: SubscriptionStatusLiteral
     current_period_end: datetime | None
     cancel_at_period_end: bool
+    scheduled_plan_name: str | None = None
+    scheduled_change_at: datetime | None = None
     stripe_subscription_id: str | None
     created_at: datetime
 

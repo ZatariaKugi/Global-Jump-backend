@@ -206,10 +206,14 @@ async def _latest_advisor_message(
 
 
 def _profile_recommendation_status(
-    recs: list[SeekerAdvisorRecommendation],
+    recs: list[SeekerAdvisorRecommendation], *, viewed_at: datetime | None = None
 ) -> JourneyStepStatus:
-    """First journey step — complete once profile-based matches exist."""
-    if recs:
+    """First journey step, "AI Recommendation" — complete once the seeker has actually
+    opened AI recommended advisors. Profile matches alone are not use (PM, 2026-10-09):
+    they exist for every seeker with intent, and a free seeker books from them without
+    ever touching the AI list."""
+    _ = recs
+    if viewed_at is not None:
         return JourneyStepStatus.completed
     return JourneyStepStatus.pending
 
@@ -466,11 +470,12 @@ async def compute_state(
     profile = await seeker_profile_service.get_or_create(session, seeker_id)
     submitted = profile.application_submitted_at is not None
 
-    profile_rec_st = _profile_recommendation_status(profile_recs)
-    advisor_unlocked = profile_rec_st == JourneyStepStatus.completed
-    advisor_st = _advisor_status(
-        bookings, advisor_unlocked, selected=advisor_engaged
+    profile_rec_st = _profile_recommendation_status(
+        profile_recs, viewed_at=profile.ai_recommendations_viewed_at
     )
+    # Booking never waits for AI recommendations: a free seeker books from matches.
+    advisor_unlocked = True
+    advisor_st = _advisor_status(bookings, advisor_unlocked, selected=advisor_engaged)
 
     docs_unlocked = advisor_st in (
         JourneyStepStatus.completed,
@@ -523,18 +528,12 @@ async def submit_application(
     country: str | None,
 ) -> JourneyState:
     """Mark the visa application submitted. Idempotent. Requires Review complete."""
-    state = await compute_state(
-        session, seeker_id, settings, visa_type=visa_type, country=country
-    )
+    state = await compute_state(session, seeker_id, settings, visa_type=visa_type, country=country)
     prep_st = state.statuses[JourneyStepKey.application_preparation]
     if prep_st != JourneyStepStatus.completed:
         docs_st = state.statuses[JourneyStepKey.documentation]
         if docs_st != JourneyStepStatus.completed:
-            pending = [
-                item.label
-                for item in state.summary.checklist
-                if item.status != "approved"
-            ]
+            pending = [item.label for item in state.summary.checklist if item.status != "approved"]
             raise ConflictError(
                 "All required documents must be advisor-approved before submitting",
                 code="documents_incomplete",
@@ -550,9 +549,7 @@ async def submit_application(
         profile.updated_by = actor_id
         session.add(profile)
         await session.flush()
-    return await compute_state(
-        session, seeker_id, settings, visa_type=visa_type, country=country
-    )
+    return await compute_state(session, seeker_id, settings, visa_type=visa_type, country=country)
 
 
 async def get_journey(
@@ -564,9 +561,7 @@ async def get_journey(
     country: str | None,
 ) -> VisaJourneyRead:
     """Build the Visa Journey Tracking payload for the seeker."""
-    state = await compute_state(
-        session, seeker_id, settings, visa_type=visa_type, country=country
-    )
+    state = await compute_state(session, seeker_id, settings, visa_type=visa_type, country=country)
     assessment, booking, summary = state.assessment, state.booking, state.summary
     statuses = state.statuses
 

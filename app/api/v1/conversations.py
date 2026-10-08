@@ -92,8 +92,9 @@ async def _send_new_message_email(
 
 
 async def _assert_seeker_may_chat(session: AsyncSession, user: User) -> None:
-    """EPIC 04: ``chats`` is a seeker plan feature; advisors and admins are never gated."""
-    if user.role == UserRole.seeker:
+    """``chats`` is a plan perk for seekers *and* advisors (PM, 2026-10-08); a booking
+    never unlocks it by itself. Admins are never gated."""
+    if user.role in (UserRole.seeker, UserRole.advisor):
         await entitlement_service.check(session, user, "chats")
 
 

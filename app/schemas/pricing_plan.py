@@ -62,6 +62,8 @@ class PricingPlanCreate(BaseModel):
     price_usd: Decimal = Field(ge=0, decimal_places=2)
     billing_interval: IntervalLiteral = "month"
     is_highlighted: bool = False
+    # The audience's designated free plan (price must be 0). One per audience.
+    is_default: bool = False
     features: list[PlanFeatureInput] = Field(default_factory=list)
 
 
@@ -71,6 +73,7 @@ class PricingPlanUpdate(BaseModel):
     tagline: str | None = Field(default=None, max_length=200)
     price_usd: Decimal | None = Field(default=None, ge=0, decimal_places=2)
     is_highlighted: bool | None = None
+    is_default: bool | None = None
     features: list[PlanFeatureInput] | None = None
 
 
@@ -87,6 +90,7 @@ class PricingPlanPublicRead(BaseModel):
     billing_interval: IntervalLiteral
     is_highlighted: bool
     is_free: bool
+    is_default: bool = False
     features: list[PlanFeatureRead]
 
 
@@ -100,6 +104,13 @@ class PricingPlanAdminRead(PricingPlanPublicRead):
     active_subscribers: int = 0
     created_at: datetime
     updated_at: datetime
+
+
+class CoreFeatureRead(BaseModel):
+    """A marketplace feature no plan can restrict; shown read-only in the editor."""
+
+    key: str
+    label: str
 
 
 class FeatureCatalogRead(BaseModel):

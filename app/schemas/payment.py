@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, computed_field
 
 from app.models.transaction import TransactionStatus
 
@@ -38,6 +38,9 @@ class PaymentConfigRead(BaseModel):
     platform_fee_refund_behavior: Literal["retained", "refunded"]
     # Legacy field for the current web client: percent / 100, or null for a fixed fee.
     platform_commission_rate: float | None = None
+    # Stripe Tax adds tax at checkout from the seeker's billing address (QA 2026-10-08):
+    # the pay sheet says "tax is added by Stripe"; the amount is only known once paid.
+    automatic_tax_enabled: bool = False
 
 
 class TransactionRead(BaseModel):
@@ -45,6 +48,7 @@ class TransactionRead(BaseModel):
 
     id: uuid.UUID
     booking_id: uuid.UUID
+    # What the seeker paid: consultation + tax.
     amount_usd: float
     commission_rate: float
     commission_usd: float
@@ -58,6 +62,18 @@ class TransactionRead(BaseModel):
     refunded_at: datetime | None
     refund_reason: str | None
     created_at: datetime
+    # QA 2026-10-08: which tax rule applied, and Stripe's processing fee (borne by
+    # the advisor).
+    tax_label: str | None = None
+    tax_country: str | None = None
+    tax_jurisdiction: str | None = None
+    stripe_fee_usd: float = 0.0
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def consultation_usd(self) -> float:
+        """The consultation price: what the seeker paid less the tax on it."""
+        return round(float(self.amount_usd) - float(self.tax_usd or 0), 2)
 
 
 class TransactionRefundRead(BaseModel):
@@ -71,6 +87,8 @@ class TransactionRefundRead(BaseModel):
     advisor_reversed_usd: float
     platform_fee_refunded_usd: float
     fee_policy_refunded: bool
+    # Human name of the rule that applied, for the ledger (QA REF-089).
+    refund_rule: Literal["admin_keeps_fee", "seeker_keeps_fee", "platform_fault", "admin"] = "admin"
     stripe_refund_id: str | None
     stripe_reversal_id: str | None
     reason: str | None
@@ -120,6 +138,12 @@ class TransactionFinanceRead(TransactionAdminRead):
     advisor_reversed_usd: float = 0.0
     platform_fee_refunded_usd: float = 0.0
     refunds: list[TransactionRefundRead] = []
+    # QA 2026-10-08: whether Stripe's fee was pulled back from the advisor, and what the
+    # advisor is left with after the fee and any reversal.
+    stripe_fee_recovered: bool = False
+    stripe_fee_reversal_id: str | None = None
+    stripe_balance_transaction_id: str | None = None
+    advisor_net_usd: float = 0.0
 
 
 class TransactionAdvisorRead(TransactionRead):
@@ -138,7 +162,10 @@ class TransactionAdvisorRead(TransactionRead):
     seeker_photo_url: str | None = None
     platform_fee_usd: float = 0.0
     consultant_fee_usd: float = 0.0
+    # Net = gross share - Stripe fee - anything reversed (QA 2026-10-08, section 5).
     net_amount_usd: float = 0.0
+    advisor_gross_usd: float = 0.0
+    advisor_reversed_usd: float = 0.0
 
 
 class SeekerPaymentRead(BaseModel):
@@ -179,11 +206,14 @@ class PaymentSummaryRead(BaseModel):
     total_paid_usd: float
     total_refunded_usd: float
     total_commission_usd: float
+    # Collected and held for the tax authority; never platform revenue.
     total_tax_usd: float
     # Same definition as Financial Analytics' "Advisor Earnings" card, deliberately --
     # see platform_payment_summary() for why it does not share the row set of the four
     # figures above.
     total_advisor_earnings_usd: float
+    # Stripe's processing fees over every charged row, borne by the advisors.
+    total_stripe_fee_usd: float = 0.0
 
 
 class AdvisorConnectStatus(BaseModel):
@@ -203,22 +233,23 @@ class StripeDashboardLink(BaseModel):
 
 class AdvisorEarnings(BaseModel):
     """Advisor earnings. The advisor share is paid inside each charge (destination
-    charge), so there is no separate balance to withdraw."""
+    charge), so there is no separate balance to withdraw.
 
+    The five-line breakdown of QA 2026-10-08 section 5 plus Total Refunded (section 17):
+    gross revenue (consultations, tax excluded) = platform fee + advisor gross;
+    advisor net = advisor gross - Stripe fee - reversals.
+    """
+
+    # Net: what the advisor actually kept. (Historical name.)
     total_earned_usd: float
+    # Platform commission across the same rows. (Historical name; same as platform fee.)
     total_commission_paid_usd: float
     transactions: list[TransactionRead]
-
-
-class RefundCreate(BaseModel):
-    """Admin refund. ``amount_usd`` absent means a full refund of what is left."""
-
-    reason: str | None = None
-    amount_usd: float | None = Field(default=None, gt=0)
-    # Pull the advisor's share back from the connected account.
-    reverse_advisor_share: bool = True
-    # Return the platform fee too (full refund defaults to yes, partial to no).
-    refund_platform_fee: bool | None = None
+    total_gross_revenue_usd: float = 0.0
+    total_platform_fee_usd: float = 0.0
+    total_advisor_gross_usd: float = 0.0
+    total_stripe_fee_usd: float = 0.0
+    total_refunded_usd: float = 0.0
 
 
 class InvoiceLineItem(BaseModel):
@@ -245,6 +276,8 @@ class InvoiceRead(BaseModel):
     line_items: list[InvoiceLineItem]
     subtotal_usd: float
     tax_usd: float
+    tax_rate_percent: float = 0.0
+    tax_label: str | None = None
     total_usd: float
     status: TransactionStatus
     display_status: PaymentDisplayStatus

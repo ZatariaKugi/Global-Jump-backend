@@ -84,6 +84,7 @@ from app.models.seeker_profile import (
 from app.models.stripe_webhook_event import StripeWebhookEvent, WebhookEventStatus
 from app.models.subscription import (
     Subscription,
+    SubscriptionFeature,
     SubscriptionInvoice,
     SubscriptionStatus,
     SubscriptionUsage,
@@ -174,6 +175,7 @@ __all__ = [
     "Subscription",
     "SubscriptionInvoice",
     "SubscriptionStatus",
+    "SubscriptionFeature",
     "SubscriptionUsage",
     "WebhookEventStatus",
     "PreRegistration",
