@@ -44,7 +44,7 @@ from app.schemas.analytics import (
     SessionTrendPoint,
     TopAdvisorRead,
 )
-from app.services import review_service
+from app.services import advisor_earnings, review_service
 
 # Donut / stacked-bar order matches the admin AI analytics FE.
 _AI_VISA_ORDER: tuple[VisaType, ...] = (
@@ -492,10 +492,13 @@ def _finance_window_totals(
     ]
     # Money reversed off the advisor is not earnings. Reversals are attributed the
     # same way refunds are -- by when they happened, not when the charge was made.
-    reversed_out = money_sum(t.advisor_reversed_usd for t in refunded)
-    # The advisor bears Stripe's fee: their earnings are the gross share less that fee.
+    reversed_out = money_sum(advisor_earnings.refund_reversals(t) for t in refunded)
+    # The advisor bears Stripe's fee once it was actually taken from their transfer;
+    # a fee that could not be taken is still theirs (PM exercise, 2026-10-10).
     advisor_payout = round(
-        money_sum(as_float(t.advisor_payout_usd) - as_float(t.stripe_fee_usd) for t in paid_out)
+        money_sum(
+            as_float(t.advisor_payout_usd) - advisor_earnings.stripe_fee_taken(t) for t in paid_out
+        )
         - reversed_out,
         2,
     )
@@ -610,9 +613,9 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
         created = _as_utc(t.created_at)
         if created < since:
             continue
-        payout_trend_map[_month_key(created)] += as_float(t.advisor_payout_usd) - as_float(
-            t.stripe_fee_usd
-        )
+        payout_trend_map[_month_key(created)] += as_float(
+            t.advisor_payout_usd
+        ) - advisor_earnings.stripe_fee_taken(t)
     monthly_payouts = [
         MonthlyAmountPoint(month=month, amount_usd=round(amount, 2))
         for month, amount in sorted(payout_trend_map.items())
@@ -624,6 +627,7 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
         net_revenue_usd=net_revenue_usd,
         refunds_usd=refunds_usd,
         advisor_payout_usd=advisor_payout_usd,
+        platform_refunds_usd=round(returned_usd, 2),
         consultation_revenue_usd=consultation_usd,
         subscription_revenue_usd=subscription_usd,
         gross_revenue_change_pct=_change_pct(gross_revenue_usd, prev_gross),
@@ -632,6 +636,7 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
         advisor_payout_change_pct=_change_pct(advisor_payout_usd, prev_payout),
         consultation_revenue_change_pct=_change_pct(consultation_usd, prev_consultation),
         subscription_revenue_change_pct=_change_pct(subscription_usd, prev_subscription),
+        platform_refunds_change_pct=_change_pct(returned_usd, prev_returned),
         revenue_trend=revenue_trend,
         refund_trend=refund_trend,
         monthly_payouts=monthly_payouts,

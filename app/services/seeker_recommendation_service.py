@@ -9,6 +9,7 @@ in ``advisor_leads`` and ``GET /assessments/{id}/matched-advisors``.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -351,6 +352,76 @@ async def as_match_reads(
     return reads
 
 
+@dataclass(slots=True)
+class DashboardMatches:
+    """The two tabs of the dashboard card (QA 2026-10-09, "Profile Based Recommendations").
+
+    ``matched`` is every advisor the profile matching ranked, paying or not: booking
+    is never a plan feature, so a free seeker must see them. ``ai_recommended`` is the
+    premium shortlist (advisors whose own plan grants ``ai_recommended``), filled only
+    when the seeker's plan includes ``matched_advisors``; otherwise it stays empty and
+    ``ai_locked`` tells the client to show a lock with an upgrade message rather than
+    an empty list.
+    """
+
+    matched: list[AdvisorMatchRead] = field(default_factory=list)
+    ai_recommended: list[AdvisorMatchRead] = field(default_factory=list)
+    ai_locked: bool = False
+    ai_failure: AiMatchFailure | None = None
+    ai_attempted: bool = False
+
+
+async def _as_directory_reads(
+    session: AsyncSession,
+    seeker_id: uuid.UUID,
+    recs: list[SeekerAdvisorRecommendation],
+    settings: Settings,
+    *,
+    limit: int,
+) -> list[AdvisorMatchRead]:
+    """The "Matched Advisors" tab, scored exactly as the Find Advisor card (PM, 2026-10-10).
+
+    The directory shows the plain rule percentage from the seeker's profile intent
+    (``advisor_matching_service.match_percentage``, no AI blend); the dashboard tab
+    must read the same number for the same advisor, best first. The AI engine's
+    blended score stays on the AI tab, as it does behind ``?recommended=true``.
+    """
+    reads = await as_match_reads(session, recs, settings)
+    if not reads:
+        return []
+    destination, visa_type = await advisor_matching_service.match_context_from_profile(
+        session, seeker_id
+    )
+    advisor_ids = [r.user_id for r in reads]
+    profiles = {
+        p.user_id: p
+        for p in (
+            await session.execute(
+                select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
+            )
+        )
+        .scalars()
+        .all()
+    }
+    plain: list[AdvisorMatchRead] = []
+    for read in reads:
+        pct = advisor_matching_service.match_percentage(
+            profiles.get(read.user_id), destination, visa_type, read.average_rating
+        )
+        plain.append(
+            read.model_copy(
+                update={
+                    "match_score": float(pct or 0),
+                    "rule_score": float(pct or 0),
+                    "ai_score": None,
+                    "match_reasons": None,
+                }
+            )
+        )
+    plain.sort(key=lambda m: (m.match_score, m.average_rating or 0), reverse=True)
+    return plain[:limit]
+
+
 async def matches_for_dashboard(
     session: AsyncSession,
     seeker_id: uuid.UUID,
@@ -359,21 +430,29 @@ async def matches_for_dashboard(
     visa_type: VisaType | None = None,
     country: str | None = None,
     limit: int = 10,
-) -> tuple[list[AdvisorMatchRead], AiMatchFailure | None, bool]:
-    """Dashboard ``matched_advisors`` from ``seeker_advisor_recommendations``.
+) -> DashboardMatches:
+    """Dashboard matches from ``seeker_advisor_recommendations``, in two lists.
 
     Refreshes the profile cache on a full miss. Query ``visa_type`` / ``country``
     filter saved rows; they never pull AI Assessment matches.
 
-    The third value is True when a live refresh (and optional AI re-rank) ran.
+    ``ai_attempted`` is True when a live refresh (and optional AI re-rank) ran.
     """
-    ai_failure: AiMatchFailure | None = None
-    ai_attempted = False
+    from app.services import entitlement_service
+
     recs, ai_failure, ai_attempted = await refresh_for_seeker(session, seeker_id, settings=settings)
-    recs = await only_ai_eligible(session, recs)
     if country is not None:
         dest = country.upper()
         recs = [r for r in recs if r.destination_country == dest]
     if visa_type is not None:
         recs = [r for r in recs if r.visa_type == visa_type.value]
-    return await as_match_reads(session, recs[:limit], settings), ai_failure, ai_attempted
+    out = DashboardMatches(ai_failure=ai_failure, ai_attempted=ai_attempted)
+    out.matched = await _as_directory_reads(session, seeker_id, recs, settings, limit=limit)
+    # The AI shortlist is the seeker's paid perk; without it nothing of the list is
+    # sent, so the client cannot show what the plan does not include.
+    if await entitlement_service.can_use(session, seeker_id, "matched_advisors"):
+        ai_recs = await only_ai_eligible(session, recs)
+        out.ai_recommended = await as_match_reads(session, ai_recs[:limit], settings)
+    else:
+        out.ai_locked = True
+    return out

@@ -10,7 +10,8 @@ matched advisors, and ``documents_uploaded`` (untagged docs included).
 combines with visa when both are set — it windows eligibility to the latest
 completed assessment in-window (score 0 if none) and ``documents_uploaded``
 to in-window uploads. Journey stages, progress percents, ``next_upcoming``,
-and ``matched_advisors`` (profile-based ``seeker_advisor_recommendations``)
+and ``matched_advisors`` / ``ai_recommended_advisors`` (profile-based
+``seeker_advisor_recommendations``, every match vs. the paid AI shortlist)
 remain current-state. ``window_days`` echoes the applied window (null = all-time).
 """
 
@@ -82,6 +83,14 @@ class SeekerDashboardRead(BaseModel):
     stats: SeekerDashboardStats
     journey_stages: list[JourneyStageRead]
     eligibility_breakdown: EligibilityBreakdownRead | None
+    # Every advisor the profile matching ranked, paying or not (the "Matched
+    # Advisors" tab; booking is never a plan feature).
     matched_advisors: list[AdvisorMatchRead]
+    # The premium shortlist ("AI Recommended" tab): advisors whose own plan grants
+    # ``ai_recommended``, sent only when the seeker's plan includes ``matched_advisors``.
+    ai_recommended_advisors: list[AdvisorMatchRead] = Field(default_factory=list)
+    # True when the seeker's plan lacks ``matched_advisors``: the client shows the tab
+    # locked with an upgrade message instead of an empty list.
+    ai_recommendations_locked: bool = False
     assessment_id: uuid.UUID | None
     ai_match: AiMatchStatusRead | None = None

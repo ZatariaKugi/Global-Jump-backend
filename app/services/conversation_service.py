@@ -232,6 +232,13 @@ async def send_message(
     recipient_id = (
         conversation.advisor_id if sender.id == conversation.seeker_id else conversation.seeker_id
     )
+    from app.services import entitlement_service  # module-level would be a cycle
+
+    if not await entitlement_service.can_use(session, recipient_id, "chats"):
+        # Deliver and hide (QA GJ-CHAT-001, PM 2026-10-10): the message is stored for
+        # the day the recipient's plan includes chat; no notification carries its
+        # preview to them before then.
+        return message
     preview = body[:140] if body else "Sent an attachment"
     notification = await notification_service.notify(
         session,

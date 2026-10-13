@@ -21,7 +21,7 @@ from app.api.deps import (
 )
 from app.api.pagination import PaginationDep, page_meta, paginate
 from app.api.v1.bookings import _party_names, _read_booking, _send_confirmations
-from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
+from app.core.exceptions import AppError, ConflictError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import delete_file, resolve_url
 from app.core.visa_types import OptionalVisaType, visa_type_name
 from app.db.session import SessionDep
@@ -32,6 +32,7 @@ from app.models.booking import Booking, BookingStatus
 from app.models.notification import NotificationType
 from app.models.regulatory_update import RegulatoryUpdate
 from app.models.seeker_document import SeekerDocumentStatus
+from app.models.transaction import Transaction
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.advisor_credential import (
     AdvisorCredentialCreate,
@@ -91,6 +92,7 @@ from app.services import (
     entitlement_service,
     notification_service,
     payment_service,
+    refund_engine,
     review_service,
     seeker_document_service,
     seeker_profile_service,
@@ -1454,6 +1456,7 @@ async def list_my_payments(
     params: PaginationDep,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     q: Annotated[
         str | None,
@@ -1462,6 +1465,9 @@ async def list_my_payments(
     service_id: Annotated[list[uuid.UUID] | None, Query()] = None,
 ) -> ResponseEnvelope[list[TransactionAdvisorRead]]:
     """Earnings / customer-payments history — one row per transaction on this advisor's bookings."""
+    # A refund that failed earlier is tried again here, before the rows are built, so
+    # the page heals itself (QA GJ-REFUND-002); the row's own keys make it safe.
+    await refund_engine.retry_failed_refunds_for_user(session, current_user.id, settings)
     stmt = payment_service.list_for_advisor_stmt(current_user.id, q=q, service_ids=service_id)
     txns, total = await paginate(session, stmt, params)
 
@@ -1476,4 +1482,39 @@ async def list_my_payments(
 
     return ResponseEnvelope[list[TransactionAdvisorRead]](
         data=data, meta=page_meta(params, total, request_id)
+    )
+
+
+@router.post(
+    "/me/payments/{transaction_id}/refund/retry",
+    response_model=ResponseEnvelope[TransactionAdvisorRead],
+    dependencies=[Depends(require_role(UserRole.advisor))],
+)
+async def retry_my_refund(
+    transaction_id: uuid.UUID,
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[TransactionAdvisorRead]:
+    """The advisor's own retry of a refund that failed on their cancellation.
+
+    Re-runs only the Stripe step(s) the failed refund never completed, with the refund
+    row's own idempotency keys: a seeker refund Stripe already issued is never issued
+    again. 409 ``refund_not_failed`` when nothing on this payment failed.
+    """
+    txn = await session.get(Transaction, transaction_id)
+    booking = await session.get(Booking, txn.booking_id) if txn is not None else None
+    if txn is None or booking is None or booking.advisor_id != current_user.id:
+        raise NotFoundError("Payment not found")
+    if not refund_engine.refund_owed(booking):
+        raise ConflictError("No failed refund on this payment", code="refund_not_failed")
+    if not await refund_engine.retry_owed_booking_refund(session, booking, settings):
+        raise AppError("Refund could not be processed", code="refund_failed")
+    await session.refresh(txn)
+    await session.refresh(booking)
+    seeker = await session.get(User, booking.seeker_id)
+    return ResponseEnvelope[TransactionAdvisorRead](
+        data=await payment_service.advisor_earnings_payment_read(session, txn, booking, seeker),
+        meta=Meta(request_id=request_id),
     )

@@ -14,9 +14,10 @@ numbers: seeker +85, advisor -85, platform keeps its fee.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 import stripe
@@ -24,9 +25,10 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.exceptions import AppError, ConflictError
-from app.models.booking import Booking, BookingRefundStatus, PaymentStatus
+from app.db.session import async_session_factory
+from app.models.booking import Booking, BookingRefundStatus, BookingStatus, PaymentStatus
 from app.models.notification import NotificationEntityType, NotificationType
 from app.models.transaction import Transaction, TransactionStatus, TransferStatus
 from app.models.transaction_event import TransactionEvent, TransactionEventType
@@ -38,6 +40,164 @@ from app.services.payment_config_service import PaymentConfig
 log = structlog.get_logger()
 
 _CENT = Decimal("0.01")
+
+# A failed refund is retried on its own (QA GJ-REFUND-002, PM 2026-10-10): in the
+# background after each of these delays, and again whenever the advisor opens their
+# Payments page once the failure is at least this old. Every retry reuses the refund
+# row's own Stripe idempotency keys, so one payment can never be refunded twice.
+REFUND_RETRY_DELAYS: tuple[float, ...] = (60, 600, 3600)
+REFUND_RETRY_MIN_AGE_SECONDS = 600
+
+_retry_tasks: set[asyncio.Task[None]] = set()
+
+
+def pending_refund_retries() -> list[asyncio.Task[None]]:
+    """The background retries still running (tests and shutdown await them)."""
+    return [t for t in _retry_tasks if not t.done()]
+
+
+def schedule_refund_retry(refund_id: uuid.UUID) -> asyncio.Task[None] | None:
+    """Retry a failed refund later, in the background, like the Stripe fee re-read.
+
+    Fire-and-forget on the running loop; the cancel request is never delayed and
+    nothing here depends on the (switched-off) scheduler. The retry on the advisor's
+    next Payments read covers a restart in between.
+    """
+    if not REFUND_RETRY_DELAYS:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        log.warning("refund_retry_no_loop", refund_id=str(refund_id))
+        return None
+    task = loop.create_task(_refund_retry_worker(refund_id))
+    _retry_tasks.add(task)
+    task.add_done_callback(_retry_tasks.discard)
+    return task
+
+
+async def _refund_retry_worker(refund_id: uuid.UUID) -> None:
+    settings = get_settings()
+    for attempt, delay in enumerate(REFUND_RETRY_DELAYS, start=1):
+        await asyncio.sleep(delay)
+        try:
+            async with async_session_factory() as session:
+                row = await session.get(TransactionRefund, refund_id)
+                if row is None or row.status != RefundStatus.failed:
+                    return  # someone (a page read, the advisor) already finished it
+                try:
+                    await retry_refund(session, refund_id, settings)
+                except AppError as exc:
+                    await session.commit()  # the failure state ``_fail`` wrote
+                    log.warning(
+                        "refund_retry_failed",
+                        refund_id=str(refund_id),
+                        attempt=attempt,
+                        code=exc.code,
+                    )
+                    continue
+                await session.commit()
+                log.info("refund_retry_succeeded", refund_id=str(refund_id), attempt=attempt)
+                return
+        except Exception:  # noqa: BLE001 - a background retry must never take the app down
+            log.exception("refund_retry_crashed", refund_id=str(refund_id))
+            return
+
+
+def _utc(dt: datetime) -> datetime:
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+def refund_owed(booking: Booking) -> bool:
+    """A cancelled or rejected booking the seeker has paid for and not been refunded.
+
+    This is the state booking 3520000004 sat in (2026-10-10): cancelled by the advisor,
+    refund refused before a ledger row existed, ``refund_status`` still ``none``. The
+    advisor's row reads "refund failed" for it, and every retry path runs the refund.
+    """
+    return (
+        booking.status in (BookingStatus.cancelled, BookingStatus.rejected)
+        and booking.payment_status == PaymentStatus.paid
+    )
+
+
+async def retry_owed_booking_refund(
+    session: AsyncSession, booking: Booking, settings: Settings
+) -> bool:
+    """Run the refund an owed booking never got (or got a failed row for).
+
+    A failed row is resumed with its own keys; without a row the refund is planned
+    and executed afresh. Returns True when the seeker has been refunded.
+    """
+    from app.services import payment_service  # module-level would be a cycle
+
+    failed = (
+        await session.execute(
+            select(TransactionRefund)
+            .join(Transaction, Transaction.id == TransactionRefund.transaction_id)
+            .where(
+                Transaction.booking_id == booking.id,
+                TransactionRefund.status == RefundStatus.failed,
+            )
+        )
+    ).scalar_one_or_none()
+    if failed is not None:
+        await retry_refund(session, failed.id, settings)
+        return True
+    kind = "rejection" if booking.status == BookingStatus.rejected else "advisor_cancel"
+    amount = await payment_service.auto_refund_booking_if_paid(
+        session, booking, booking.cancelled_by, booking.cancellation_reason, settings, kind=kind
+    )
+    return amount is not None
+
+
+async def retry_failed_refunds_for_user(
+    session: AsyncSession, user_id: uuid.UUID, settings: Settings
+) -> int:
+    """Retry the user's failed refunds that are at least ``REFUND_RETRY_MIN_AGE_SECONDS`` old.
+
+    Called before the advisor's Payments rows are built, so the page itself heals a
+    refund that failed while the app was down. A fresh failure is left alone for a
+    few minutes so a page refresh does not hammer Stripe. Returns how many succeeded.
+    """
+    cutoff = datetime.now(UTC) - timedelta(seconds=REFUND_RETRY_MIN_AGE_SECONDS)
+    owed = (
+        (
+            await session.execute(
+                select(Booking).where(
+                    (Booking.advisor_id == user_id) | (Booking.seeker_id == user_id),
+                    Booking.status.in_((BookingStatus.cancelled, BookingStatus.rejected)),
+                    Booking.payment_status == PaymentStatus.paid,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    done = 0
+    for booking in owed:
+        if _utc(booking.updated_at or booking.created_at) > cutoff:
+            continue  # a fresh failure is left alone for a few minutes
+        pending = (
+            await session.execute(
+                select(TransactionRefund)
+                .join(Transaction, Transaction.id == TransactionRefund.transaction_id)
+                .where(
+                    Transaction.booking_id == booking.id,
+                    TransactionRefund.status == RefundStatus.pending,
+                )
+            )
+        ).scalar_one_or_none()
+        if pending is not None:
+            continue
+        try:
+            if await retry_owed_booking_refund(session, booking, settings):
+                done += 1
+        except AppError as exc:
+            log.warning("refund_retry_on_read_failed", booking_id=str(booking.id), code=exc.code)
+    return done
+
+
 _PLATFORM_FAULT = (RefundKind.expiry, RefundKind.rejection)
 
 
@@ -137,10 +297,11 @@ def compute_refund(
     """
     kind = RefundKind(kind)
     remaining_total = refundable_total(txn) - _money(getattr(txn, "refunded_amount_usd", 0))
-    remaining_advisor = (
-        _money(txn.advisor_payout_usd)  # type: ignore[attr-defined]
-        - _stripe_fee_taken(txn)
-        - _money(getattr(txn, "advisor_reversed_usd", 0))
+    # ``advisor_reversed_usd`` is everything reversed off the advisor's transfer, Stripe's
+    # fee included (the fee recovery books it; ``transfer.reversed`` reconciles it), so
+    # the fee must not be subtracted again here (booking 3520000009, 2026-10-10).
+    remaining_advisor = _money(txn.advisor_payout_usd) - _money(  # type: ignore[attr-defined]
+        getattr(txn, "advisor_reversed_usd", 0)
     )
     remaining_fee = _fee_total(txn) - _money(getattr(txn, "platform_fee_refunded_usd", 0))
     remaining_advisor = max(Decimal(0), remaining_advisor)
@@ -168,9 +329,17 @@ def compute_refund(
         # back and the commission is not on offer, so there is nothing to send.
         raise AppError("Nothing left to refund on this payment", code="not_refundable")
     if seeker > remaining_total:
-        raise AppError(
-            "Refund would exceed what is left of the payment", code="refund_amount_too_large"
-        )
+        # Stripe's fee has not (yet) been taken from the advisor, so share + fee adds up
+        # to more than the seeker can ever get back (booking 3520000004, 2026-10-10).
+        # The seeker gets the ceiling; the advisor still gives back the whole share;
+        # the platform keeps the difference, which is exactly the fee the advisor
+        # bears (PM, 2026-10-08). Anything beyond that is a real overflow.
+        fee_untaken = _money(getattr(txn, "stripe_fee_usd", 0)) - _stripe_fee_taken(txn)
+        if seeker - remaining_total > fee_untaken + _CENT:
+            raise AppError(
+                "Refund would exceed what is left of the payment", code="refund_amount_too_large"
+            )
+        seeker = _money(remaining_total)
     return RefundPlan(
         kind=kind.value,
         refund_to_seeker_usd=seeker,
@@ -202,6 +371,22 @@ async def _fail(
         session.add(booking)
     session.add(row)
     await _log_event(session, txn.id, TransactionEventType.refund_failed)
+    if booking is not None:
+        # The advisor is the one who cancelled and the one who sees "Paid" otherwise
+        # (QA GJ-REFUND-002); admins have no refund action of their own.
+        await notification_service.notify(
+            session,
+            user_id=booking.advisor_id,
+            type=NotificationType.refund_failed,
+            title="Refund to the seeker failed",
+            body=(
+                f"The ${row.refund_to_seeker_usd} refund for {booking.name} could not be "
+                f"completed ({row.last_error}). We will retry automatically; you can also "
+                "retry from Payments."
+            ),
+            entity_type=NotificationEntityType.transaction,
+            entity_id=txn.id,
+        )
     await notification_service.notify_admins(
         session,
         type=NotificationType.refund_failed,
@@ -275,6 +460,7 @@ async def execute_refund(
         await _run_stripe_steps(txn, row)
     except (stripe.StripeError, ReversalUnavailable) as exc:
         await _fail(session, row, txn, exc)
+        schedule_refund_retry(row.id)
         raise AppError("Refund could not be processed", code="refund_failed") from exc
 
     await _settle(session, txn, row, initiated_by=initiated_by, reason=reason, settings=settings)

@@ -23,6 +23,8 @@ class BookingStatus(StrEnum):
     cancelled = "cancelled"
     rejected = "rejected"
     no_show = "no_show"
+    # Unpaid when its scheduled start passed (QA GJ-BOOKING-003, PM 2026-10-10).
+    expired = "expired"
 
 
 class BookingRefundStatus(StrEnum):

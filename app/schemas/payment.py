@@ -10,7 +10,9 @@ from pydantic import BaseModel, computed_field
 
 from app.models.transaction import TransactionStatus
 
-PaymentDisplayStatus = Literal["paid", "pending", "refunded", "failed"]
+# ``refund_failed``: the advisor cancelled, the refund to the seeker is still owed
+# (QA GJ-REFUND-002); advisor rows only.
+PaymentDisplayStatus = Literal["paid", "pending", "refunded", "failed", "refund_failed"]
 InvoicePerspective = Literal["seeker", "advisor", "admin"]
 
 

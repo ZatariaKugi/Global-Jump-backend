@@ -110,6 +110,62 @@ def compute_capabilities(
 _ACTIVE_UPCOMING = (BookingStatus.pending, BookingStatus.confirmed)
 
 
+def is_past_unpaid(booking: Booking, now: datetime | None = None) -> bool:
+    """Unpaid, still open, and its scheduled start has passed (QA GJ-BOOKING-003)."""
+    now = now or datetime.now(UTC)
+    return (
+        booking.status in _ACTIVE_UPCOMING
+        and booking.payment_status == PaymentStatus.unpaid
+        and as_utc(booking.scheduled_start) <= now
+    )
+
+
+def expire_if_past(booking: Booking, now: datetime | None = None) -> bool:
+    """Mark one booking expired when ``is_past_unpaid``; True when it changed.
+
+    PM rule, 2026-10-10: an unpaid booking expires at its scheduled start. The
+    scheduler is switched off, so expiry is applied on read and on payment instead
+    of by a sweep; a stale page, an old link or a direct checkout call all land here.
+    """
+    if not is_past_unpaid(booking, now):
+        return False
+    booking.status = BookingStatus.expired
+    booking.cancellation_reason = EXPIRED_UNPAID_REASON
+    return True
+
+
+EXPIRED_UNPAID_REASON = "Unpaid when the scheduled time passed"
+
+
+async def expire_past_unpaid(session: AsyncSession, *, user_id: uuid.UUID) -> int:
+    """Expire every past unpaid booking the user is party to; returns how many.
+
+    Called before a bookings list or banner is built, so both the seeker and the
+    advisor read the same status. Paid, cancelled, completed and future rows are
+    never touched.
+    """
+    now = datetime.now(UTC)
+    rows = (
+        await session.execute(
+            select(Booking).where(
+                or_(Booking.seeker_id == user_id, Booking.advisor_id == user_id),
+                Booking.status.in_(_ACTIVE_UPCOMING),
+                Booking.payment_status == PaymentStatus.unpaid,
+                Booking.scheduled_start <= now,
+            )
+        )
+    ).scalars()
+    expired = 0
+    for booking in rows:
+        if expire_if_past(booking, now):
+            session.add(booking)
+            expired += 1
+    if expired:
+        await session.flush()
+        log.info("bookings_expired_on_read", user_id=str(user_id), count=expired)
+    return expired
+
+
 def _chat_eligible_payment_clause() -> ColumnElement[bool]:
     """Confirmed bookings that are paid or advisor-waived (free-book)."""
     return or_(

@@ -51,8 +51,15 @@ async def _inbox_push_to_participants(
     event_type: str,
     base_payload: dict[str, Any],
 ) -> None:
-    """Send a per-user inbox event (includes that user's ``unread_count``)."""
+    """Send a per-user inbox event (includes that user's ``unread_count``).
+
+    A participant whose plan lacks ``chats`` gets nothing: the preview and the unread
+    count would show them what their plan does not include (deliver and hide, PM
+    2026-10-10). The row stays; it is theirs to read once they upgrade.
+    """
     for user_id in (conversation.seeker_id, conversation.advisor_id):
+        if not await _may_chat(session, user_id):
+            continue
         unread = await conversation_service.unread_count(session, conversation.id, user_id)
         await inbox_manager.send_user(
             user_id,
@@ -79,6 +86,8 @@ async def _send_new_message_email(
     recipient = await session.get(User, recipient_id)
     if recipient is None or recipient.id == sender.id:
         return
+    if not await _may_chat(session, recipient.id):
+        return  # the preview would leak the message to a plan without chat
     email_service.schedule_email(
         email_service.send_new_message_email(
             recipient.email,
@@ -91,11 +100,21 @@ async def _send_new_message_email(
     )
 
 
-async def _assert_seeker_may_chat(session: AsyncSession, user: User) -> None:
+async def _assert_may_chat(session: AsyncSession, user: User) -> None:
     """``chats`` is a plan perk for seekers *and* advisors (PM, 2026-10-08); a booking
-    never unlocks it by itself. Admins are never gated."""
+    never unlocks it by itself. Admins are never gated.
+
+    Since QA GJ-CHAT-001 (2026-10-10) this guards *reading* too: the thread list,
+    history, read receipts, edits, deletes, reports and both sockets. A participant
+    whose plan lacks chat sees the lock, not the other side's messages.
+    """
     if user.role in (UserRole.seeker, UserRole.advisor):
         await entitlement_service.check(session, user, "chats")
+
+
+async def _may_chat(session: AsyncSession, user_id: uuid.UUID) -> bool:
+    """``_assert_may_chat`` as a boolean for a participant we hold the id of."""
+    return await entitlement_service.can_use(session, user_id, "chats")
 
 
 @router.post("/conversations", status_code=201, response_model=ResponseEnvelope[ConversationRead])
@@ -106,7 +125,7 @@ async def create_conversation(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[ConversationRead]:
-    await _assert_seeker_may_chat(session, current_user)
+    await _assert_may_chat(session, current_user)
     conversation = await conversation_service.get_or_create(
         session, current_user, data.other_user_id
     )
@@ -127,6 +146,7 @@ async def list_conversations(
     request_id: RequestIdDep,
     q: str | None = None,
 ) -> ResponseEnvelope[list[ConversationRead]]:
+    await _assert_may_chat(session, current_user)
     stmt = conversation_service.list_for_user_stmt(current_user.id, q)
     conversations, total = await paginate(session, stmt, params)
     data = [
@@ -150,6 +170,7 @@ async def list_messages(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[MessageRead]]:
+    await _assert_may_chat(session, current_user)
     conversation = await conversation_service.get_for_user(
         session, conversation_id, current_user.id
     )
@@ -182,7 +203,7 @@ async def send_message(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[MessageRead]:
-    await _assert_seeker_may_chat(session, current_user)
+    await _assert_may_chat(session, current_user)
     conversation = await conversation_service.get_for_user(
         session, conversation_id, current_user.id
     )
@@ -241,6 +262,7 @@ async def mark_message_read(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[MessageRead]:
+    await _assert_may_chat(session, current_user)
     message = await conversation_service.get_message_for_user(session, message_id, current_user.id)
     message = await conversation_service.mark_read(session, message, current_user)
     sender = await session.get(User, message.sender_id)
@@ -283,6 +305,7 @@ async def edit_message(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[MessageRead]:
+    await _assert_may_chat(session, current_user)
     message = await conversation_service.get_message_for_user(session, message_id, current_user.id)
     message = await conversation_service.edit_message(session, message, current_user.id, data.body)
     photos = await conversation_service.profile_photo_keys(session, [current_user.id])
@@ -326,6 +349,7 @@ async def delete_message(
     current_user: CurrentUser,
     session: SessionDep,
 ) -> None:
+    await _assert_may_chat(session, current_user)
     message = await conversation_service.get_message_for_user(session, message_id, current_user.id)
     message = await conversation_service.delete_message(session, message, current_user.id)
 
@@ -368,6 +392,7 @@ async def report_message(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[MessageRead]:
+    await _assert_may_chat(session, current_user)
     message = await conversation_service.get_message_for_user(session, message_id, current_user.id)
     message = await conversation_service.report(session, message, current_user.id, data.reason)
     sender = await session.get(User, message.sender_id)
@@ -435,6 +460,9 @@ async def inbox_websocket(
     if user is None:
         await websocket.close(code=4401)
         return
+    if not await _may_chat(session, user.id):
+        await websocket.close(code=4403)  # plan without chat: no previews, no unread
+        return
 
     inbox_manager.register(user.id, websocket)
     try:
@@ -461,6 +489,9 @@ async def conversation_websocket(
     user = await _authenticate_websocket(websocket, session, settings)
     if user is None:
         await websocket.close(code=4401)
+        return
+    if not await _may_chat(session, user.id):
+        await websocket.close(code=4403)  # plan without chat: no live thread
         return
 
     try:

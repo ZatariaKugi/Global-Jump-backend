@@ -333,6 +333,8 @@ async def list_my_bookings(
     (null outside the scheduled window).
     """
     role = current_user.role
+    # Past unpaid bookings expire the moment anyone reads them (PM, 2026-10-10).
+    await booking_service.expire_past_unpaid(session, user_id=current_user.id)
     stmt = booking_service.list_for_user_stmt(
         current_user.id,
         role,
@@ -447,6 +449,11 @@ async def get_booking(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[BookingRead]:
     booking = await booking_service.get_for_party(session, booking_id, current_user.id)
+    if booking_service.expire_if_past(booking):
+        session.add(booking)
+        await session.flush()
+        # Reload after the flush so updated_at is not expired mid-read (MissingGreenlet).
+        await session.refresh(booking)
     seeker, advisor = await _party_names(session, booking)
     return ResponseEnvelope[BookingRead](
         data=await _read_booking(
