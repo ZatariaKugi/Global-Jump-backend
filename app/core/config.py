@@ -136,6 +136,10 @@ class Settings(BaseSettings):
     # Safety net: cancel pending+unpaid bookings older than this (minutes) to
     # release slots when checkout.session.expired webhooks are missed.
     STALE_UNPAID_BOOKING_MINUTES: int = 60
+    # After a successful payment the advisor's Cancel is locked for this long (PM,
+    # 2026-10-15): Stripe's fee is taken from the advisor ~30 s after payment, and a
+    # cancel that lands before it left the platform paying the fee.
+    BOOKING_CANCEL_COOLDOWN_SECONDS: int = 120
     INVOICE_FROM_ADDRESS: str | None = None  # optional platform address on invoices
     INVOICE_FROM_PHONE: str | None = None  # optional platform phone on invoices
 

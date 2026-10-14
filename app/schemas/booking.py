@@ -128,6 +128,8 @@ class BookingRead(BaseModel):
     updated_at: datetime
     can_reschedule: bool = False
     can_cancel: bool = False
+    # The advisor's Cancel unlocks here after payment (PM, 2026-10-15); None when unpaid.
+    cancel_available_at: datetime | None = None
     # Seeker reschedule window in hours (kept for older clients); prefer the deadlines.
     cancellation_notice_hours: int = 24
     reschedule_deadline: datetime | None = None
@@ -187,6 +189,8 @@ class BookingHistoryRead(BaseModel):
     created_at: datetime
     can_reschedule: bool = False
     can_cancel: bool = False
+    # The advisor's Cancel unlocks here after payment (PM, 2026-10-15); None when unpaid.
+    cancel_available_at: datetime | None = None
     # Seeker reschedule window in hours (kept for older clients); prefer the deadlines.
     cancellation_notice_hours: int = 24
     reschedule_deadline: datetime | None = None
@@ -261,6 +265,8 @@ class SessionDetailRead(BaseModel):
     scheduled_start: datetime
     can_reschedule: bool = False
     can_cancel: bool = False
+    # The advisor's Cancel unlocks here after payment (PM, 2026-10-15); None when unpaid.
+    cancel_available_at: datetime | None = None
     # Seeker reschedule window in hours (kept for older clients); prefer the deadlines.
     cancellation_notice_hours: int = 24
     reschedule_deadline: datetime | None = None

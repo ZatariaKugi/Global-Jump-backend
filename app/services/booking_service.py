@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.types import String
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import resolve_media_url
 from app.core.logging import get_logger
@@ -98,13 +98,34 @@ def compute_capabilities(
 
     if viewer_role == UserRole.advisor:
         can_reschedule = booking.status == BookingStatus.confirmed
-        can_cancel = now <= cancellation_deadline(booking, config)
+        can_cancel = now <= cancellation_deadline(booking, config) and not in_cancel_cooldown(
+            booking, now
+        )
         return can_reschedule, can_cancel
 
     if viewer_role == UserRole.admin:
         return True, True
 
     return now <= reschedule_deadline(booking, config), False
+
+
+def cancel_available_at(booking: Booking) -> datetime | None:
+    """When the advisor's Cancel unlocks after payment (PM, 2026-10-15), or None if unpaid.
+
+    A fixed ``BOOKING_CANCEL_COOLDOWN_SECONDS`` after ``paid_at``. Stripe's fee is taken
+    from the advisor about 30 s after payment; a cancel inside that window refunded the
+    whole share and left the platform paying the fee (staging, 14 October).
+    """
+    if booking.payment_status != PaymentStatus.paid or booking.paid_at is None:
+        return None
+    return as_utc(booking.paid_at) + timedelta(
+        seconds=get_settings().BOOKING_CANCEL_COOLDOWN_SECONDS
+    )
+
+
+def in_cancel_cooldown(booking: Booking, now: datetime | None = None) -> bool:
+    opens = cancel_available_at(booking)
+    return opens is not None and (now or datetime.now(UTC)) < opens
 
 
 _ACTIVE_UPCOMING = (BookingStatus.pending, BookingStatus.confirmed)
@@ -410,6 +431,7 @@ def build_read(
         updated_at=booking.updated_at,
         can_reschedule=can_reschedule,
         can_cancel=can_cancel,
+        cancel_available_at=cancel_available_at(booking),
         cancellation_notice_hours=config.seeker_reschedule_window_hours,
         reschedule_deadline=reschedule_deadline(booking, config),
         cancellation_deadline=cancellation_deadline(booking, config),
@@ -969,6 +991,12 @@ async def _assert_cancel_allowed(
     _assert_not_started(booking, now)
     if actor_id != booking.advisor_id:
         return  # admin: any time before start
+    if in_cancel_cooldown(booking, now):
+        raise AppError(
+            "You cannot cancel yet. The payment is still settling; cancellation opens "
+            "two minutes after payment.",
+            code="cancel_cooldown",
+        )
     config = await payment_config_service.get_config(session)
     if now > cancellation_deadline(booking, config):
         raise AppError(
@@ -1474,6 +1502,7 @@ async def build_history(
         created_at=booking.created_at,
         can_reschedule=can_reschedule,
         can_cancel=can_cancel,
+        cancel_available_at=cancel_available_at(booking),
         cancellation_notice_hours=config.seeker_reschedule_window_hours,
         reschedule_deadline=reschedule_deadline(booking, config),
         cancellation_deadline=cancellation_deadline(booking, config),
@@ -1653,6 +1682,7 @@ async def build_session_detail(
         scheduled_start=as_utc(booking.scheduled_start),
         can_reschedule=can_reschedule,
         can_cancel=can_cancel,
+        cancel_available_at=cancel_available_at(booking),
         cancellation_notice_hours=config.seeker_reschedule_window_hours,
         reschedule_deadline=reschedule_deadline(booking, config),
         cancellation_deadline=cancellation_deadline(booking, config),
