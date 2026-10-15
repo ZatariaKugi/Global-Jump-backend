@@ -150,13 +150,12 @@ def plan_perks(plan: PricingPlan) -> list[Perk]:
         key = pricing_plan_service.canonical_key(f.feature_key)
         if f.kind != FeatureKind.enforceable or not key:
             continue
+        value_type, value = pricing_plan_service.coerce_feature(
+            key, str(getattr(f.value_type, "value", f.value_type)), f.value
+        )
         out.append(
             Perk(
-                key=key,
-                label=f.label,
-                value_type=str(getattr(f.value_type, "value", f.value_type)),
-                value=f.value,
-                is_enabled=f.is_enabled,
+                key=key, label=f.label, value_type=value_type, value=value, is_enabled=f.is_enabled
             )
         )
     return out
@@ -166,16 +165,20 @@ def perks_for(plan: PricingPlan, sub: Subscription | None) -> list[Perk]:
     """The perks that apply: the subscription's snapshot when it has one (BUG21),
     else the plan's current rows (free-plan users, and rows written before snapshots)."""
     if sub is not None and sub.features:
-        return [
-            Perk(
-                key=pricing_plan_service.canonical_key(f.feature_key) or f.feature_key,
-                label=f.label,
-                value_type=f.value_type,
-                value=f.value,
-                is_enabled=f.is_enabled,
+        out: list[Perk] = []
+        for f in sub.features:
+            key = pricing_plan_service.canonical_key(f.feature_key) or f.feature_key
+            value_type, value = pricing_plan_service.coerce_feature(key, f.value_type, f.value)
+            out.append(
+                Perk(
+                    key=key,
+                    label=f.label,
+                    value_type=value_type,
+                    value=value,
+                    is_enabled=f.is_enabled,
+                )
             )
-            for f in sub.features
-        ]
+        return out
     return plan_perks(plan)
 
 

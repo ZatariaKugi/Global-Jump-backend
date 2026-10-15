@@ -1541,26 +1541,6 @@ async def list_subscription_invoices_admin(
     )
 
 
-@router.post(
-    "/subscriptions/{subscription_id}/cancel",
-    response_model=ResponseEnvelope[AdminSubscriptionRead],
-)
-async def cancel_subscription_admin(
-    subscription_id: uuid.UUID,
-    session: SessionDep,
-    settings: SettingsDep,
-    request_id: RequestIdDep,
-) -> ResponseEnvelope[AdminSubscriptionRead]:
-    """Immediate cancellation (for example a suspended account)."""
-    sub = await subscription_service.admin_cancel(session, subscription_id, settings)
-    user = await session.get(User, sub.user_id)
-    plan = await pricing_plan_service.get(session, sub.plan_id)
-    assert user is not None
-    return ResponseEnvelope[AdminSubscriptionRead](
-        data=subscription_service.admin_read(sub, user, plan), meta=Meta(request_id=request_id)
-    )
-
-
 @router.get("/engine-settings", response_model=ResponseEnvelope[EngineSettingsRead])
 async def get_engine_settings(
     session: SessionDep,

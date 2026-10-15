@@ -1462,49 +1462,6 @@ def admin_read(
     )
 
 
-async def admin_cancel(
-    session: AsyncSession, subscription_id: uuid.UUID, settings: Settings
-) -> Subscription:
-    sub = await session.get(Subscription, subscription_id)
-    if sub is None:
-        raise NotFoundError("Subscription not found")
-    if sub.stripe_subscription_id and sub.status in _ACTIVE_LIKE:
-        await _init_stripe(session, settings)
-        try:
-            result = await stripe.Subscription.cancel_async(str(sub.stripe_subscription_id))
-        except stripe.InvalidRequestError as exc:
-            # Stripe has already ended it, or never had it. The admin asked for it to
-            # be over and it is over, so finish locally rather than refusing — this is
-            # exactly the lapsed row an admin is most likely to be cleaning up.
-            log.info(
-                "admin_cancel_already_ended",
-                subscription_id=str(sub.id),
-                stripe_subscription_id=str(sub.stripe_subscription_id),
-                error=str(exc)[:200],
-            )
-        except stripe.StripeError as exc:
-            # Anything else — auth, network, rate limit — left the remote side in an
-            # unknown state, so do not record a cancellation that may not have happened.
-            log.warning(
-                "admin_cancel_stripe_error",
-                subscription_id=str(sub.id),
-                error=str(exc)[:300],
-            )
-            raise AppError(
-                "Stripe could not cancel this subscription; try again",
-                code="subscription_cancel_failed",
-            ) from exc
-        else:
-            _apply_stripe_subscription(sub, result)
-    sub.status = SubscriptionStatus.canceled
-    sub.canceled_at = sub.canceled_at or datetime.now(UTC)
-    sub.access_until = datetime.now(UTC)
-    session.add(sub)
-    await _sync_advisor_flag(session, sub)
-    await session.flush()
-    return sub
-
-
 # ── Subscriptions Finance summary (admin cards) ──────────────────────────────
 
 _PAID_INVOICE_STATUS = "paid"

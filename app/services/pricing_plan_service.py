@@ -65,15 +65,15 @@ CATALOG: tuple[dict[str, object], ...] = (
         "label": "Assessment history",
         "module": "ai_assessment",
         "audience": "seeker",
-        "limit_type": "number",
+        "limit_type": "bool",
         "display_order": 30,
     },
     {
         "key": "matched_advisors",
-        "label": "Recommended advisors",
+        "label": "AI recommendations",
         "module": "matching",
         "audience": "seeker",
-        "limit_type": "number",
+        "limit_type": "bool",
         "display_order": 40,
     },
     {
@@ -81,7 +81,7 @@ CATALOG: tuple[dict[str, object], ...] = (
         "label": "Bookmarked advisors",
         "module": "bookmarks",
         "audience": "seeker",
-        "limit_type": "number",
+        "limit_type": "bool",
         "display_order": 60,
     },
     {
@@ -97,7 +97,7 @@ CATALOG: tuple[dict[str, object], ...] = (
         "label": "Documents",
         "module": "documents",
         "audience": "seeker",
-        "limit_type": "number",
+        "limit_type": "bool",
         "display_order": 90,
     },
     {
@@ -146,6 +146,22 @@ CATALOG_KEYS: frozenset[str] = frozenset(str(entry["key"]) for entry in CATALOG)
 # Keys retired on 2026-10-08. Plans written before then may still carry the old
 # spelling; ``canonical_key`` maps it forward and ``get_catalog`` rewrites the rows.
 RENAMED_KEYS: dict[str, str] = {"priority_support": "support"}
+
+# Perks that were numbers until 2026-10-15 (QA GJ-SUB-010, PM decision): a cap that never
+# touched the monthly counter read "0 used" forever, and "Recommended advisors" *is* the AI
+# shortlist. A stored number now means On; migration f8b2c6d0e4f7 rewrites the rows and
+# ``coerce_feature`` covers anything read before it ran.
+NUMBER_TO_BOOL: frozenset[str] = frozenset(
+    {"assessment_history", "bookmarks", "documents", "matched_advisors"}
+)
+
+
+def coerce_feature(key: str | None, value_type: str, value: str) -> tuple[str, str]:
+    """A number stored for an On/Off perk reads as On (``bool`` / ``"true"``)."""
+    if key in NUMBER_TO_BOOL and value_type == "number":
+        return "bool", "true"
+    return value_type, value
+
 
 # What the admin can never put behind a plan: the marketplace transaction itself
 # (discussion sections 33-36). Shown read-only in the plan editor.
@@ -659,13 +675,14 @@ async def free_plan_for(session: AsyncSession, audience: str) -> PricingPlan | N
 
 
 def feature_read(f: PricingPlanFeature) -> PlanFeatureRead:
+    value_type, value = coerce_feature(canonical_key(f.feature_key), _val(f.value_type), f.value)
     return PlanFeatureRead(
         id=f.id,
         kind=_val(f.kind),
         feature_key=f.feature_key,
         label=f.label,
-        value_type=_val(f.value_type),
-        value=f.value,
+        value_type=value_type,
+        value=value,
         is_enabled=f.is_enabled,
         display_order=f.display_order,
     )
