@@ -93,6 +93,52 @@ async def notify_seekers_about_new_advisor(
     return notified
 
 
+async def announce_advisor_if_bookable(
+    session: AsyncSession,
+    advisor_user_id: uuid.UUID,
+    *,
+    settings: Settings,
+) -> int:
+    """Tell matching seekers about an advisor once they are approved AND bookable.
+
+    QA #333 (2026-10-27): the approval announcement ignored the Stripe / Zoom readiness
+    gate that hides an advisor from Find Advisor, the dashboard matches and booking, so
+    seekers were told about advisors they could neither find nor book. Called at approval
+    and again whenever readiness is refreshed (Stripe ``account.updated``, the live
+    Connect status check, a Zoom connect); announces exactly once per advisor.
+    """
+    from app.models.notification import Notification
+    from app.models.user import UserRole, VerificationStatus
+    from app.services import advisor_search_service
+
+    advisor = await session.get(User, advisor_user_id)
+    if (
+        advisor is None
+        or advisor.role != UserRole.advisor
+        or not advisor.is_active
+        or advisor.verification_status != VerificationStatus.approved
+    ):
+        return 0
+    if not await advisor_search_service.is_integrations_ready(session, advisor.id):
+        return 0
+    already = await session.scalar(
+        select(Notification.id)
+        .where(
+            Notification.type == NotificationType.new_relevant_advisor.value,
+            Notification.actor_id == advisor.id,
+        )
+        .limit(1)
+    )
+    if already is not None:
+        return 0
+    profile = await session.scalar(
+        select(AdvisorProfile).where(AdvisorProfile.user_id == advisor.id)
+    )
+    if profile is None:
+        return 0
+    return await notify_seekers_about_new_advisor(session, advisor, profile, settings=settings)
+
+
 async def list_for_seeker(
     session: AsyncSession,
     seeker_id: uuid.UUID,

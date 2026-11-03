@@ -59,6 +59,9 @@ typecheck: ## Run MyPy
 test: ## Run tests
 	$(UV_RUN) pytest
 
+test-flows: ## Run the CI happy-flow suite (tests/flows, in-memory, no network)
+	$(UV_RUN) pytest tests/flows -q
+
 check: lint typecheck test ## Run lint + type-check + tests
 
 pre-commit: ## Run pre-commit hooks on all files

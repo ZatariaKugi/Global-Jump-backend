@@ -74,6 +74,19 @@ class ConversationRead(BaseModel):
     created_at: datetime
 
 
+class UnreadSummaryRead(BaseModel):
+    """Counts only — readable by a plan that lacks ``chats`` (QA BUG 3, PM 2026-10-23).
+
+    Never carries a preview; ``latest_sender_name`` is the one identifying field, so a
+    locked participant can be told "someone wrote to you" without the content.
+    """
+
+    unread_messages: int
+    unread_conversations: int
+    latest_sender_name: str | None
+    chat_locked: bool
+
+
 class MessageReport(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
 

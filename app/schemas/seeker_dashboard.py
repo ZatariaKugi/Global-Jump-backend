@@ -71,9 +71,14 @@ class EligibilityBreakdownSegment(BaseModel):
 
 
 class EligibilityBreakdownRead(BaseModel):
-    """Donut — segments from the assessment score, center = journey cover."""
+    """Donut — segments from the assessment score; the centre is that same score.
+
+    Journey cover has its own top-row card (``stats.journey_progress_percent``); it
+    was wrongly sent as the centre until 2026-10-24 (QA #330).
+    """
 
     center_percent: int
+    center_label: str = "Eligibility"
     segments: list[EligibilityBreakdownSegment]
 
 

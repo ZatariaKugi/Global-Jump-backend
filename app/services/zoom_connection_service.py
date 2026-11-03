@@ -20,9 +20,7 @@ from app.services import zoom_oauth_service
 logger = get_logger(__name__)
 
 
-async def get_by_advisor(
-    session: AsyncSession, advisor_id: uuid.UUID
-) -> ZoomConnection | None:
+async def get_by_advisor(session: AsyncSession, advisor_id: uuid.UUID) -> ZoomConnection | None:
     result = await session.execute(
         select(ZoomConnection).where(
             ZoomConnection.advisor_id == advisor_id,
@@ -78,9 +76,7 @@ def sync_zoom_connect_flag(profile: AdvisorProfile, connection: ZoomConnection |
     profile.needs_zoom_connect = needs_zoom_connect(connection)
 
 
-async def _get_profile_for_advisor(
-    session: AsyncSession, advisor_id: uuid.UUID
-) -> AdvisorProfile:
+async def _get_profile_for_advisor(session: AsyncSession, advisor_id: uuid.UUID) -> AdvisorProfile:
     result = await session.execute(
         select(AdvisorProfile).where(AdvisorProfile.user_id == advisor_id)
     )
@@ -141,6 +137,12 @@ async def upsert_from_oauth(
     profile = await _get_profile_for_advisor(session, advisor_id)
     sync_zoom_connect_flag(profile, connection)
     await session.flush()
+    # QA #333: Zoom may be the last readiness step; announce the advisor to seekers now.
+    from app.services import seeker_recommendation_service
+
+    await seeker_recommendation_service.announce_advisor_if_bookable(
+        session, advisor_id, settings=settings
+    )
     logger.info("zoom_connection_saved", advisor_id=str(advisor_id))
     return connection
 

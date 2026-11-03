@@ -33,8 +33,9 @@ class PaymentConfigRead(BaseModel):
     """
 
     publishable_key: str | None
-    commission_type: Literal["percent", "fixed"]
-    commission_value: float
+    # Null for a seeker (QA BUG2, PM 2026-10-22): the commission rule is not theirs to read.
+    commission_type: Literal["percent", "fixed"] | None
+    commission_value: float | None
     seeker_reschedule_window_hours: int
     advisor_cancellation_window_hours: int
     platform_fee_refund_behavior: Literal["retained", "refunded"]

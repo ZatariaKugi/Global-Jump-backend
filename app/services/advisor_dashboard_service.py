@@ -36,6 +36,7 @@ from app.services import (
     advisor_earnings,
     booking_service,
     conversation_service,
+    entitlement_service,
 )
 from app.services.review_service import PUBLIC_STATUSES as REVIEW_PUBLIC_STATUSES
 
@@ -174,8 +175,11 @@ def _inquiry_status(
 
 
 async def _client_inquiries(
-    session: AsyncSession, advisor: User, settings: Settings, limit: int
+    session: AsyncSession, advisor: User, settings: Settings, limit: int, *, chat_locked: bool
 ) -> list[ClientInquiryRead]:
+    """The card's rows. For a plan without ``chats`` the preview is blanked: the row may
+    say who wrote and that it is unread, never what was written (QA BUG 3; this card was
+    the one reader GJ-CHAT-001 missed)."""
     stmt = conversation_service.list_for_user_stmt(advisor.id).limit(limit)
     conversations = (await session.execute(stmt)).scalars().all()
     inquiries: list[ClientInquiryRead] = []
@@ -185,7 +189,10 @@ async def _client_inquiries(
         )
         last_sender_id = await _last_message_sender(session, conversation.id)
         status = _inquiry_status(base.unread_count, last_sender_id, advisor.id)
-        inquiries.append(ClientInquiryRead(**base.model_dump(), status=status))
+        fields = base.model_dump()
+        if chat_locked:
+            fields["last_message_preview"] = None
+        inquiries.append(ClientInquiryRead(**fields, status=status))
     return inquiries
 
 
@@ -197,6 +204,7 @@ async def get_dashboard(
     days: int | None,
 ) -> AdvisorDashboardRead:
     since = _since(days)
+    chat_locked = not await entitlement_service.can_use(session, advisor.id, "chats")
     stats = DashboardStats(
         new_leads_count=await _new_leads_count(session, advisor.id, since),
         total_earned_usd=await _total_earned_usd(session, advisor.id, since),
@@ -208,7 +216,10 @@ async def get_dashboard(
         next_upcoming=await _next_upcoming(session, advisor.id),
         stats=stats,
         regulatory_updates=await _regulatory_updates(session, since, _REGULATORY_CARD_LIMIT),
-        client_inquiries=await _client_inquiries(session, advisor, settings, _INQUIRIES_CARD_LIMIT),
+        client_inquiries=await _client_inquiries(
+            session, advisor, settings, _INQUIRIES_CARD_LIMIT, chat_locked=chat_locked
+        ),
+        chat_locked=chat_locked,
         needs_stripe_connect=profile.needs_stripe_connect,
         # Hide Zoom banner when Zoom OAuth is not configured for this environment.
         needs_zoom_connect=profile.needs_zoom_connect if settings.zoom_oauth_enabled else False,

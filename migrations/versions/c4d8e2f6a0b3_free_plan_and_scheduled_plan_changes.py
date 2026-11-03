@@ -118,8 +118,10 @@ def upgrade() -> None:
     # 4. snapshot every existing subscription from its plan's current rows
     op.execute(
         """
-        INSERT INTO subscription_features (id, subscription_id, feature_key, label, value_type, value, is_enabled)
-        SELECT gen_random_uuid(), s.id, f.feature_key, f.label, f.value_type::text, f.value, f.is_enabled
+        INSERT INTO subscription_features
+            (id, subscription_id, feature_key, label, value_type, value, is_enabled)
+        SELECT gen_random_uuid(), s.id, f.feature_key, f.label, f.value_type::text,
+               f.value, f.is_enabled
         FROM subscriptions s
         JOIN pricing_plan_features f ON f.plan_id = s.plan_id
         WHERE f.kind = 'enforceable' AND f.feature_key IS NOT NULL
@@ -127,7 +129,8 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        UPDATE subscriptions s SET plan_version = GREATEST(p.price_version, 1), price_usd = p.price_usd
+        UPDATE subscriptions s
+        SET plan_version = GREATEST(p.price_version, 1), price_usd = p.price_usd
         FROM pricing_plans p WHERE p.id = s.plan_id
         """
     )
@@ -148,10 +151,13 @@ def upgrade() -> None:
         "UPDATE subscription_features SET feature_key = 'support', label = 'Support' "
         "WHERE feature_key = 'priority_support'"
     )
-    op.execute("UPDATE plan_feature_catalog SET audience = 'both', label = 'Chat' WHERE key = 'chats'")
+    op.execute(
+        "UPDATE plan_feature_catalog SET audience = 'both', label = 'Chat' WHERE key = 'chats'"
+    )
     for key, label, module, audience, limit_type, order in NEW_KEYS:
         op.execute(
-            "INSERT INTO plan_feature_catalog (key, label, module, audience, limit_type, display_order) "
+            "INSERT INTO plan_feature_catalog "
+            "(key, label, module, audience, limit_type, display_order) "
             f"VALUES ('{key}', '{label}', '{module}', '{audience}', '{limit_type}', {order}) "
             "ON CONFLICT (key) DO NOTHING"
         )

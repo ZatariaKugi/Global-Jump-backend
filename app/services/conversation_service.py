@@ -184,6 +184,10 @@ def list_messages_stmt(conversation_id: uuid.UUID) -> Select[tuple[Message]]:
     )
 
 
+# What a participant whose plan lacks ``chats`` is told instead of the message.
+LOCKED_NOTIFICATION_BODY = "Upgrade your plan to read it."
+
+
 async def send_message(
     session: AsyncSession,
     conversation: Conversation,
@@ -235,9 +239,20 @@ async def send_message(
     from app.services import entitlement_service  # module-level would be a cycle
 
     if not await entitlement_service.can_use(session, recipient_id, "chats"):
-        # Deliver and hide (QA GJ-CHAT-001, PM 2026-10-10): the message is stored for
-        # the day the recipient's plan includes chat; no notification carries its
-        # preview to them before then.
+        # Deliver and hide (QA GJ-CHAT-001, PM 2026-10-10) kept the row and told the
+        # recipient nothing. QA BUG 3 (PM 2026-10-23) keeps the hide and adds the
+        # telling: one notification that names the sender and carries no preview, so
+        # the bell, the sidebar and the lock card can say a message is waiting.
+        await notification_service.notify(
+            session,
+            user_id=recipient_id,
+            type=NotificationType.message_received,
+            title=f"New message from {sender.full_name or 'your contact'}",
+            body=LOCKED_NOTIFICATION_BODY,
+            entity_type=NotificationEntityType.conversation,
+            entity_id=conversation.id,
+            actor_id=sender.id,
+        )
         return message
     preview = body[:140] if body else "Sent an attachment"
     notification = await notification_service.notify(
@@ -331,6 +346,27 @@ async def unread_count(
         .where(Message.moderation_status.in_(PUBLIC_STATUSES))
     )
     return int(result.scalar_one())
+
+
+async def unread_summary(session: AsyncSession, user_id: uuid.UUID) -> tuple[int, int, str | None]:
+    """``(unread_messages, unread_conversations, latest_sender_name)`` across every
+    thread the user is in — counts and one name, no text (QA BUG 3)."""
+    mine = select(Conversation.id).where(
+        or_(Conversation.seeker_id == user_id, Conversation.advisor_id == user_id)
+    )
+    unread = (
+        select(Message)
+        .where(Message.conversation_id.in_(mine))
+        .where(Message.sender_id != user_id)
+        .where(Message.read_at.is_(None))
+        .where(Message.deleted_at.is_(None))
+        .where(Message.moderation_status.in_(PUBLIC_STATUSES))
+    )
+    rows = (await session.execute(unread.order_by(Message.created_at.desc()))).scalars().all()
+    if not rows:
+        return 0, 0, None
+    latest = await session.get(User, rows[0].sender_id)
+    return len(rows), len({m.conversation_id for m in rows}), latest.full_name if latest else None
 
 
 async def last_message(session: AsyncSession, conversation_id: uuid.UUID) -> Message | None:

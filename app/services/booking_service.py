@@ -16,7 +16,6 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import resolve_media_url
 from app.core.logging import get_logger
-from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorOfferedService, AdvisorProfile
 from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus, PaymentStatus
 from app.models.booking_document_request import BookingDocumentRequest, DocumentRequestStatus
@@ -44,6 +43,8 @@ from app.schemas.booking import (
 )
 from app.services import (
     advisor_lead_service,
+    advisor_matching_service,
+    advisor_profile_service,
     availability_service,
     booking_document_service,
     booking_meeting_service,
@@ -51,6 +52,7 @@ from app.services import (
     notification_service,
     payment_config_service,
     payment_service,
+    review_service,
 )
 from app.services.availability_service import as_utc
 from app.services.payment_config_service import PaymentConfig, compute_platform_fee
@@ -410,8 +412,9 @@ def build_read(
         service_id=booking.service_id,
         name=booking.name,
         duration_minutes=booking.duration_minutes,
-        advisor_fee_usd=advisor_fee,
-        platform_fee_usd=platform_fee,
+        # the split stays with the people it concerns (QA BUG2, PM 2026-10-22)
+        advisor_fee_usd=None if viewer_role == UserRole.seeker else advisor_fee,
+        platform_fee_usd=None if viewer_role == UserRole.seeker else platform_fee,
         price_usd=booking.price_usd,
         scheduled_start=as_utc(booking.scheduled_start),
         scheduled_end=as_utc(booking.scheduled_end),
@@ -1759,7 +1762,13 @@ async def build_client_reads(
     clients: list[User],
     settings: Settings,
 ) -> list[ClientRead]:
-    """Enrich client picker rows with latest booking + optional lead match_score."""
+    """Enrich client picker rows with the latest booking and the profile match.
+
+    ``match_score`` is the same number the seeker sees for this advisor on Find
+    Advisor (``advisor_matching_service.match_percentage`` from the seeker's
+    profile intent), never the AI lead score — one pair, one figure (#337).
+    ``None`` when the seeker's profile has no destination / visa to match on.
+    """
     if not clients:
         return []
 
@@ -1782,23 +1791,18 @@ async def build_client_reads(
         if booking.seeker_id not in latest_booking:
             latest_booking[booking.seeker_id] = booking
 
-    leads = (
-        (
+    advisor_profile = await advisor_profile_service.get_by_user_id(session, advisor_id)
+    average_rating, _ = await review_service.rating_summary(session, advisor_id)
+    intents: dict[uuid.UUID, tuple[str | None, str | None]] = {
+        sp.user_id: (sp.intended_destination, sp.intended_visa_type)
+        for sp in (
             await session.execute(
-                select(AdvisorLead)
-                .where(AdvisorLead.advisor_id == advisor_id)
-                .where(AdvisorLead.seeker_id.in_(seeker_ids))
-                .where(AdvisorLead.status != AdvisorLeadStatus.dismissed)
-                .order_by(AdvisorLead.created_at.desc())
+                select(SeekerProfile).where(SeekerProfile.user_id.in_(seeker_ids))
             )
         )
         .scalars()
         .all()
-    )
-    latest_lead: dict[uuid.UUID, AdvisorLead] = {}
-    for lead in leads:
-        if lead.seeker_id not in latest_lead:
-            latest_lead[lead.seeker_id] = lead
+    }
 
     photos = await seeker_photo_keys(session, set(seeker_ids))
 
@@ -1808,7 +1812,10 @@ async def build_client_reads(
     rows: list[ClientRead] = []
     for client in clients:
         latest = latest_booking.get(client.id)
-        lead_row = latest_lead.get(client.id)
+        destination, visa_type = intents.get(client.id, (None, None))
+        match = advisor_matching_service.match_percentage(
+            advisor_profile, destination, visa_type, average_rating
+        )
         appt = appointment_id_str(latest) if latest is not None else None
         rows.append(
             ClientRead(
@@ -1821,7 +1828,7 @@ async def build_client_reads(
                 consultation_number=appt,
                 appointment_id=appt,
                 consultation_type=latest.name if latest is not None else None,
-                match_score=lead_row.match_score if lead_row is not None else None,
+                match_score=float(match) if match is not None else None,
                 status=latest.status if latest is not None else None,
                 is_important=latest.is_important if latest is not None else False,
                 is_unread=unread_flags.get(latest.id, False) if latest is not None else False,

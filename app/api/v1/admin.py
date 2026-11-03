@@ -17,7 +17,6 @@ from app.core.file_storage import resolve_url
 from app.core.visa_types import OptionalVisaType
 from app.db.session import SessionDep
 from app.models.advisor_credential import CredentialStatus
-from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import AssessmentQuestion
 from app.models.assessment_threshold import AssessmentThreshold
 from app.models.booking import BookingStatus
@@ -260,16 +259,12 @@ async def update_advisor_verification(
     if body.status == VerificationStatus.approved and (
         previous_status != VerificationStatus.approved or not was_active
     ):
-        advisor_profile = await session.scalar(
-            select(AdvisorProfile).where(AdvisorProfile.user_id == advisor.id)
+        # QA #333: announce to seekers only when the advisor is bookable (Stripe, and
+        # Zoom where configured). Otherwise the announcement waits for readiness —
+        # see payment_service / zoom_connection_service — and goes out once.
+        await seeker_recommendation_service.announce_advisor_if_bookable(
+            session, advisor.id, settings=settings
         )
-        if advisor_profile is not None:
-            await seeker_recommendation_service.notify_seekers_about_new_advisor(
-                session,
-                advisor,
-                advisor_profile,
-                settings=settings,
-            )
         schedule_email(
             send_advisor_welcome_email(
                 advisor.email,

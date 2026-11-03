@@ -102,9 +102,16 @@ async def plan_choice_required(session: AsyncSession, user: User) -> bool:
 
 
 async def _notify_admins_user_registered(session: AsyncSession, user: User) -> None:
+    # The admin's deep link needs the role (#340): a seeker opens Seeker Management, an
+    # advisor the Verification Queue. The notification row carries no role field, so the
+    # type says it.
     await notification_service.notify_admins(
         session,
-        type=NotificationType.user_registered,
+        type=(
+            NotificationType.seeker_registered
+            if user.role == UserRole.seeker
+            else NotificationType.user_registered
+        ),
         title="New user registered",
         body=f"{user.full_name or user.email} signed up as {user.role.value}",
         entity_type=NotificationEntityType.user,

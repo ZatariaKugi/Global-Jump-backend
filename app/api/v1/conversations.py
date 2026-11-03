@@ -26,6 +26,7 @@ from app.schemas.conversation import (
     MessageRead,
     MessageReport,
     MessageSend,
+    UnreadSummaryRead,
 )
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.token import TokenPayload
@@ -155,6 +156,33 @@ async def list_conversations(
     ]
     return ResponseEnvelope[list[ConversationRead]](
         data=data, meta=page_meta(params, total, request_id)
+    )
+
+
+@router.get("/conversations/unread-summary", response_model=ResponseEnvelope[UnreadSummaryRead])
+async def unread_summary(
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[UnreadSummaryRead]:
+    """Counts only, open to a plan that lacks ``chats`` (QA BUG 3, PM 2026-10-23).
+
+    The one read under ``/conversations`` that skips ``_assert_may_chat``: it tells a
+    locked participant *that* messages wait and from whom, never what they say. The
+    list, the history and both sockets keep refusing until the plan includes chat.
+    """
+    messages, threads, sender = await conversation_service.unread_summary(session, current_user.id)
+    locked = current_user.role in (UserRole.seeker, UserRole.advisor) and not await _may_chat(
+        session, current_user.id
+    )
+    return ResponseEnvelope[UnreadSummaryRead](
+        data=UnreadSummaryRead(
+            unread_messages=messages,
+            unread_conversations=threads,
+            latest_sender_name=sender,
+            chat_locked=locked,
+        ),
+        meta=Meta(request_id=request_id),
     )
 
 

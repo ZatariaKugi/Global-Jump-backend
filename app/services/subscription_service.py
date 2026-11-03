@@ -619,6 +619,28 @@ def _invoice_description(lines: list[Any], amount: Decimal) -> str | None:
     return str(_get(lines[0], "description") or "") or None
 
 
+def _upgrade_target_plan_id(invoice: Any) -> uuid.UUID | None:
+    """The plan an upgrade-difference invoice bought (QA BUG5, 2026-10-22).
+
+    ``change_plan`` stamps ``gj_kind=upgrade_difference`` and ``plan_id`` on the one-off
+    invoice and on its line. Its ``invoice.paid`` lands *before* the subscriber has been
+    moved, so at that moment ``sub.plan_id`` is the plan being left — crediting the
+    payment there is exactly the mis-grouping QA saw. Anything without our stamp (a
+    first purchase, a renewal, a backfilled row) returns None and keeps the old rule.
+    """
+    candidates = [_get(invoice, "metadata")]
+    for line in _get(_get(invoice, "lines"), "data") or []:
+        candidates.append(_get(line, "metadata"))
+    for meta in candidates:
+        if not meta or str(_get(meta, "gj_kind") or "") != "upgrade_difference":
+            continue
+        try:
+            return uuid.UUID(str(_get(meta, "plan_id")))
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
 async def _upsert_invoice_row(session: AsyncSession, sub: Subscription, invoice: Any) -> Decimal:
     """Write (or refresh) one Billing History row. Returns the amount paid.
 
@@ -635,6 +657,7 @@ async def _upsert_invoice_row(session: AsyncSession, sub: Subscription, invoice:
         period_end = _ts(_get(lp, "end")) or period_end
     amount = Decimal(str(_get(invoice, "amount_paid", 0) or 0)) / Decimal(100)
     description = _invoice_description(lines, amount)
+    bought = _upgrade_target_plan_id(invoice)
     existing = (
         await session.execute(
             select(SubscriptionInvoice).where(
@@ -646,9 +669,10 @@ async def _upsert_invoice_row(session: AsyncSession, sub: Subscription, invoice:
         session.add(
             SubscriptionInvoice(
                 subscription_id=sub.id,
-                # Snapshot, not a reference: the subscriber's plan at the moment of
-                # the charge, so an upgrade never re-attributes what they paid before.
-                plan_id=sub.plan_id,
+                # Snapshot, not a reference: the plan this payment bought. For an
+                # upgrade that is the plan being moved TO (our metadata); otherwise
+                # the subscriber's plan at the moment of the charge.
+                plan_id=bought or sub.plan_id,
                 stripe_invoice_id=stripe_invoice_id,
                 stripe_invoice_number=_get(invoice, "number"),
                 description=(description or None),
@@ -663,6 +687,8 @@ async def _upsert_invoice_row(session: AsyncSession, sub: Subscription, invoice:
     else:
         existing.status = str(_get(invoice, "status") or "paid")
         existing.amount_usd = amount
+        if bought is not None and existing.plan_id != bought:
+            existing.plan_id = bought
         session.add(existing)
     return amount
 
@@ -1462,6 +1488,39 @@ def admin_read(
     )
 
 
+async def reattribute_upgrade_invoices(session: AsyncSession) -> int:
+    """One-time repair (QA BUG5, 2026-10-22). Rows written before the fix carry the plan
+    the subscriber was leaving and a description ``Upgrade to <plan>``; move each to the
+    plan named, within the audience of the subscription's current plan (plan names repeat
+    across audiences). Rows naming no known plan are left alone. Idempotent. The
+    migration ``a9c3d7e1f5b2`` runs the same rule in SQL; this is the testable twin.
+    """
+    prefix = "Upgrade to "
+    rows = (
+        await session.execute(
+            select(SubscriptionInvoice, PricingPlan.audience)
+            .join(Subscription, Subscription.id == SubscriptionInvoice.subscription_id)
+            .join(PricingPlan, PricingPlan.id == Subscription.plan_id)
+            .where(SubscriptionInvoice.description.like(prefix + "%"))
+        )
+    ).all()
+    if not rows:
+        return 0
+    plans = (await session.execute(select(PricingPlan))).scalars().all()
+    by_key = {(_audience_value(p.audience), p.name): p.id for p in plans}
+    moved = 0
+    for inv, audience in rows:
+        name = (inv.description or "")[len(prefix):].strip()
+        target = by_key.get((_audience_value(audience), name))
+        if target is None or target == inv.plan_id:
+            continue
+        inv.plan_id = target
+        session.add(inv)
+        moved += 1
+    await session.flush()
+    return moved
+
+
 # ── Subscriptions Finance summary (admin cards) ──────────────────────────────
 
 _PAID_INVOICE_STATUS = "paid"
@@ -1694,15 +1753,28 @@ async def admin_finance_summary(
     ).all()
     subs_by_plan = {pid: int(n or 0) for pid, n in sub_rows}
 
+    # A plan with an active subscriber but no payment in the window is still a row
+    # (QA BUG5): the newest plan after an upgrade was missing from the breakdown.
+    listed = {plan_id for plan_id, _name, _aud, _amount in current}
+    quiet = [pid for pid in subs_by_plan if pid is not None and pid not in listed]
+    if quiet:
+        quiet_plans = await session.execute(select(PricingPlan).where(PricingPlan.id.in_(quiet)))
+        for p in quiet_plans.scalars():
+            current.append((p.id, p.name, _audience_value(p.audience), 0.0))
+
+    def plan_change(amount: float, previous_amount: float) -> float | None:
+        # Nothing to compare with -> no figure; the screen says "New" (QA BUG5).
+        if not has_previous or previous_amount <= 0:
+            return None
+        return _change_pct(amount, previous_amount)
+
     plans = [
         AdminSubscriptionPlanRevenueRead(
             plan_id=plan_id,
             plan_name=name,
             audience="advisor" if aud == "advisor" else "seeker",
             revenue_usd=amount,
-            change_pct=(
-                _change_pct(amount, prev_by_plan.get(plan_id, 0.0)) if has_previous else None
-            ),
+            change_pct=plan_change(amount, prev_by_plan.get(plan_id, 0.0)),
             subscriber_count=subs_by_plan.get(plan_id, 0),
         )
         for plan_id, name, aud, amount in current
@@ -1717,10 +1789,10 @@ async def admin_finance_summary(
         active_seekers=active_seekers,
         active_advisors=active_advisors,
         total_revenue_usd=total,
-        total_revenue_change_pct=_change_pct(total, prev_total) if has_previous else None,
+        total_revenue_change_pct=plan_change(total, prev_total),
         advisor_revenue_usd=advisor,
-        advisor_revenue_change_pct=_change_pct(advisor, prev_advisor) if has_previous else None,
+        advisor_revenue_change_pct=plan_change(advisor, prev_advisor),
         seeker_revenue_usd=seeker,
-        seeker_revenue_change_pct=_change_pct(seeker, prev_seeker) if has_previous else None,
+        seeker_revenue_change_pct=plan_change(seeker, prev_seeker),
         plans=plans,
     )

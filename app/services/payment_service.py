@@ -737,6 +737,14 @@ async def _handle_account_updated(session: AsyncSession, account: object) -> Non
     _sync_connect_flags(profile, account)
     session.add(profile)
     await session.flush()
+    if profile.stripe_payouts_enabled:
+        # QA #333: a seeker is told about a new advisor only once they are bookable.
+        from app.core.config import get_settings
+        from app.services import seeker_recommendation_service
+
+        await seeker_recommendation_service.announce_advisor_if_bookable(
+            session, profile.user_id, settings=get_settings()
+        )
     if not was_payouts_enabled and profile.stripe_payouts_enabled:
         await notification_service.notify(
             session,
@@ -1724,6 +1732,13 @@ async def get_connect_status(
     _sync_connect_flags(profile, account)
     session.add(profile)
     await session.flush()
+    if profile.stripe_payouts_enabled:
+        # QA #333: readiness may first be seen here rather than via the webhook.
+        from app.services import seeker_recommendation_service
+
+        await seeker_recommendation_service.announce_advisor_if_bookable(
+            session, profile.user_id, settings=settings
+        )
 
     account_type = _stripe_get(account, "type", None)
 

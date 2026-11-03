@@ -63,6 +63,7 @@ class ClientRead(BaseModel):
     consultation_number: str | None = None
     appointment_id: str | None = None
     consultation_type: str | None = None
+    # Seeker-facing profile match (same as Find Advisor); None = nothing to match on.
     match_score: float | None = None
     status: BookingStatus | None = None
     # From the latest booking — drives Clients-table bookmark / red-dot.
@@ -107,8 +108,10 @@ class BookingRead(BaseModel):
     name: str
     duration_minutes: int
     # ``price_usd`` is the total charge; the fee split comes from the admin payment settings.
-    advisor_fee_usd: float
-    platform_fee_usd: float
+    # Null for a seeker: how the price splits between the advisor and the platform is
+    # their business, never the seeker's (QA BUG2, PM 2026-10-22).
+    advisor_fee_usd: float | None
+    platform_fee_usd: float | None
     price_usd: float
     scheduled_start: datetime
     scheduled_end: datetime

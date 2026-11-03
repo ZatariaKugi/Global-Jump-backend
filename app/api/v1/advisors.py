@@ -1202,7 +1202,8 @@ async def list_my_clients(
     ``id`` / ``seeker_id`` are the seeker user UUID. Booking fields
     (``booking_id``, ``consultation_number`` / ``appointment_id``,
     ``consultation_type``, ``status``, ``is_important``) come from the latest
-    booking; ``match_score`` from the latest non-dismissed lead when present.
+    booking; ``match_score`` is the seeker-facing profile match for this advisor
+    (the Find Advisor number), ``null`` when the seeker's profile has no intent.
     """
     stmt = booking_service.list_clients_stmt(
         current_user.id, q, service_ids=service_id, status=status

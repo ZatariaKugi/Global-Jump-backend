@@ -40,6 +40,8 @@ class NotificationType(StrEnum):
     payout_completed = "payout_completed"
     payout_rejected = "payout_rejected"
     user_registered = "user_registered"
+    # a seeker sign-up (#340); `user_registered` stays for advisors and old rows
+    seeker_registered = "seeker_registered"
     pre_registration_received = "pre_registration_received"
     new_relevant_advisor = "new_relevant_advisor"
     message_received = "message_received"

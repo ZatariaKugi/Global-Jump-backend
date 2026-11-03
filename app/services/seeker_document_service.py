@@ -6,7 +6,7 @@ import uuid
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import ColumnElement, Select, delete, exists, func, or_, select
+from sqlalchemy import ColumnElement, Select, delete, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -284,7 +284,12 @@ def _review_stale_after_document_update(
     document: SeekerDocument,
     review: SeekerDocumentAdvisorReview,
 ) -> bool:
-    """True when the file/metadata changed after this review (e.g. seeker re-uploaded)."""
+    """True when the file/metadata changed after this review (e.g. seeker re-uploaded).
+
+    Only writes that change the document may move ``updated_at``; the comments-read
+    stamp deliberately pins it (``mark_comments_read``), and comment rows never touch
+    the document at all (QA BUG4).
+    """
     if document.status != SeekerDocumentStatus.under_review:
         return False
     if document.updated_at is None:
@@ -665,11 +670,25 @@ async def add_comment(
 async def mark_comments_read(
     session: AsyncSession, document: SeekerDocument, actor_id: uuid.UUID
 ) -> None:
-    """Idempotent: seeker opened the comments sheet."""
-    document.comments_last_read_at = datetime.now(UTC)
-    document.updated_by = actor_id
-    session.add(document)
+    """Idempotent: seeker opened the comments sheet.
+
+    Written as a targeted UPDATE that pins ``updated_at`` to its current value. Reading
+    comments is not a change to the document: through the ORM the row's ``onupdate``
+    bumped ``updated_at``, and ``_review_stale_after_document_update`` then hid every
+    advisor approval older than that instant — an approved document flipped to Under
+    Review the moment the seeker opened its Reviews sheet (QA BUG4, 2026-10-23).
+    """
+    await session.execute(
+        update(SeekerDocument)
+        .where(SeekerDocument.id == document.id)
+        .values(
+            comments_last_read_at=datetime.now(UTC),
+            updated_by=actor_id,
+            updated_at=SeekerDocument.updated_at,
+        )
+    )
     await session.flush()
+    session.expire(document, ["comments_last_read_at", "updated_by"])
 
 
 async def notify_seeker_of_advisor_comment(

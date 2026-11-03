@@ -37,7 +37,8 @@ def upgrade() -> None:
         f"WHERE key IN {KEYS} AND limit_type = 'number'"
     )
     op.execute(
-        "UPDATE plan_feature_catalog SET label = 'AI recommendations' WHERE key = 'matched_advisors'"
+        "UPDATE plan_feature_catalog SET label = 'AI recommendations' "
+        "WHERE key = 'matched_advisors'"
     )
     # The card label is copied onto each plan row and snapshot at save time; rename the
     # ones that still carry the catalog's old wording (an admin's own wording is kept).

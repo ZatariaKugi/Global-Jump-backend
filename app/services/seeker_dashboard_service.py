@@ -230,7 +230,8 @@ async def get_dashboard(
     score = 0.0 if raw_score is None else float(raw_score)
     eligibility = max(0, min(int(round(score)), 100))
     breakdown = EligibilityBreakdownRead(
-        center_percent=journey_progress,
+        # the centre of the eligibility ring is the eligibility score (QA #330)
+        center_percent=eligibility,
         segments=[
             EligibilityBreakdownSegment(key="eligibility", label="Eligibility", value=eligibility),
             EligibilityBreakdownSegment(
