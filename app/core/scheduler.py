@@ -13,17 +13,24 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.db.session import async_session_factory
-from app.services import booking_service, payment_service, push_service, upload_cleanup_service
+from app.services import (
+    booking_service,
+    payment_service,
+    push_service,
+    stripe_config_service,
+    upload_cleanup_service,
+)
 
 logger = get_logger(__name__)
 
 
 async def _sweep_due_transfers(settings: Settings) -> None:
     """One sweep pass. Opens its own session and commits/rolls back explicitly."""
-    if not settings.STRIPE_SECRET_KEY:
-        return  # payments not configured (e.g. local dev without Stripe) — nothing to do
     async with async_session_factory() as session:
         try:
+            keys = await stripe_config_service.effective_keys(session, settings)
+            if not keys.secret_key:
+                return  # Stripe not configured in the admin panel — nothing to sweep
             count = await payment_service.run_due_transfers(session, settings)
             await session.commit()
             if count:

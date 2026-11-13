@@ -1,0 +1,20 @@
+Hi {{ full_name }},
+
+{% if renewed %}Your {{ plan_name }} plan has renewed.{% else %}Your {{ plan_name }} plan is now active.{% endif %}
+
+  Plan:          {{ plan_name }}
+  Amount paid:   ${{ amount_usd }}
+{% if period_end_str %}  Paid through:  {{ period_end_str }}
+{% endif %}
+{% if invoice_url %}View your invoice: {{ invoice_url }}
+{% endif %}
+You can manage your plan, card and invoices any time from your {{ app_name }} dashboard.
+
+— The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}
+How it works: {{ how_it_works_url }}
+FAQs: {{ faq_url }}

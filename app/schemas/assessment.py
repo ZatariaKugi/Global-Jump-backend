@@ -225,6 +225,11 @@ class AssessmentRead(BaseModel):
     weaknesses: list[str]
     missing_requirements: list[str]
     ai_summary: str | None
+    # Always false since 2026-10-09: the narrative is part of the assessment the
+    # seeker just spent an allowance on. Kept for the web client's payload shape.
+    # (Was: true when the seeker's plan did not include ``ai_insights`` —
+    # the score is shown, the narrative lists above are emptied.
+    insights_locked: bool = False
 
 
 class AssessmentSummaryRead(BaseModel):

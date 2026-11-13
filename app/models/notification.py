@@ -40,12 +40,22 @@ class NotificationType(StrEnum):
     payout_completed = "payout_completed"
     payout_rejected = "payout_rejected"
     user_registered = "user_registered"
+    # a seeker sign-up (#340); `user_registered` stays for advisors and old rows
+    seeker_registered = "seeker_registered"
     pre_registration_received = "pre_registration_received"
     new_relevant_advisor = "new_relevant_advisor"
     message_received = "message_received"
     lead_contacted = "lead_contacted"
     document_comment = "document_comment"
     document_status_updated = "document_status_updated"
+    # EPIC 04 payments and subscriptions
+    booking_refund_issued = "booking_refund_issued"
+    refund_failed = "refund_failed"
+    subscription_activated = "subscription_activated"
+    subscription_payment_failed = "subscription_payment_failed"
+    subscription_canceled = "subscription_canceled"
+    plan_sync_failed = "plan_sync_failed"
+    webhook_processing_failed = "webhook_processing_failed"
 
 
 class NotificationEntityType(StrEnum):
@@ -55,6 +65,7 @@ class NotificationEntityType(StrEnum):
     user = "user"
     conversation = "conversation"
     seeker_document = "seeker_document"
+    subscription = "subscription"
 
 
 class PushStatus(StrEnum):
@@ -89,9 +100,7 @@ class Notification(BaseModel):
     )
     entity_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    scheduled_start: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    scheduled_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     push_status: Mapped[PushStatus] = mapped_column(
         SAEnum(PushStatus, name="notification_push_status"),

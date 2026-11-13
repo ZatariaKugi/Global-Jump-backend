@@ -20,10 +20,10 @@ from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import Assessment, AssessmentStatus, EligibilityTier
 from app.models.booking import Booking, BookingStatus
 from app.models.message import Message
-from app.models.payout_request import PayoutRequest, PayoutStatus
 from app.models.seeker_document import SeekerDocument
 from app.models.seeker_profile import SeekerProfile
-from app.models.transaction import Transaction, TransactionStatus
+from app.models.subscription import SubscriptionInvoice
+from app.models.transaction import Transaction, TransactionStatus, TransferStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.models.visa_type import VisaType
 from app.schemas.analytics import (
@@ -44,7 +44,7 @@ from app.schemas.analytics import (
     SessionTrendPoint,
     TopAdvisorRead,
 )
-from app.services import review_service
+from app.services import advisor_earnings, review_service
 
 # Donut / stacked-bar order matches the admin AI analytics FE.
 _AI_VISA_ORDER: tuple[VisaType, ...] = (
@@ -75,6 +75,70 @@ _GROSS_STATUSES = (
     TransactionStatus.partially_refunded,
     TransactionStatus.refunded,
 )
+
+
+async def revenue_today(session: AsyncSession) -> float:
+    """Everything received today: consultations net of same-day refunds, plus
+    subscription invoices paid today (QA BUG16). Both screens call this."""
+    consultations = await consultation_revenue_today(session)
+    subscriptions = await subscription_revenue_today(session)
+    return round(consultations + subscriptions, 2)
+
+
+def _today_bounds() -> tuple[datetime, datetime]:
+    today = datetime.now(UTC).date()
+    today_start = datetime(today.year, today.month, today.day, tzinfo=UTC)
+    return today_start, today_start + timedelta(days=1)
+
+
+async def subscription_revenue_today(session: AsyncSession) -> float:
+    """Subscription invoices paid today. Subscriptions never refund (PM, 2026-10-07)."""
+    today_start, today_end = _today_bounds()
+    when = func.coalesce(SubscriptionInvoice.period_start, SubscriptionInvoice.created_at)
+    total = (
+        await session.execute(
+            select(func.coalesce(func.sum(SubscriptionInvoice.amount_usd), 0)).where(
+                SubscriptionInvoice.status == "paid", when >= today_start, when < today_end
+            )
+        )
+    ).scalar_one()
+    return round(float(total or 0), 2)
+
+
+async def consultation_revenue_today(session: AsyncSession) -> float:
+    """Today's charges, net of refunds on those same charges.
+
+    The card is strictly the current day (PM decision, 2026-10-07, reversing the
+    2026-10-01 rule): a consultation bought and refunded today reads net, but a refund
+    today of a booking paid on an earlier day does not touch it. The 30-day finance
+    window is where that refund shows, attributed by refund date as before. The earlier
+    rule made a quiet day with one old refund read as a negative number.
+
+    Both the admin dashboard and the analytics overview call this, so the two screens
+    cannot drift apart.
+    """
+    today_start, today_end = _today_bounds()
+    # Revenue is the platform's income (PM, 2026-10-09): the commission on today's
+    # charges, less any commission returned to the seeker ("seeker keeps the fee").
+    net_today = (
+        await session.execute(
+            select(
+                func.coalesce(
+                    func.sum(
+                        Transaction.commission_usd
+                        - func.coalesce(Transaction.platform_fee_refunded_usd, 0.0)
+                    ),
+                    0.0,
+                )
+            ).where(
+                Transaction.status.in_(_GROSS_STATUSES),
+                Transaction.created_at >= today_start,
+                Transaction.created_at < today_end,
+            )
+        )
+    ).scalar_one()
+    # coalesce() guarantees a number, but the column is nullable so the type is not.
+    return round(float(net_today or 0), 2)
 
 
 def _month_key(dt: datetime) -> str:
@@ -148,18 +212,7 @@ async def get_overview_analytics(session: AsyncSession, days: int = 30) -> Overv
     ).scalar_one()
     booking_rate = round(100.0 * booked / assessed, 2) if assessed else 0.0
 
-    today = datetime.now(UTC).date()
-    today_start = datetime(today.year, today.month, today.day, tzinfo=UTC)
-    today_end = today_start + timedelta(days=1)
-    revenue_today_usd = (
-        await session.execute(
-            select(func.coalesce(func.sum(Transaction.amount_usd), 0.0)).where(
-                Transaction.status.in_(_GROSS_STATUSES),
-                Transaction.created_at >= today_start,
-                Transaction.created_at < today_end,
-            )
-        )
-    ).scalar_one()
+    revenue_today_usd = await revenue_today(session)
 
     country_rows = (
         await session.execute(
@@ -403,17 +456,24 @@ def _change_pct(current: float, previous: float) -> float:
 
 def _finance_window_totals(
     transactions: Sequence[Transaction],
-    payouts: Sequence[PayoutRequest],
     window_start: datetime,
     window_end: datetime,
 ) -> tuple[float, float, float, float]:
-    """Gross / refunds / net / advisor payout for [window_start, window_end)."""
+    """Commission earned / seeker refunds / commission returned / advisor earnings for
+    [window_start, window_end).
+
+    Revenue is the platform's *income* (PM, 2026-10-09), never the consultation price:
+    the commission (percent or fixed, as configured) on every charge in the window.
+    "Platform keeps the fee" on a refund leaves it earned; "seeker keeps the fee" returns
+    it, attributed by refund date like every other refund. Advisor earnings = the advisor
+    share of every payment whose transfer completed, less Stripe's fee and reversals.
+    """
     gross_txns = [
         t
         for t in transactions
         if t.status in _GROSS_STATUSES and window_start <= _as_utc(t.created_at) < window_end
     ]
-    gross = round(money_sum(t.amount_usd for t in gross_txns), 2)
+    earned = round(money_sum(as_float(t.commission_usd) for t in gross_txns), 2)
 
     refunded = [
         t
@@ -421,15 +481,53 @@ def _finance_window_totals(
         if t.refunded_at is not None and window_start <= _as_utc(t.refunded_at) < window_end
     ]
     refunds = round(money_sum(t.refunded_amount_usd for t in refunded), 2)
-    net = round(gross - refunds, 2)
+    returned = round(money_sum(as_float(t.platform_fee_refunded_usd) for t in refunded), 2)
 
-    window_payouts = [
-        p
-        for p in payouts
-        if p.processed_at is not None and window_start <= _as_utc(p.processed_at) < window_end
+    paid_out = [
+        t
+        for t in transactions
+        if t.transfer_status == TransferStatus.completed
+        and t.status in _GROSS_STATUSES
+        and window_start <= _as_utc(t.created_at) < window_end
     ]
-    advisor_payout = round(money_sum(p.amount_usd for p in window_payouts), 2)
-    return gross, refunds, net, advisor_payout
+    # Money reversed off the advisor is not earnings. Reversals are attributed the
+    # same way refunds are -- by when they happened, not when the charge was made.
+    reversed_out = money_sum(advisor_earnings.refund_reversals(t) for t in refunded)
+    # The advisor bears Stripe's fee once it was actually taken from their transfer;
+    # a fee that could not be taken is still theirs (PM exercise, 2026-10-10).
+    advisor_payout = round(
+        money_sum(
+            as_float(t.advisor_payout_usd) - advisor_earnings.stripe_fee_taken(t) for t in paid_out
+        )
+        - reversed_out,
+        2,
+    )
+    return earned, refunds, returned, advisor_payout
+
+
+async def _subscription_revenue(
+    session: AsyncSession, start: datetime, end: datetime
+) -> tuple[float, dict[str, float]]:
+    """Paid plan invoices attributed to the period they cover (falls back to row time).
+
+    Subscriptions never refund and never pay an advisor, so this is pure platform
+    revenue and joins Gross/Net only. Same attribution as Subscriptions Finance.
+    """
+    when = func.coalesce(SubscriptionInvoice.period_start, SubscriptionInvoice.created_at)
+    rows = (
+        await session.execute(
+            select(when, SubscriptionInvoice.amount_usd).where(
+                SubscriptionInvoice.status == "paid", when >= start, when < end
+            )
+        )
+    ).all()
+    by_month: dict[str, float] = defaultdict(float)
+    total = 0.0
+    for when_value, amount in rows:
+        value = as_float(amount)
+        total += value
+        by_month[_month_key(_as_utc(when_value))] += value
+    return round(total, 2), by_month
 
 
 async def get_finance_analytics(session: AsyncSession, days: int = 30) -> FinanceAnalyticsRead:
@@ -463,25 +561,23 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
         by_id.setdefault(t.id, t)
     transactions = list(by_id.values())
 
-    payouts = (
-        (
-            await session.execute(
-                select(PayoutRequest).where(
-                    PayoutRequest.status == PayoutStatus.completed,
-                    PayoutRequest.processed_at >= prev_since,
-                )
-            )
-        )
-        .scalars()
-        .all()
+    earned_usd, refunds_usd, returned_usd, advisor_payout_usd = _finance_window_totals(
+        transactions, since, now
     )
-
-    gross_revenue_usd, refunds_usd, net_revenue_usd, advisor_payout_usd = _finance_window_totals(
-        transactions, payouts, since, now
+    prev_earned, prev_refunds, prev_returned, prev_payout = _finance_window_totals(
+        transactions, prev_since, since
     )
-    prev_gross, prev_refunds, prev_net, prev_payout = _finance_window_totals(
-        transactions, payouts, prev_since, since
-    )
+    # Revenue is the platform's income (PM, 2026-10-09): Gross = commission earned +
+    # subscriptions; Net takes the commission returned to seekers off that. The
+    # Refunds card still reports what went back to seekers in full.
+    subscription_usd, subscription_by_month = await _subscription_revenue(session, since, now)
+    prev_subscription, _ = await _subscription_revenue(session, prev_since, since)
+    consultation_usd = round(earned_usd - returned_usd, 2)
+    prev_consultation = round(prev_earned - prev_returned, 2)
+    gross_revenue_usd = round(earned_usd + subscription_usd, 2)
+    net_revenue_usd = round(gross_revenue_usd - returned_usd, 2)
+    prev_gross = round(prev_earned + prev_subscription, 2)
+    prev_net = round(prev_gross - prev_returned, 2)
 
     # Trends: current window only.
     current_gross = [
@@ -489,7 +585,9 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
     ]
     revenue_trend_map: dict[str, float] = defaultdict(float)
     for t in current_gross:
-        revenue_trend_map[_month_key(t.created_at)] += as_float(t.amount_usd)
+        revenue_trend_map[_month_key(t.created_at)] += as_float(t.commission_usd)
+    for month, amount in subscription_by_month.items():
+        revenue_trend_map[month] += amount
     revenue_trend = [
         MonthlyAmountPoint(month=month, amount_usd=round(amount, 2))
         for month, amount in sorted(revenue_trend_map.items())
@@ -509,11 +607,15 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
     ]
 
     payout_trend_map: dict[str, float] = defaultdict(float)
-    for p in payouts:
-        assert p.processed_at is not None
-        if _as_utc(p.processed_at) < since:
+    for t in transactions:
+        if t.transfer_status != TransferStatus.completed or t.status not in _GROSS_STATUSES:
             continue
-        payout_trend_map[_month_key(p.processed_at)] += as_float(p.amount_usd)
+        created = _as_utc(t.created_at)
+        if created < since:
+            continue
+        payout_trend_map[_month_key(created)] += as_float(
+            t.advisor_payout_usd
+        ) - advisor_earnings.stripe_fee_taken(t)
     monthly_payouts = [
         MonthlyAmountPoint(month=month, amount_usd=round(amount, 2))
         for month, amount in sorted(payout_trend_map.items())
@@ -525,10 +627,16 @@ async def get_finance_analytics(session: AsyncSession, days: int = 30) -> Financ
         net_revenue_usd=net_revenue_usd,
         refunds_usd=refunds_usd,
         advisor_payout_usd=advisor_payout_usd,
+        platform_refunds_usd=round(returned_usd, 2),
+        consultation_revenue_usd=consultation_usd,
+        subscription_revenue_usd=subscription_usd,
         gross_revenue_change_pct=_change_pct(gross_revenue_usd, prev_gross),
         net_revenue_change_pct=_change_pct(net_revenue_usd, prev_net),
         refunds_change_pct=_change_pct(refunds_usd, prev_refunds),
         advisor_payout_change_pct=_change_pct(advisor_payout_usd, prev_payout),
+        consultation_revenue_change_pct=_change_pct(consultation_usd, prev_consultation),
+        subscription_revenue_change_pct=_change_pct(subscription_usd, prev_subscription),
+        platform_refunds_change_pct=_change_pct(returned_usd, prev_returned),
         revenue_trend=revenue_trend,
         refund_trend=refund_trend,
         monthly_payouts=monthly_payouts,

@@ -35,6 +35,13 @@ class TransferStatus(StrEnum):
     failed = "failed"  # transfer attempts exhausted; needs manual intervention
 
 
+class ChargeModel(StrEnum):
+    """How the money moved for this payment."""
+
+    separate_transfer = "separate_transfer"  # legacy: platform charged, sweep transferred
+    destination = "destination"  # EPIC 04: destination charge, advisor paid in the charge
+
+
 class Transaction(BaseModel):
     __tablename__ = "transactions"
 
@@ -70,11 +77,45 @@ class Transaction(BaseModel):
     )
     transfer_last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
+    # EPIC 04 destination charges (PAY-102 / PAY-105). Historical rows keep the
+    # server default ``separate_transfer``.
+    charge_model: Mapped[ChargeModel] = mapped_column(
+        SAEnum(ChargeModel, name="charge_model"),
+        default=ChargeModel.destination,
+        server_default=ChargeModel.separate_transfer.value,
+        nullable=False,
+    )
+    application_fee_usd: Mapped[float] = mapped_column(
+        Numeric(10, 2), nullable=False, default=0, server_default="0"
+    )
+    stripe_application_fee_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    advisor_reversed_usd: Mapped[float] = mapped_column(
+        Numeric(10, 2), nullable=False, default=0, server_default="0"
+    )
+    platform_fee_refunded_usd: Mapped[float] = mapped_column(
+        Numeric(10, 2), nullable=False, default=0, server_default="0"
+    )
+    # Stripe's own processing fee on this charge, read from the charge's balance
+    # transaction at payment time. The advisor bears it (QA 2026-10-08): the same amount
+    # is reversed off their transfer and ``stripe_fee_reversal_id`` records that call.
+    # NULL with a non-zero fee means the recovery failed and the advisor still holds it.
+    stripe_fee_usd: Mapped[float] = mapped_column(
+        Numeric(10, 2), nullable=False, default=0, server_default="0"
+    )
+    stripe_fee_reversal_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_balance_transaction_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # ``amount_usd`` is what the seeker paid: consultation price plus ``tax_usd``.
     amount_usd: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     commission_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
     commission_usd: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     tax_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False, server_default="0.08")
     tax_usd: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False, server_default="0")
+    # What Stripe Tax charged ("VAT", "DE", "Germany" / "Sales Tax", "US", "California");
+    # NULL when no tax applied. Stripe decides the rate from the seeker's billing address.
+    tax_label: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    tax_country: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    tax_jurisdiction: Mapped[str | None] = mapped_column(String(100), nullable=True)
     advisor_payout_usd: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     payment_method: Mapped[str] = mapped_column(
         String(50), default="card", server_default="card", nullable=False

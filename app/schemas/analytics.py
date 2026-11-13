@@ -112,15 +112,25 @@ class AdvisorAnalyticsRead(BaseModel):
 
 class FinanceAnalyticsRead(BaseModel):
     window_days: int
+    # Gross = consultations + subscriptions. Refunds and advisor earnings are
+    # consultation-only: plans never refund and never pay an advisor.
     gross_revenue_usd: float
     net_revenue_usd: float
     refunds_usd: float
     advisor_payout_usd: float
+    consultation_revenue_usd: float
+    subscription_revenue_usd: float
+    # "Refunds from platform" (QA GJ-ANALYTICS-001, PM 2026-10-10): the commission the
+    # platform itself gave back to seekers in the window. Net = Gross minus this.
+    platform_refunds_usd: float = 0.0
     # % change vs the immediately preceding window of the same length.
     gross_revenue_change_pct: float
     net_revenue_change_pct: float
     refunds_change_pct: float
     advisor_payout_change_pct: float
+    consultation_revenue_change_pct: float
+    subscription_revenue_change_pct: float
+    platform_refunds_change_pct: float = 0.0
     revenue_trend: list[MonthlyAmountPoint]
     refund_trend: list[MonthlyAmountPoint]
     monthly_payouts: list[MonthlyAmountPoint]

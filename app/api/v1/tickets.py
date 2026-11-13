@@ -11,12 +11,13 @@ from app.api.pagination import PaginationDep, page_meta, paginate
 from app.core.exceptions import PermissionDeniedError
 from app.core.file_storage import resolve_url
 from app.db.session import SessionDep
+from app.models.support_ticket import TicketPriority
 from app.models.ticket_message import TicketMessageAttachment
 from app.models.user import User
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.support_ticket import TicketRead, TicketSelfCreate
 from app.schemas.ticket_message import TicketMessageRead, TicketMessageSend
-from app.services import support_ticket_service, ticket_message_service
+from app.services import entitlement_service, support_ticket_service, ticket_message_service
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
@@ -35,7 +36,12 @@ async def create_my_ticket(
     seeker or advisor on that booking); its session context is snapshotted onto
     the ticket. The ``description`` becomes the opening thread message.
     """
-    ticket = await support_ticket_service.create_for_user(session, body, current_user)
+    # Support is a plan perk for seekers and advisors (PM, 2026-10-08): the whole
+    # module locks without it. There is no priority tier any more.
+    await entitlement_service.check(session, current_user, "support")
+    ticket = await support_ticket_service.create_for_user(
+        session, body, current_user, priority=TicketPriority.medium
+    )
     return ResponseEnvelope[TicketRead](
         data=await support_ticket_service.ticket_read(session, ticket, settings),
         meta=Meta(request_id=request_id),
@@ -59,6 +65,7 @@ async def list_my_tickets(
     """
     from app.core.exceptions import AppError
 
+    await entitlement_service.check(session, current_user, "support")
     try:
         status_filter = support_ticket_service.coerce_status_filter(status)
     except ValueError as exc:
@@ -82,6 +89,7 @@ async def get_my_ticket(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[TicketRead]:
+    await entitlement_service.check(session, current_user, "support")
     ticket = await support_ticket_service.get_for_user(session, ticket_id, current_user.id)
     return ResponseEnvelope[TicketRead](
         data=await support_ticket_service.ticket_read(
@@ -103,6 +111,7 @@ async def list_my_ticket_messages(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[TicketMessageRead]]:
+    await entitlement_service.check(session, current_user, "support")
     ticket = await support_ticket_service.get_for_user(session, ticket_id, current_user.id)
     stmt = ticket_message_service.list_messages_stmt(ticket.id)
     messages, total = await paginate(session, stmt, params)
@@ -129,6 +138,7 @@ async def send_my_ticket_message(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[TicketMessageRead]:
+    await entitlement_service.check(session, current_user, "support")
     ticket = await support_ticket_service.get_for_user(session, ticket_id, current_user.id)
     support_ticket_service.assert_repliable(ticket)
 

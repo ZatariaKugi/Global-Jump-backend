@@ -4,33 +4,33 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.deps import CurrentPrincipal, RequestIdDep, SettingsDep, require_role
 from app.api.pagination import PaginationDep, page_meta, paginate
+from app.core.exceptions import AppError
 from app.core.file_storage import resolve_url
 from app.core.visa_types import OptionalVisaType
 from app.db.session import SessionDep
 from app.models.advisor_credential import CredentialStatus
-from app.models.advisor_profile import AdvisorProfile
 from app.models.assessment import AssessmentQuestion
 from app.models.assessment_threshold import AssessmentThreshold
 from app.models.booking import BookingStatus
 from app.models.country_rule import RulePublishStatus
 from app.models.eligibility_rule import EligibilityRule
-from app.models.payout_request import PayoutStatus
 from app.models.pre_registration import PreRegistrationInterest
+from app.models.pricing_plan import PricingPlan
 from app.models.review import Review
 from app.models.support_ticket import TicketPriority
 from app.models.ticket_message import TicketMessageAttachment
 from app.models.transaction import TransactionStatus
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.ab_variant import AbVariantCreate, AbVariantRead, AbVariantUpdate
-from app.schemas.admin import FeatureFlagUpdate, VerificationStatusUpdate
+from app.schemas.admin import VerificationStatusUpdate
 from app.schemas.advisor import AdvisorRead
 from app.schemas.advisor_admin import (
     AdvisorEarningsSummaryRead,
@@ -42,7 +42,6 @@ from app.schemas.advisor_admin import (
 )
 from app.schemas.advisor_credential import AdvisorCredentialRead, CredentialStatusUpdate
 from app.schemas.advisor_dashboard import DashboardWindow
-from app.schemas.advisor_profile import AdvisorProfileRead
 from app.schemas.analytics import (
     AdvisorAnalyticsRead,
     AIAnalyticsRead,
@@ -85,11 +84,24 @@ from app.schemas.matching_weights import MatchingWeightsRead, MatchingWeightsUpd
 from app.schemas.payment import (
     InvoiceRead,
     PaymentSummaryRead,
-    RefundCreate,
     TransactionFinanceRead,
+    TransactionRefundRead,
 )
-from app.schemas.payout import PayoutDecision, PayoutRequestRead
+from app.schemas.payment_settings import (
+    PaymentSettingChangeRead,
+    PaymentSettingsRead,
+    PaymentSettingsUpdate,
+    StripeKeyStatus,
+    StripeKeysUpdate,
+)
 from app.schemas.pre_registration import PreRegistrationRead
+from app.schemas.pricing_plan import (
+    CoreFeatureRead,
+    FeatureCatalogRead,
+    PricingPlanAdminRead,
+    PricingPlanCreate,
+    PricingPlanUpdate,
+)
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.review import (
     AdvisorReviewsTabRead,
@@ -98,6 +110,12 @@ from app.schemas.review import (
 )
 from app.schemas.seeker_admin import SeekerCreate, SeekerDetailRead, SeekerListRead
 from app.schemas.seeker_document import SeekerDocumentRead, SeekerDocumentStatusUpdate
+from app.schemas.stripe_admin import StripeStatusRead, WebhookEventRead
+from app.schemas.subscription import (
+    AdminInvoiceRead,
+    AdminSubscriptionRead,
+    AdminSubscriptionSummaryRead,
+)
 from app.schemas.support_ticket import TicketCreate, TicketRead, TicketUpdate
 from app.schemas.ticket_message import TicketMessageRead, TicketMessageSend
 from app.schemas.transaction_event import TransactionEventRead
@@ -106,7 +124,6 @@ from app.services import (
     ab_variant_service,
     advisor_admin_service,
     advisor_credential_service,
-    advisor_profile_service,
     analytics_service,
     assessment_service,
     booking_service,
@@ -114,14 +131,19 @@ from app.services import (
     country_rule_service,
     dashboard_service,
     eligibility_rule_service,
+    entitlement_service,
     impersonation_service,
     matching_weights_service,
+    payment_config_service,
     payment_service,
-    payout_service,
     pre_registration_service,
+    pricing_plan_service,
+    refund_engine,
     review_service,
     seeker_admin_service,
     seeker_document_service,
+    stripe_config_service,
+    subscription_service,
     support_ticket_service,
     ticket_message_service,
     user_admin_service,
@@ -135,6 +157,11 @@ router = APIRouter(
 )
 
 
+AdvisorSubscriptionFilter = Literal[
+    "none", "incomplete", "trialing", "active", "past_due", "canceled", "unpaid", "expired"
+]
+
+
 @router.get("/advisors", response_model=ResponseEnvelope[list[AdvisorManagementListRead]])
 async def list_advisors(
     params: PaginationDep,
@@ -144,10 +171,15 @@ async def list_advisors(
     status: VerificationStatus | None = None,
     search: str | None = None,
     visa_type: OptionalVisaType = None,
+    subscription_status: AdvisorSubscriptionFilter | None = None,
 ) -> ResponseEnvelope[list[AdvisorManagementListRead]]:
     """Advisor Management list: Advisor, Expertise, Status, Registration Date,
-    Sessions, Rating. Optional ``visa_type`` filters by PRD specialization enum."""
-    stmt = advisor_admin_service.list_advisors_stmt(search, status, visa_type)
+    Sessions, Rating. Optional ``visa_type`` filters by PRD specialization enum;
+    ``subscription_status`` filters on the cached Advisor Subscription state
+    (``none`` = never subscribed)."""
+    stmt = advisor_admin_service.list_advisors_stmt(
+        search, status, visa_type, subscription_status=subscription_status
+    )
     advisors, total = await paginate(session, stmt, params)
     return ResponseEnvelope[list[AdvisorManagementListRead]](
         data=await advisor_admin_service.build_list_read(session, advisors, settings),
@@ -227,16 +259,12 @@ async def update_advisor_verification(
     if body.status == VerificationStatus.approved and (
         previous_status != VerificationStatus.approved or not was_active
     ):
-        advisor_profile = await session.scalar(
-            select(AdvisorProfile).where(AdvisorProfile.user_id == advisor.id)
+        # QA #333: announce to seekers only when the advisor is bookable (Stripe, and
+        # Zoom where configured). Otherwise the announcement waits for readiness —
+        # see payment_service / zoom_connection_service — and goes out once.
+        await seeker_recommendation_service.announce_advisor_if_bookable(
+            session, advisor.id, settings=settings
         )
-        if advisor_profile is not None:
-            await seeker_recommendation_service.notify_seekers_about_new_advisor(
-                session,
-                advisor,
-                advisor_profile,
-                settings=settings,
-            )
         schedule_email(
             send_advisor_welcome_email(
                 advisor.email,
@@ -269,35 +297,6 @@ async def update_advisor_verification(
 
     return ResponseEnvelope[AdvisorRead](
         data=AdvisorRead.model_validate(advisor),
-        meta=Meta(request_id=request_id),
-    )
-
-
-@router.patch(
-    "/advisors/{advisor_id}/feature",
-    response_model=ResponseEnvelope[AdvisorProfileRead],
-)
-async def update_advisor_featured(
-    advisor_id: uuid.UUID,
-    body: FeatureFlagUpdate,
-    session: SessionDep,
-    settings: SettingsDep,
-    request_id: RequestIdDep,
-) -> ResponseEnvelope[AdvisorProfileRead]:
-    """Feature or un-feature an advisor on the homepage (admin-curated, PRD §3.5)."""
-    from app.core.exceptions import NotFoundError
-
-    advisor = await session.get(User, advisor_id)
-    if advisor is None or advisor.role != UserRole.advisor:
-        raise NotFoundError("Advisor not found")
-
-    profile = await advisor_profile_service.get_or_create(session, advisor_id)
-    profile.is_featured = body.is_featured
-    session.add(profile)
-    await session.flush()
-    await session.refresh(profile)
-    return ResponseEnvelope[AdvisorProfileRead](
-        data=await advisor_profile_service.build_enriched_read(session, profile, advisor, settings),
         meta=Meta(request_id=request_id),
     )
 
@@ -594,26 +593,6 @@ async def list_advisor_earnings_transactions(
     data = [await payment_service.finance_read(session, t, settings) for t in txns]
     return ResponseEnvelope[list[TransactionFinanceRead]](
         data=data, meta=page_meta(params, total, request_id)
-    )
-
-
-@router.get(
-    "/advisors/{advisor_id}/earnings/payouts",
-    response_model=ResponseEnvelope[list[PayoutRequestRead]],
-)
-async def list_advisor_earnings_payouts(
-    advisor_id: uuid.UUID,
-    params: PaginationDep,
-    session: SessionDep,
-    request_id: RequestIdDep,
-    status: PayoutStatus | None = None,
-) -> ResponseEnvelope[list[PayoutRequestRead]]:
-    """Detail page's Earnings tab — payout history sub-list."""
-    stmt = payout_service.list_for_advisor_stmt(advisor_id, status)
-    payouts, total = await paginate(session, stmt, params)
-    return ResponseEnvelope[list[PayoutRequestRead]](
-        data=[PayoutRequestRead.model_validate(p) for p in payouts],
-        meta=page_meta(params, total, request_id),
     )
 
 
@@ -1189,6 +1168,374 @@ async def upsert_matching_weights(
     return ResponseEnvelope[MatchingWeightsRead](data=data, meta=Meta(request_id=request_id))
 
 
+# ── Payment settings (EPIC 04 PAY-107) ──────────────────────────────────────
+
+
+@router.get("/payment-settings", response_model=ResponseEnvelope[PaymentSettingsRead])
+async def get_payment_settings(
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[PaymentSettingsRead]:
+    """Current consultation payment rules (seeded from env on first read)."""
+    data = await payment_config_service.get_read(session)
+    return ResponseEnvelope[PaymentSettingsRead](data=data, meta=Meta(request_id=request_id))
+
+
+@router.put("/payment-settings", response_model=ResponseEnvelope[PaymentSettingsRead])
+async def update_payment_settings(
+    body: PaymentSettingsUpdate,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[PaymentSettingsRead]:
+    """Save the rules; effective for the next operation, audited per changed key.
+
+    Switching ``live_payments_enabled`` on requires every Stripe check to pass.
+    """
+    current = await payment_config_service.get_config(session)
+    if body.live_payments_enabled and not current.live_payments_enabled:
+        keys = await stripe_config_service.effective_keys(session, settings)
+        status = await stripe_config_service.validate(keys)
+        if not status.ok:
+            raise AppError(
+                "Stripe configuration is incomplete; live payments cannot be enabled",
+                code="stripe_config_invalid",
+                detail={"checks": status.checks, "mode": status.mode},
+            )
+    await payment_config_service.update(session, body, principal.id)
+    data = await payment_config_service.get_read(session)
+    return ResponseEnvelope[PaymentSettingsRead](data=data, meta=Meta(request_id=request_id))
+
+
+@router.get(
+    "/payment-settings/audit", response_model=ResponseEnvelope[list[PaymentSettingChangeRead]]
+)
+async def list_payment_setting_changes(
+    params: PaginationDep,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[list[PaymentSettingChangeRead]]:
+    """Who changed which payment setting, from what to what, newest first."""
+    rows, total = await paginate(session, payment_config_service.audit_stmt(), params)
+    data = await payment_config_service.build_audit_reads(session, list(rows))
+    return ResponseEnvelope[list[PaymentSettingChangeRead]](
+        data=data, meta=page_meta(params, total, request_id)
+    )
+
+
+# ── Stripe status, webhook ledger (EPIC 04 PAY-108 / PAY-115) ────────────────
+
+
+@router.get("/stripe/status", response_model=ResponseEnvelope[StripeStatusRead])
+async def get_stripe_status(
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[StripeStatusRead]:
+    """Presence and probe checks. Never returns key material."""
+    keys = await stripe_config_service.effective_keys(session, settings)
+    status = await stripe_config_service.validate(keys)
+    config = await payment_config_service.get_config(session)
+    return ResponseEnvelope[StripeStatusRead](
+        data=StripeStatusRead(
+            mode=status.mode,
+            checks=status.checks,
+            ok=status.ok,
+            live_payments_enabled=config.live_payments_enabled,
+        ),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.get("/stripe/keys", response_model=ResponseEnvelope[StripeKeyStatus])
+async def get_stripe_keys(
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[StripeKeyStatus]:
+    """What the Stripe Configuration form shows: presence, last four, mode, origin.
+
+    Never the secret key or the signing secret (PAY-108 AC 2).
+    """
+    return ResponseEnvelope[StripeKeyStatus](
+        data=await stripe_config_service.key_status(session, settings),
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.put("/stripe/keys", response_model=ResponseEnvelope[StripeKeyStatus])
+async def update_stripe_keys(
+    body: StripeKeysUpdate,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[StripeKeyStatus]:
+    """Save Stripe credentials after checking them.
+
+    Every supplied value is validated before anything is written — the secret key
+    against Stripe itself — so a typo is refused here rather than discovered when a
+    customer tries to pay. Fields left out keep their stored value.
+    """
+    return ResponseEnvelope[StripeKeyStatus](
+        data=await stripe_config_service.save_keys(session, body, principal.id, settings),
+        meta=Meta(request_id=request_id),
+    )
+
+
+def _webhook_event_read(row: object) -> WebhookEventRead:
+    return WebhookEventRead(
+        event_id=row.event_id,  # type: ignore[attr-defined]
+        event_type=row.event_type,  # type: ignore[attr-defined]
+        status=row.status.value,  # type: ignore[attr-defined]
+        attempts=row.attempts,  # type: ignore[attr-defined]
+        error=row.error,  # type: ignore[attr-defined]
+        received_at=row.received_at,  # type: ignore[attr-defined]
+        processed_at=row.processed_at,  # type: ignore[attr-defined]
+    )
+
+
+@router.get("/stripe/webhook-events", response_model=ResponseEnvelope[list[WebhookEventRead]])
+async def list_webhook_events(
+    params: PaginationDep,
+    session: SessionDep,
+    request_id: RequestIdDep,
+    status: Annotated[str | None, Query()] = None,
+) -> ResponseEnvelope[list[WebhookEventRead]]:
+    rows, total = await paginate(session, payment_service.webhook_events_stmt(status), params)
+    return ResponseEnvelope[list[WebhookEventRead]](
+        data=[_webhook_event_read(r) for r in rows], meta=page_meta(params, total, request_id)
+    )
+
+
+@router.post(
+    "/stripe/webhook-events/{event_id}/retry", response_model=ResponseEnvelope[WebhookEventRead]
+)
+async def retry_webhook_event(
+    event_id: str,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[WebhookEventRead]:
+    """Re-fetch the event from Stripe and run it through the dispatcher again."""
+    row = await payment_service.retry_webhook_event(session, event_id, settings)
+    return ResponseEnvelope[WebhookEventRead](
+        data=_webhook_event_read(row), meta=Meta(request_id=request_id)
+    )
+
+
+# ── Pricing plans (EPIC 04 PAY-112 / 113 / 114) ─────────────────────────────
+
+
+@router.get(
+    "/pricing-plans/feature-catalog", response_model=ResponseEnvelope[list[FeatureCatalogRead]]
+)
+async def get_feature_catalog(
+    session: SessionDep, request_id: RequestIdDep
+) -> ResponseEnvelope[list[FeatureCatalogRead]]:
+    """Enforceable feature keys the admin can put on a plan (one per project module)."""
+    rows = await pricing_plan_service.get_catalog(session)
+    return ResponseEnvelope[list[FeatureCatalogRead]](
+        data=[pricing_plan_service.catalog_read(r) for r in rows], meta=Meta(request_id=request_id)
+    )
+
+
+@router.get("/pricing-plans/core-features", response_model=ResponseEnvelope[list[CoreFeatureRead]])
+async def get_core_features(request_id: RequestIdDep) -> ResponseEnvelope[list[CoreFeatureRead]]:
+    """Marketplace features no plan may restrict (shown read-only in the plan editor)."""
+    return ResponseEnvelope[list[CoreFeatureRead]](
+        data=[CoreFeatureRead(key=k, label=v) for k, v in pricing_plan_service.CORE_FEATURES],
+        meta=Meta(request_id=request_id),
+    )
+
+
+@router.get("/pricing-plans", response_model=ResponseEnvelope[list[PricingPlanAdminRead]])
+async def list_pricing_plans_admin(
+    params: PaginationDep,
+    session: SessionDep,
+    request_id: RequestIdDep,
+    audience: Annotated[str | None, Query()] = None,
+    status: Annotated[str | None, Query()] = None,
+) -> ResponseEnvelope[list[PricingPlanAdminRead]]:
+    rows, total = await paginate(
+        session, pricing_plan_service.list_admin_stmt(audience, status), params
+    )
+    data = [await pricing_plan_service.admin_read(session, p) for p in rows]
+    return ResponseEnvelope[list[PricingPlanAdminRead]](
+        data=data, meta=page_meta(params, total, request_id)
+    )
+
+
+@router.post(
+    "/pricing-plans", response_model=ResponseEnvelope[PricingPlanAdminRead], status_code=201
+)
+async def create_pricing_plan(
+    body: PricingPlanCreate,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[PricingPlanAdminRead]:
+    """Create the plan and sync it to Stripe. Draft with ``sync_error`` if Stripe fails."""
+    plan = await pricing_plan_service.create(session, body, principal.id)
+    return ResponseEnvelope[PricingPlanAdminRead](
+        data=await pricing_plan_service.admin_read(session, plan), meta=Meta(request_id=request_id)
+    )
+
+
+@router.get("/pricing-plans/{plan_id}", response_model=ResponseEnvelope[PricingPlanAdminRead])
+async def get_pricing_plan(
+    plan_id: uuid.UUID, session: SessionDep, request_id: RequestIdDep
+) -> ResponseEnvelope[PricingPlanAdminRead]:
+    plan = await pricing_plan_service.get(session, plan_id)
+    return ResponseEnvelope[PricingPlanAdminRead](
+        data=await pricing_plan_service.admin_read(session, plan), meta=Meta(request_id=request_id)
+    )
+
+
+@router.patch("/pricing-plans/{plan_id}", response_model=ResponseEnvelope[PricingPlanAdminRead])
+async def update_pricing_plan(
+    plan_id: uuid.UUID,
+    body: PricingPlanUpdate,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[PricingPlanAdminRead]:
+    """Price change: new Stripe Price, old archived. Other fields: Product metadata sync."""
+    plan = await pricing_plan_service.update(session, plan_id, body, principal.id)
+    return ResponseEnvelope[PricingPlanAdminRead](
+        data=await pricing_plan_service.admin_read(session, plan), meta=Meta(request_id=request_id)
+    )
+
+
+@router.post(
+    "/pricing-plans/{plan_id}/retry-sync", response_model=ResponseEnvelope[PricingPlanAdminRead]
+)
+async def retry_pricing_plan_sync(
+    plan_id: uuid.UUID,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[PricingPlanAdminRead]:
+    plan = await pricing_plan_service.retry_sync(session, plan_id, principal.id)
+    return ResponseEnvelope[PricingPlanAdminRead](
+        data=await pricing_plan_service.admin_read(session, plan), meta=Meta(request_id=request_id)
+    )
+
+
+@router.post(
+    "/pricing-plans/{plan_id}/deactivate", response_model=ResponseEnvelope[PricingPlanAdminRead]
+)
+async def deactivate_pricing_plan(
+    plan_id: uuid.UUID,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[PricingPlanAdminRead]:
+    plan = await pricing_plan_service.set_active(session, plan_id, False, principal.id)
+    return ResponseEnvelope[PricingPlanAdminRead](
+        data=await pricing_plan_service.admin_read(session, plan), meta=Meta(request_id=request_id)
+    )
+
+
+@router.post(
+    "/pricing-plans/{plan_id}/activate", response_model=ResponseEnvelope[PricingPlanAdminRead]
+)
+async def activate_pricing_plan(
+    plan_id: uuid.UUID,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[PricingPlanAdminRead]:
+    plan = await pricing_plan_service.set_active(session, plan_id, True, principal.id)
+    return ResponseEnvelope[PricingPlanAdminRead](
+        data=await pricing_plan_service.admin_read(session, plan), meta=Meta(request_id=request_id)
+    )
+
+
+# ── Subscriptions (EPIC 04 PAY-110 / 111) ────────────────────────────────────
+
+
+@router.get(
+    "/subscriptions/summary",
+    response_model=ResponseEnvelope[AdminSubscriptionSummaryRead],
+)
+async def subscriptions_finance_summary(
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+    period: Annotated[Literal["daily", "monthly", "yearly", "overall"], Query()] = "monthly",
+) -> ResponseEnvelope[AdminSubscriptionSummaryRead]:
+    """Cards above the Subscriptions Finance table: who subscribes, and what they pay.
+
+    ``settings`` is passed so the read can repair invoices a missed ``invoice.paid``
+    webhook never recorded -- otherwise a subscriber who has genuinely paid shows as
+    Active beside $0 revenue, with nothing on the screen able to fix it.
+
+    Declared before ``/subscriptions/{subscription_id}/invoices`` so "summary" is not
+    parsed as a subscription id.
+    """
+    data = await subscription_service.admin_finance_summary(session, period, settings)
+    return ResponseEnvelope[AdminSubscriptionSummaryRead](
+        data=data, meta=Meta(request_id=request_id)
+    )
+
+
+@router.get("/subscriptions", response_model=ResponseEnvelope[list[AdminSubscriptionRead]])
+async def list_subscriptions_admin(
+    params: PaginationDep,
+    session: SessionDep,
+    request_id: RequestIdDep,
+    audience: Annotated[str | None, Query()] = None,
+    status: Annotated[str | None, Query()] = None,
+    q: Annotated[str | None, Query(max_length=100)] = None,
+) -> ResponseEnvelope[list[AdminSubscriptionRead]]:
+    grace_days = await entitlement_service.grace_days(session)
+    stmt = subscription_service.admin_list_stmt(audience, status, q, grace_days)
+    count_stmt = select(func.count()).select_from(stmt.order_by(None).subquery())
+    total = (await session.scalar(count_stmt)) or 0
+    rows = (await session.execute(stmt.offset(params.offset).limit(params.limit))).all()
+    pending_ids = {s.scheduled_plan_id for s, _u, _p, _c in rows if s.scheduled_plan_id}
+    pending_names: dict[uuid.UUID, str] = {}
+    if pending_ids:
+        pending_names = {
+            pl.id: pl.name
+            for pl in (
+                await session.execute(select(PricingPlan).where(PricingPlan.id.in_(pending_ids)))
+            ).scalars()
+        }
+    data = [
+        subscription_service.admin_read(
+            s, u, p, charged, grace_days, scheduled_plan_name=pending_names.get(s.scheduled_plan_id)
+        )
+        for s, u, p, charged in rows
+    ]
+    return ResponseEnvelope[list[AdminSubscriptionRead]](
+        data=data, meta=page_meta(params, total, request_id)
+    )
+
+
+@router.get(
+    "/subscriptions/{subscription_id}/invoices",
+    response_model=ResponseEnvelope[list[AdminInvoiceRead]],
+)
+async def list_subscription_invoices_admin(
+    subscription_id: uuid.UUID,
+    params: PaginationDep,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[list[AdminInvoiceRead]]:
+    """What the subscriber was actually charged, with the lines that explain it."""
+    rows, total = await paginate(
+        session, subscription_service.admin_invoices_stmt(subscription_id), params
+    )
+    data = [await subscription_service.admin_invoice_read(session, r, settings) for r in rows]
+    return ResponseEnvelope[list[AdminInvoiceRead]](
+        data=data, meta=page_meta(params, total, request_id)
+    )
+
+
 @router.get("/engine-settings", response_model=ResponseEnvelope[EngineSettingsRead])
 async def get_engine_settings(
     session: SessionDep,
@@ -1325,7 +1672,7 @@ async def get_payments_summary(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[PaymentSummaryRead]:
-    """Platform-wide payment summary cards (paid / refunded / commission / tax)."""
+    """Platform-wide payment summary cards (paid / refunded / commission / tax / advisor)."""
     data = await payment_service.platform_payment_summary(session)
     return ResponseEnvelope[PaymentSummaryRead](data=data, meta=Meta(request_id=request_id))
 
@@ -1349,6 +1696,44 @@ async def list_all_payments(
         data=data,
         meta=page_meta(params, total, request_id),
     )
+
+
+@router.get("/payments/refunds", response_model=ResponseEnvelope[list[TransactionRefundRead]])
+async def list_refunds(
+    params: PaginationDep,
+    session: SessionDep,
+    request_id: RequestIdDep,
+    status: Literal["pending", "refunded", "reversed", "failed"] | None = None,
+) -> ResponseEnvelope[list[TransactionRefundRead]]:
+    """Refund ledger across the platform; ``status=failed`` is the retry queue."""
+    stmt = payment_service.refunds_stmt(status)
+    rows, total = await paginate(session, stmt, params)
+    return ResponseEnvelope[list[TransactionRefundRead]](
+        data=[payment_service.refund_read(r) for r in rows],
+        meta=page_meta(params, total, request_id),
+    )
+
+
+@router.post(
+    "/payments/refunds/{refund_id}/retry",
+    response_model=ResponseEnvelope[TransactionFinanceRead],
+)
+async def retry_refund(
+    refund_id: uuid.UUID,
+    principal: CurrentPrincipal,
+    session: SessionDep,
+    settings: SettingsDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[TransactionFinanceRead]:
+    """Re-run the Stripe step(s) a failed refund never completed.
+
+    Uses the refund row's own idempotency keys, so a step Stripe already applied
+    is never applied twice.
+    """
+    row = await refund_engine.retry_refund(session, refund_id, settings, initiated_by=principal.id)
+    txn = await payment_service.get_by_id(session, row.transaction_id)
+    data = await payment_service.finance_read(session, txn, settings)
+    return ResponseEnvelope[TransactionFinanceRead](data=data, meta=Meta(request_id=request_id))
 
 
 @router.get("/payments/{transaction_id}", response_model=ResponseEnvelope[TransactionFinanceRead])
@@ -1426,29 +1811,6 @@ async def get_payment_timeline(
     )
 
 
-@router.post(
-    "/payments/{transaction_id}/refund",
-    response_model=ResponseEnvelope[TransactionFinanceRead],
-)
-async def refund_payment(
-    transaction_id: uuid.UUID,
-    body: RefundCreate,
-    principal: CurrentPrincipal,
-    settings: SettingsDep,
-    session: SessionDep,
-    request_id: RequestIdDep,
-) -> ResponseEnvelope[TransactionFinanceRead]:
-    """Issue a full or partial refund for a completed payment."""
-    txn = await payment_service.refund_transaction(
-        session, transaction_id, principal.id, body.reason, settings, body.amount_usd
-    )
-    data = await payment_service.finance_read(session, txn, settings)
-    return ResponseEnvelope[TransactionFinanceRead](
-        data=data,
-        meta=Meta(request_id=request_id),
-    )
-
-
 class AdminNoteUpdate(BaseModel):
     admin_note: str | None = None
 
@@ -1475,49 +1837,6 @@ async def update_payment_note(
     data = await payment_service.finance_read(session, txn, settings)
     return ResponseEnvelope[TransactionFinanceRead](
         data=data,
-        meta=Meta(request_id=request_id),
-    )
-
-
-@router.get("/payouts", response_model=ResponseEnvelope[list[PayoutRequestRead]])
-async def list_all_payouts(
-    params: PaginationDep,
-    session: SessionDep,
-    request_id: RequestIdDep,
-    status: PayoutStatus | None = None,
-) -> ResponseEnvelope[list[PayoutRequestRead]]:
-    """Full payout request queue across the platform, optionally filtered by status."""
-    stmt = payout_service.list_all_stmt(status)
-    payouts, total = await paginate(session, stmt, params)
-    return ResponseEnvelope[list[PayoutRequestRead]](
-        data=[PayoutRequestRead.model_validate(p) for p in payouts],
-        meta=page_meta(params, total, request_id),
-    )
-
-
-@router.patch(
-    "/payouts/{payout_id}",
-    response_model=ResponseEnvelope[PayoutRequestRead],
-)
-async def review_payout(
-    payout_id: uuid.UUID,
-    body: PayoutDecision,
-    principal: CurrentPrincipal,
-    session: SessionDep,
-    request_id: RequestIdDep,
-) -> ResponseEnvelope[PayoutRequestRead]:
-    """Complete or reject a pending payout request."""
-    payout = await payout_service.get_by_id(session, payout_id)
-    if body.action == PayoutStatus.completed:
-        payout = await payout_service.complete(session, payout, principal.id)
-    elif body.action == PayoutStatus.rejected:
-        payout = await payout_service.reject(session, payout, principal.id, body.rejection_reason)
-    else:
-        from app.core.exceptions import AppError
-
-        raise AppError("action must be 'completed' or 'rejected'", code="invalid_action")
-    return ResponseEnvelope[PayoutRequestRead](
-        data=PayoutRequestRead.model_validate(payout),
         meta=Meta(request_id=request_id),
     )
 

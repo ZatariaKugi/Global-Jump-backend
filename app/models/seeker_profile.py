@@ -147,6 +147,12 @@ class SeekerProfile(BaseModel):
     application_submitted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # First time the seeker opened AI recommended advisors (the AI filter on Find
+    # Advisor). Drives the "AI Recommendation" bar of the journey chart; profile
+    # matches alone never do (PM, 2026-10-09).
+    ai_recommendations_viewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Passport — stored AES-256-GCM encrypted; plaintext never persisted
     passport_number_encrypted: Mapped[str | None] = mapped_column(String(500), nullable=True)

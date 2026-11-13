@@ -1,0 +1,16 @@
+Hi {{ full_name }},
+
+Your {{ plan_name }} plan has ended.
+{% if access_until_str %}
+You keep access to its features until {{ access_until_str }}.
+{% endif %}
+You can subscribe again at any time from your {{ app_name }} dashboard.
+
+— The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}
+How it works: {{ how_it_works_url }}
+FAQs: {{ faq_url }}

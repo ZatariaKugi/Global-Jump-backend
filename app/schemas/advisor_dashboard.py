@@ -85,6 +85,9 @@ class AdvisorDashboardRead(BaseModel):
     stats: DashboardStats
     regulatory_updates: list[RegulatoryUpdateRead]  # newest first, capped for the card
     client_inquiries: list[ClientInquiryRead]  # most-recent threads, capped for the card
+    # True when the advisor's plan lacks ``chats``: the rows above then carry no
+    # ``last_message_preview`` (QA BUG 3) and the card should say "upgrade to read".
+    chat_locked: bool = False
     # Persistent connect banners (NOT windowed by ``days``). FE shows while true.
     needs_stripe_connect: bool
     needs_zoom_connect: bool

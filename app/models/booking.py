@@ -23,6 +23,15 @@ class BookingStatus(StrEnum):
     cancelled = "cancelled"
     rejected = "rejected"
     no_show = "no_show"
+    # Unpaid when its scheduled start passed (QA GJ-BOOKING-003, PM 2026-10-10).
+    expired = "expired"
+
+
+class BookingRefundStatus(StrEnum):
+    none = "none"
+    pending = "pending"
+    refunded = "refunded"
+    failed = "failed"
 
 
 class PaymentStatus(StrEnum):
@@ -70,6 +79,17 @@ class Booking(BaseModel):
         SAEnum(PaymentStatus, name="payment_status"),
         default=PaymentStatus.unpaid,
         nullable=False,
+    )
+
+    refund_status: Mapped[BookingRefundStatus] = mapped_column(
+        SAEnum(BookingRefundStatus, name="booking_refund_status"),
+        default=BookingRefundStatus.none,
+        server_default=BookingRefundStatus.none.value,
+        nullable=False,
+    )
+    # Seeker reschedules on this booking (document §3.1).
+    reschedule_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
     )
 
     cancellation_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)

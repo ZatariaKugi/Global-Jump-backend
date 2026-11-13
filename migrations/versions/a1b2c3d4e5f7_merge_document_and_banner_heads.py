@@ -10,8 +10,6 @@ so ``alembic upgrade head`` has a single tip.
 
 from __future__ import annotations
 
-from alembic import op
-
 revision = "a1b2c3d4e5f7"
 down_revision = ("f3a5b7c9d0e2", "b9c1d3e5f7a9")
 branch_labels = None

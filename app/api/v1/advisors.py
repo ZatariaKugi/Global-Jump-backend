@@ -21,7 +21,7 @@ from app.api.deps import (
 )
 from app.api.pagination import PaginationDep, page_meta, paginate
 from app.api.v1.bookings import _party_names, _read_booking, _send_confirmations
-from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
+from app.core.exceptions import AppError, ConflictError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import delete_file, resolve_url
 from app.core.visa_types import OptionalVisaType, visa_type_name
 from app.db.session import SessionDep
@@ -32,6 +32,7 @@ from app.models.booking import Booking, BookingStatus
 from app.models.notification import NotificationType
 from app.models.regulatory_update import RegulatoryUpdate
 from app.models.seeker_document import SeekerDocumentStatus
+from app.models.transaction import Transaction
 from app.models.user import User, UserRole, VerificationStatus
 from app.schemas.advisor_credential import (
     AdvisorCredentialCreate,
@@ -64,7 +65,6 @@ from app.schemas.payment import (
     TransactionAdvisorRead,
     TransactionRead,
 )
-from app.schemas.payout import PayoutPreviewRead, PayoutRequestCreate, PayoutRequestRead
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.review import AdvisorReviewSummaryRead
 from app.schemas.seeker_document import (
@@ -89,11 +89,13 @@ from app.services import (
     bookmark_service,
     conversation_service,
     email_service,
+    entitlement_service,
     notification_service,
     payment_service,
-    payout_service,
+    refund_engine,
     review_service,
     seeker_document_service,
+    seeker_profile_service,
     seeker_recommendation_service,
 )
 from app.services.advisor_search_service import AdvisorSearchFilters, SortOption
@@ -169,13 +171,20 @@ async def update_my_advisor_profile(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorProfileRead]:
-    """Update editable profile fields. ``successful_applications`` is not accepted."""
+    """Update editable profile fields. ``successful_applications`` is not accepted.
+
+    ``profile_edits`` is an advisor plan quota (one free save on the free plan,
+    discussion §20): checked before the save and counted only after it succeeds, so
+    a rejected payload or a failed save never costs the advisor their edit.
+    """
+    await entitlement_service.check(session, current_user, "profile_edits")
     profile = await advisor_profile_service.get_or_create(session, current_user.id)
     if profile.public_profile_slug is None and data.public_profile_slug is None:
         profile.public_profile_slug = await advisor_search_service.generate_unique_slug(
             session, current_user.full_name
         )
     profile = await advisor_profile_service.update(session, profile, data)
+    await entitlement_service.consume(session, current_user, "profile_edits")
     return ResponseEnvelope[AdvisorProfileRead](
         data=await advisor_profile_service.build_enriched_read(
             session, profile, current_user, settings
@@ -234,6 +243,10 @@ async def list_advisors(
         recommended=recommended,
         sort=sort,
     )
+    # Advisor discovery is free for every seeker (PM, 2026-10-08). The AI path
+    # below (``recommended=true``) is the seeker perk ``matched_advisors``.
+    if recommended and principal.user is not None and principal.user.role == UserRole.seeker:
+        await entitlement_service.limit_for(session, principal.user, "matched_advisors")
     stmt = advisor_search_service.build_search_stmt(filters)
     destination, match_visa = await _seeker_match_context(session, principal)
     blended_pct: dict[uuid.UUID, int] = {}
@@ -252,6 +265,12 @@ async def list_advisors(
             from app.services.ai_advisor_match_service import ai_match_status
 
             ai_match_meta = ai_match_status(ai_failure, attempted=True)
+        # Only advisors whose current plan grants ``ai_recommended`` may appear
+        # in AI results (discussion §29-§31); the rest stay ordinary matches.
+        recs = await seeker_recommendation_service.only_ai_eligible(session, recs)
+        # The seeker has now *used* AI recommendations: the journey chart's first bar
+        # follows this, never the existence of matches (PM, 2026-10-09).
+        await seeker_profile_service.mark_ai_recommendations_viewed(session, principal.id)
         score_by_id = {r.advisor_id: int(round(r.match_score)) for r in recs}
         ordered_ids = [r.advisor_id for r in recs]
         all_users = list((await session.execute(stmt)).scalars().all())
@@ -941,12 +960,15 @@ async def get_my_earnings(
 ) -> ResponseEnvelope[AdvisorEarnings]:
     """Advisor earnings summary and full transaction history."""
     data = await payment_service.get_advisor_earnings(session, current_user.id)
-    available_balance = await payout_service.get_available_balance(session, current_user.id)
     return ResponseEnvelope[AdvisorEarnings](
         data=AdvisorEarnings(
             total_earned_usd=data["total_earned_usd"],
             total_commission_paid_usd=data["total_commission_paid_usd"],
-            available_balance_usd=available_balance,
+            total_gross_revenue_usd=data["total_gross_revenue_usd"],
+            total_platform_fee_usd=data["total_platform_fee_usd"],
+            total_advisor_gross_usd=data["total_advisor_gross_usd"],
+            total_stripe_fee_usd=data["total_stripe_fee_usd"],
+            total_refunded_usd=data["total_refunded_usd"],
             transactions=[
                 TransactionRead.model_validate(t)
                 for t in data["transactions"]  # type: ignore[attr-defined]
@@ -1021,14 +1043,20 @@ async def list_my_leads(
         OptionalVisaType, Query(description="Filter by assessment visa type")
     ] = None,
 ) -> ResponseEnvelope[list[AdvisorLeadRead]]:
-    """AI-matched customer leads for this advisor, ranked by match score."""
+    """AI-matched customer leads for this advisor, ranked by match score.
+
+    The advisor plan's ``leads`` feature is a lock (off or absent ->
+    ``subscription_required``) and, when numeric, caps the list at the top *n*.
+    """
+    await entitlement_service.check(session, current_user, "leads")
+    cap = await entitlement_service.limit_for(session, current_user, "leads")
     stmt = advisor_lead_service.list_for_advisor_stmt(
         current_user.id,
         status,
         q=q,
         visa_type=visa_type.value if visa_type else None,
     )
-    leads, total = await paginate(session, stmt, params)
+    leads, total = await paginate(session, stmt, params, cap=cap)
     data = [await _build_lead_read(session, lead) for lead in leads]
     return ResponseEnvelope[list[AdvisorLeadRead]](
         data=data, meta=page_meta(params, total, request_id)
@@ -1047,6 +1075,7 @@ async def get_my_lead(
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorLeadRead]:
     """Lead detail, including the AI-generated match reasons. Marks the lead as viewed."""
+    await entitlement_service.check(session, current_user, "leads")
     lead = await advisor_lead_service.get_for_advisor(session, lead_id, current_user.id)
     lead = await advisor_lead_service.mark_viewed(session, lead)
     return ResponseEnvelope[AdvisorLeadRead](
@@ -1068,6 +1097,7 @@ async def contact_my_lead(
 ) -> ResponseEnvelope[AdvisorLeadRead]:
     """Record that the advisor reached out to this lead (status marker only —
     in-app chat requires an actual booking per PRD §3.7.1)."""
+    await entitlement_service.check(session, current_user, "leads")
     lead = await advisor_lead_service.get_for_advisor(session, lead_id, current_user.id)
     lead = await advisor_lead_service.mark_contacted(session, lead, current_user.id)
     seeker = await session.get(User, lead.seeker_id)
@@ -1106,6 +1136,7 @@ async def dismiss_my_lead(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[AdvisorLeadRead]:
+    await entitlement_service.check(session, current_user, "leads")
     lead = await advisor_lead_service.get_for_advisor(session, lead_id, current_user.id)
     lead = await advisor_lead_service.dismiss(session, lead, current_user.id)
     return ResponseEnvelope[AdvisorLeadRead](
@@ -1171,7 +1202,8 @@ async def list_my_clients(
     ``id`` / ``seeker_id`` are the seeker user UUID. Booking fields
     (``booking_id``, ``consultation_number`` / ``appointment_id``,
     ``consultation_type``, ``status``, ``is_important``) come from the latest
-    booking; ``match_score`` from the latest non-dismissed lead when present.
+    booking; ``match_score`` is the seeker-facing profile match for this advisor
+    (the Find Advisor number), ``null`` when the seeker's profile has no intent.
     """
     stmt = booking_service.list_clients_stmt(
         current_user.id, q, service_ids=service_id, status=status
@@ -1291,9 +1323,7 @@ async def review_client_document(
         )
 
     existing = (
-        await seeker_document_service.reviews_for_advisor(
-            session, [document.id], current_user.id
-        )
+        await seeker_document_service.reviews_for_advisor(session, [document.id], current_user.id)
     ).get(document.id)
     current_status = seeker_document_service.advisor_effective_status(document, existing)
     if data.status == current_status and (existing is None or existing.note == data.note):
@@ -1427,6 +1457,7 @@ async def list_my_payments(
     params: PaginationDep,
     current_user: CurrentUser,
     session: SessionDep,
+    settings: SettingsDep,
     request_id: RequestIdDep,
     q: Annotated[
         str | None,
@@ -1435,6 +1466,9 @@ async def list_my_payments(
     service_id: Annotated[list[uuid.UUID] | None, Query()] = None,
 ) -> ResponseEnvelope[list[TransactionAdvisorRead]]:
     """Earnings / customer-payments history — one row per transaction on this advisor's bookings."""
+    # A refund that failed earlier is tried again here, before the rows are built, so
+    # the page heals itself (QA GJ-REFUND-002); the row's own keys make it safe.
+    await refund_engine.retry_failed_refunds_for_user(session, current_user.id, settings)
     stmt = payment_service.list_for_advisor_stmt(current_user.id, q=q, service_ids=service_id)
     txns, total = await paginate(session, stmt, params)
 
@@ -1452,58 +1486,36 @@ async def list_my_payments(
     )
 
 
-@router.get(
-    "/me/payouts/preview",
-    response_model=ResponseEnvelope[PayoutPreviewRead],
-    dependencies=[Depends(require_role(UserRole.advisor))],
-)
-async def preview_payout(
-    amount_usd: float,
-    current_user: CurrentUser,
-    session: SessionDep,
-    settings: SettingsDep,
-    request_id: RequestIdDep,
-) -> ResponseEnvelope[PayoutPreviewRead]:
-    """Request Payout modal — fee breakdown before submitting."""
-    available = await payout_service.get_available_balance(session, current_user.id)
-    data = payout_service.preview_payout(available, amount_usd, settings)
-    return ResponseEnvelope[PayoutPreviewRead](data=data, meta=Meta(request_id=request_id))
-
-
-@router.get(
-    "/me/payouts",
-    response_model=ResponseEnvelope[list[PayoutRequestRead]],
-    dependencies=[Depends(require_role(UserRole.advisor))],
-)
-async def list_my_payouts(
-    params: PaginationDep,
-    current_user: CurrentUser,
-    session: SessionDep,
-    request_id: RequestIdDep,
-) -> ResponseEnvelope[list[PayoutRequestRead]]:
-    stmt = payout_service.list_for_advisor_stmt(current_user.id)
-    payouts, total = await paginate(session, stmt, params)
-    return ResponseEnvelope[list[PayoutRequestRead]](
-        data=[PayoutRequestRead.model_validate(p) for p in payouts],
-        meta=page_meta(params, total, request_id),
-    )
-
-
 @router.post(
-    "/me/payouts",
-    status_code=201,
-    response_model=ResponseEnvelope[PayoutRequestRead],
+    "/me/payments/{transaction_id}/refund/retry",
+    response_model=ResponseEnvelope[TransactionAdvisorRead],
     dependencies=[Depends(require_role(UserRole.advisor))],
 )
-async def request_payout(
-    data: PayoutRequestCreate,
+async def retry_my_refund(
+    transaction_id: uuid.UUID,
     current_user: CurrentUser,
     session: SessionDep,
     settings: SettingsDep,
     request_id: RequestIdDep,
-) -> ResponseEnvelope[PayoutRequestRead]:
-    payout = await payout_service.create_request(session, current_user, data, settings)
-    return ResponseEnvelope[PayoutRequestRead](
-        data=PayoutRequestRead.model_validate(payout),
+) -> ResponseEnvelope[TransactionAdvisorRead]:
+    """The advisor's own retry of a refund that failed on their cancellation.
+
+    Re-runs only the Stripe step(s) the failed refund never completed, with the refund
+    row's own idempotency keys: a seeker refund Stripe already issued is never issued
+    again. 409 ``refund_not_failed`` when nothing on this payment failed.
+    """
+    txn = await session.get(Transaction, transaction_id)
+    booking = await session.get(Booking, txn.booking_id) if txn is not None else None
+    if txn is None or booking is None or booking.advisor_id != current_user.id:
+        raise NotFoundError("Payment not found")
+    if not refund_engine.refund_owed(booking):
+        raise ConflictError("No failed refund on this payment", code="refund_not_failed")
+    if not await refund_engine.retry_owed_booking_refund(session, booking, settings):
+        raise AppError("Refund could not be processed", code="refund_failed")
+    await session.refresh(txn)
+    await session.refresh(booking)
+    seeker = await session.get(User, booking.seeker_id)
+    return ResponseEnvelope[TransactionAdvisorRead](
+        data=await payment_service.advisor_earnings_payment_read(session, txn, booking, seeker),
         meta=Meta(request_id=request_id),
     )

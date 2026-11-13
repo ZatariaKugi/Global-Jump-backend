@@ -117,12 +117,15 @@ class Settings(BaseSettings):
     S3_BUCKET_NAME: str | None = None
 
     # Stripe -----------------------------------------------------------------
-    STRIPE_SECRET_KEY: str | None = None
-    STRIPE_WEBHOOK_SECRET: str | None = None
-    STRIPE_PUBLISHABLE_KEY: str | None = None
-    PLATFORM_COMMISSION_RATE: float = 0.15  # 15% platform commission, configurable
-    TAX_WITHHOLDING_RATE: float = 0.08  # 8% tax withheld from advisor payouts, configurable
-    PAYOUT_PROCESSING_FEE_RATE: float = 0.02  # 2% fee on manual payout requests, configurable
+    # The Stripe credentials are deliberately NOT here. They are configured by an
+    # admin in the panel and stored encrypted on ``platform_payment_settings``; the
+    # only reader is ``stripe_config_service.effective_keys``. There is no
+    # environment fallback: keys the admin cannot see or change are how this project
+    # spent two days running against the wrong Stripe account, so "not configured"
+    # has to be loud rather than quietly wrong.
+    # Seeds the first ``platform_payment_settings`` row only (0.15 -> 15 percent). After
+    # that the admin panel owns the commission; nothing reads this at request time.
+    PLATFORM_COMMISSION_RATE: float = 0.15
     # Delayed payout: how long the platform holds the advisor's share before the
     # automatic Connect transfer fires. Refunds are only possible during this window.
     PAYOUT_HOLD_MINUTES: int = 2
@@ -133,6 +136,10 @@ class Settings(BaseSettings):
     # Safety net: cancel pending+unpaid bookings older than this (minutes) to
     # release slots when checkout.session.expired webhooks are missed.
     STALE_UNPAID_BOOKING_MINUTES: int = 60
+    # After a successful payment the advisor's Cancel is locked for this long (PM,
+    # 2026-10-15): Stripe's fee is taken from the advisor ~30 s after payment, and a
+    # cancel that lands before it left the platform paying the fee.
+    BOOKING_CANCEL_COOLDOWN_SECONDS: int = 120
     INVOICE_FROM_ADDRESS: str | None = None  # optional platform address on invoices
     INVOICE_FROM_PHONE: str | None = None  # optional platform phone on invoices
 
@@ -178,9 +185,6 @@ class Settings(BaseSettings):
         "IDENTITY_JWKS_URL",
         "SENTRY_DSN",
         "SMTP_HOST",
-        "STRIPE_SECRET_KEY",
-        "STRIPE_WEBHOOK_SECRET",
-        "STRIPE_PUBLISHABLE_KEY",
         "OPENAI_API_KEY",
         "GOOGLE_CLIENT_ID",
         "GOOGLE_CLIENT_SECRET",

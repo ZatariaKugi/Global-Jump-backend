@@ -11,8 +11,6 @@ has a single tip again with no additional schema changes.
 
 from __future__ import annotations
 
-from alembic import op
-
 revision = "d4e6f8a0b2c4"
 down_revision = ("c3d5e7f9a1b3", "c5e7a9b1d3f4")
 branch_labels = None

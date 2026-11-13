@@ -1,13 +1,15 @@
 Hi {{ full_name }},
 
-{{ seeker_name }} has paid for their consultation with you. Your payout will be
-scheduled per your payout settings.
+{{ seeker_name }} has paid for their consultation with you. Your share is in your
+Stripe account.
 
   Invoice:      #{{ invoice_number }}
   Service:      {{ name }}
   Client:       {{ seeker_name }}
-  Amount paid:  ${{ amount_usd }}
-  Your payout:  ${{ payout_usd }}
+  Consultation: ${{ amount_usd }}
+{% if platform_fee_usd %}  Platform fee: ${{ platform_fee_usd }}
+{% endif %}{% if stripe_fee_usd %}  Stripe fee:   ${{ stripe_fee_usd }}
+{% endif %}  Your net:     ${{ payout_usd }}
 
 You can view the transaction details from your {{ app_name }} dashboard at any time.
 

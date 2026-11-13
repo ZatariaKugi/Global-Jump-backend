@@ -81,6 +81,7 @@ def schedule_email(coro: Coroutine[Any, Any, None]) -> None:
     _background_email_tasks.add(task)
     task.add_done_callback(_background_email_tasks.discard)
 
+
 _TEMPLATES_DIR = pathlib.Path(__file__).parent.parent / "templates" / "email"
 _EMAIL_ASSETS_DIR = pathlib.Path(__file__).resolve().parents[2] / "public" / "email"
 
@@ -485,13 +486,22 @@ async def send_payment_receipt_email(
     amount_usd: float,
     invoice_number: str,
     settings: Settings,
+    consultation_usd: float | None = None,
+    tax_usd: float = 0.0,
+    tax_label: str | None = None,
 ) -> None:
-    ctx = {
+    """The seeker's receipt: Consultation + Tax = Total, the same three lines as the
+    checkout page and the invoice (QA 2026-10-08, section 4). No fee is ever named."""
+    consultation = consultation_usd if consultation_usd is not None else amount_usd
+    ctx: dict[str, object] = {
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
         "advisor_name": advisor_name,
         "name": name,
         "amount_usd": f"{amount_usd:.2f}",
+        "consultation_usd": f"{consultation:.2f}",
+        "tax_usd": f"{tax_usd:.2f}" if tax_usd > 0 else None,
+        "tax_label": tax_label or "Tax",
         "invoice_number": invoice_number,
         "year": datetime.now(UTC).year,
     }
@@ -997,15 +1007,22 @@ async def send_advisor_payment_notification_email(
     payout_usd: float,
     invoice_number: str,
     settings: Settings,
+    platform_fee_usd: float | None = None,
+    stripe_fee_usd: float = 0.0,
 ) -> None:
-    """Notify an advisor that a seeker has paid for their consultation."""
-    ctx = {
+    """Notify an advisor that a seeker has paid for their consultation.
+
+    ``amount_usd`` is the consultation (tax excluded: it is not the advisor's);
+    ``payout_usd`` is their net after the platform fee and Stripe's fee."""
+    ctx: dict[str, object] = {
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
         "seeker_name": seeker_name,
         "name": name,
         "amount_usd": f"{amount_usd:.2f}",
         "payout_usd": f"{payout_usd:.2f}",
+        "platform_fee_usd": f"{platform_fee_usd:.2f}" if platform_fee_usd is not None else None,
+        "stripe_fee_usd": f"{stripe_fee_usd:.2f}" if stripe_fee_usd > 0 else None,
         "invoice_number": invoice_number,
         "year": datetime.now(UTC).year,
     }
@@ -1334,7 +1351,7 @@ async def send_document_status_email(
 ) -> None:
     """Notify the seeker that an advisor updated their document's status."""
     documents_url = f"{settings.FRONTEND_URL.rstrip('/')}/seeker/documents"
-    
+
     status_capitalized = status.capitalize()
     if status == "approved":
         subject = f"Document approved — {settings.EMAILS_FROM_NAME}"
@@ -1348,7 +1365,7 @@ async def send_document_status_email(
         preview = " ".join(note.split())
         if len(preview) > 120:
             preview = preview[:117] + "..."
-            
+
     ctx: dict[str, object] = {
         "app_name": settings.EMAILS_FROM_NAME,
         "full_name": full_name or to,
@@ -1453,3 +1470,147 @@ async def send_document_requested_email(
             error=str(exc),
         )
 
+
+# ── EPIC 04: subscriptions and refunds ───────────────────────────────────────
+
+
+def _date_str(dt: datetime | None) -> str | None:
+    return dt.astimezone(UTC).strftime("%d %B %Y") if dt else None
+
+
+async def _send_simple(
+    *,
+    template: str,
+    subject: str,
+    to: str,
+    ctx: dict[str, object],
+    settings: Settings,
+    log_event: str,
+) -> None:
+    if not settings.SMTP_HOST:
+        logger.info(f"{log_event} [no smtp — logged]", to=to)
+        return
+    message = _build_message(
+        subject=subject,
+        recipients=[to],
+        body=_render(f"{template}.html", ctx, settings),
+        subtype=MessageType.html,
+        alternative_body=_render(f"{template}.txt", ctx, settings),
+        headers={
+            "X-Priority": "3",
+            "X-Mailer": settings.EMAILS_FROM_NAME,
+            **_deliverability_headers(settings),
+        },
+    )
+    if message is None:
+        return
+    try:
+        await FastMail(_make_connection(settings)).send_message(message)
+        logger.info(f"{log_event}_sent", to=to)
+    except (ConnectionErrors, SMTPException, OSError) as exc:
+        logger.warning(f"{log_event}_failed", to=to, error=str(exc))
+
+
+async def send_subscription_activated_email(
+    to: str,
+    full_name: str,
+    *,
+    plan_name: str,
+    amount_usd: float,
+    period_end: datetime | None,
+    renewed: bool,
+    invoice_url: str | None,
+    settings: Settings,
+) -> None:
+    """First payment (activated) or a renewal on a subscription plan."""
+    ctx: dict[str, object] = {
+        "full_name": full_name or to,
+        "plan_name": plan_name,
+        "amount_usd": f"{amount_usd:.2f}",
+        "period_end_str": _date_str(period_end),
+        "renewed": renewed,
+        "invoice_url": invoice_url,
+    }
+    await _send_simple(
+        template="subscription_activated",
+        subject=(
+            f"{'Subscription renewed' if renewed else 'Subscription active'} – "
+            f"{settings.EMAILS_FROM_NAME}"
+        ),
+        to=to,
+        ctx=ctx,
+        settings=settings,
+        log_event="subscription_activated_email",
+    )
+
+
+async def send_subscription_payment_failed_email(
+    to: str,
+    full_name: str,
+    *,
+    plan_name: str,
+    manage_url: str,
+    settings: Settings,
+) -> None:
+    """A renewal charge failed; the user must update their card before the grace ends."""
+    ctx: dict[str, object] = {
+        "full_name": full_name or to,
+        "plan_name": plan_name,
+        "manage_url": manage_url,
+    }
+    await _send_simple(
+        template="subscription_payment_failed",
+        subject=f"Action needed: subscription payment failed – {settings.EMAILS_FROM_NAME}",
+        to=to,
+        ctx=ctx,
+        settings=settings,
+        log_event="subscription_payment_failed_email",
+    )
+
+
+async def send_subscription_canceled_email(
+    to: str,
+    full_name: str,
+    *,
+    plan_name: str,
+    access_until: datetime | None,
+    settings: Settings,
+) -> None:
+    """The subscription ended (by the user, the admin, or after failed payments)."""
+    ctx: dict[str, object] = {
+        "full_name": full_name or to,
+        "plan_name": plan_name,
+        "access_until_str": _date_str(access_until),
+    }
+    await _send_simple(
+        template="subscription_canceled",
+        subject=f"Your subscription has ended – {settings.EMAILS_FROM_NAME}",
+        to=to,
+        ctx=ctx,
+        settings=settings,
+        log_event="subscription_canceled_email",
+    )
+
+
+async def send_refund_issued_email(
+    to: str,
+    full_name: str,
+    *,
+    booking_name: str,
+    amount_usd: float,
+    settings: Settings,
+) -> None:
+    """A consultation refund went back to the seeker's original card."""
+    ctx: dict[str, object] = {
+        "full_name": full_name or to,
+        "booking_name": booking_name,
+        "amount_usd": f"{amount_usd:.2f}",
+    }
+    await _send_simple(
+        template="refund_issued",
+        subject=f"Refund issued – {settings.EMAILS_FROM_NAME}",
+        to=to,
+        ctx=ctx,
+        settings=settings,
+        log_event="refund_issued_email",
+    )

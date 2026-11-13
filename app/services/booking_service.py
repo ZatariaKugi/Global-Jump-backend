@@ -12,11 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.types import String
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.exceptions import AppError, NotFoundError, PermissionDeniedError
 from app.core.file_storage import resolve_media_url
 from app.core.logging import get_logger
-from app.models.advisor_lead import AdvisorLead, AdvisorLeadStatus
 from app.models.advisor_profile import AdvisorOfferedService, AdvisorProfile
 from app.models.booking import APPOINTMENT_NUMBER_START, Booking, BookingStatus, PaymentStatus
 from app.models.booking_document_request import BookingDocumentRequest, DocumentRequestStatus
@@ -44,17 +43,21 @@ from app.schemas.booking import (
 )
 from app.services import (
     advisor_lead_service,
+    advisor_matching_service,
+    advisor_profile_service,
     availability_service,
     booking_document_service,
     booking_meeting_service,
     booking_note_service,
     notification_service,
+    payment_config_service,
     payment_service,
+    review_service,
 )
 from app.services.availability_service import as_utc
+from app.services.payment_config_service import PaymentConfig, compute_platform_fee
 from app.services.seeker_profile_service import preferred_language_names
 
-DEFAULT_NOTICE_HOURS = 24
 UNACCEPTED_BOOKING_EXPIRY_REASON = "Advisor did not accept before the scheduled session time"
 
 log = get_logger(__name__)
@@ -64,59 +67,126 @@ def _before_start(booking: Booking, now: datetime) -> bool:
     return now < as_utc(booking.scheduled_start)
 
 
-def _seeker_within_notice_window(booking: Booking, notice_hours: int, now: datetime) -> bool:
-    """True when the seeker is still allowed to cancel/reschedule (not late)."""
-    deadline = as_utc(booking.scheduled_start) - timedelta(hours=notice_hours)
-    return now <= deadline
+def reschedule_deadline(booking: Booking, config: PaymentConfig) -> datetime:
+    """Last instant a seeker may reschedule (document §3.1)."""
+    return as_utc(booking.scheduled_start) - timedelta(hours=config.seeker_reschedule_window_hours)
+
+
+def cancellation_deadline(booking: Booking, config: PaymentConfig) -> datetime:
+    """Last instant an advisor may cancel (document §3.2)."""
+    return as_utc(booking.scheduled_start) - timedelta(
+        hours=config.advisor_cancellation_window_hours
+    )
 
 
 def compute_capabilities(
     booking: Booking,
     *,
-    cancellation_notice_hours: int,
+    config: PaymentConfig,
     viewer_role: UserRole,
     now: datetime | None = None,
 ) -> tuple[bool, bool]:
-    """Return ``(can_reschedule, can_cancel)`` for the viewing party."""
+    """Return ``(can_reschedule, can_cancel)`` for the viewing party.
+
+    Rules come from the admin payment settings, not from the advisor's profile:
+      seeker  - may reschedule until ``reschedule_deadline``; may never cancel
+      advisor - may reschedule until start; may cancel until ``cancellation_deadline``
+      admin   - both, until start
+    """
     now = now or datetime.now(UTC)
-    if not _before_start(booking, now):
+    active = booking.status in (BookingStatus.pending, BookingStatus.confirmed)
+    if not active or not _before_start(booking, now):
         return False, False
 
     if viewer_role == UserRole.advisor:
         can_reschedule = booking.status == BookingStatus.confirmed
-        can_cancel = booking.status in (BookingStatus.pending, BookingStatus.confirmed)
+        can_cancel = now <= cancellation_deadline(booking, config) and not in_cancel_cooldown(
+            booking, now
+        )
         return can_reschedule, can_cancel
 
     if viewer_role == UserRole.admin:
-        active = booking.status in (BookingStatus.pending, BookingStatus.confirmed)
-        return active, active
-
-    # Seeker — pending or confirmed, and outside the advisor notice window.
-    if booking.status not in (BookingStatus.pending, BookingStatus.confirmed):
-        return False, False
-    if _seeker_within_notice_window(booking, cancellation_notice_hours, now):
         return True, True
-    return False, False
+
+    return now <= reschedule_deadline(booking, config), False
 
 
-async def notice_hours_by_advisor(
-    session: AsyncSession, advisor_ids: set[uuid.UUID]
-) -> dict[uuid.UUID, int]:
-    if not advisor_ids:
-        return {}
-    rows = (
-        await session.execute(
-            select(AdvisorProfile.user_id, AdvisorProfile.cancellation_notice_hours).where(
-                AdvisorProfile.user_id.in_(advisor_ids)
-            )
-        )
-    ).all()
-    return {
-        user_id: (hours if hours is not None else DEFAULT_NOTICE_HOURS) for user_id, hours in rows
-    }
+def cancel_available_at(booking: Booking) -> datetime | None:
+    """When the advisor's Cancel unlocks after payment (PM, 2026-10-15), or None if unpaid.
+
+    A fixed ``BOOKING_CANCEL_COOLDOWN_SECONDS`` after ``paid_at``. Stripe's fee is taken
+    from the advisor about 30 s after payment; a cancel inside that window refunded the
+    whole share and left the platform paying the fee (staging, 14 October).
+    """
+    if booking.payment_status != PaymentStatus.paid or booking.paid_at is None:
+        return None
+    return as_utc(booking.paid_at) + timedelta(
+        seconds=get_settings().BOOKING_CANCEL_COOLDOWN_SECONDS
+    )
+
+
+def in_cancel_cooldown(booking: Booking, now: datetime | None = None) -> bool:
+    opens = cancel_available_at(booking)
+    return opens is not None and (now or datetime.now(UTC)) < opens
 
 
 _ACTIVE_UPCOMING = (BookingStatus.pending, BookingStatus.confirmed)
+
+
+def is_past_unpaid(booking: Booking, now: datetime | None = None) -> bool:
+    """Unpaid, still open, and its scheduled start has passed (QA GJ-BOOKING-003)."""
+    now = now or datetime.now(UTC)
+    return (
+        booking.status in _ACTIVE_UPCOMING
+        and booking.payment_status == PaymentStatus.unpaid
+        and as_utc(booking.scheduled_start) <= now
+    )
+
+
+def expire_if_past(booking: Booking, now: datetime | None = None) -> bool:
+    """Mark one booking expired when ``is_past_unpaid``; True when it changed.
+
+    PM rule, 2026-10-10: an unpaid booking expires at its scheduled start. The
+    scheduler is switched off, so expiry is applied on read and on payment instead
+    of by a sweep; a stale page, an old link or a direct checkout call all land here.
+    """
+    if not is_past_unpaid(booking, now):
+        return False
+    booking.status = BookingStatus.expired
+    booking.cancellation_reason = EXPIRED_UNPAID_REASON
+    return True
+
+
+EXPIRED_UNPAID_REASON = "Unpaid when the scheduled time passed"
+
+
+async def expire_past_unpaid(session: AsyncSession, *, user_id: uuid.UUID) -> int:
+    """Expire every past unpaid booking the user is party to; returns how many.
+
+    Called before a bookings list or banner is built, so both the seeker and the
+    advisor read the same status. Paid, cancelled, completed and future rows are
+    never touched.
+    """
+    now = datetime.now(UTC)
+    rows = (
+        await session.execute(
+            select(Booking).where(
+                or_(Booking.seeker_id == user_id, Booking.advisor_id == user_id),
+                Booking.status.in_(_ACTIVE_UPCOMING),
+                Booking.payment_status == PaymentStatus.unpaid,
+                Booking.scheduled_start <= now,
+            )
+        )
+    ).scalars()
+    expired = 0
+    for booking in rows:
+        if expire_if_past(booking, now):
+            session.add(booking)
+            expired += 1
+    if expired:
+        await session.flush()
+        log.info("bookings_expired_on_read", user_id=str(user_id), count=expired)
+    return expired
 
 
 def _chat_eligible_payment_clause() -> ColumnElement[bool]:
@@ -317,15 +387,15 @@ def build_read(
     advisor_profile_photo_key: str | None = None,
     seeker_profile_photo_key: str | None = None,
     review_id: uuid.UUID | None = None,
-    cancellation_notice_hours: int = DEFAULT_NOTICE_HOURS,
+    config: PaymentConfig,
     viewer_role: UserRole = UserRole.seeker,
     is_unread: bool = False,
 ) -> BookingRead:
-    platform_fee = round(booking.price_usd * settings.PLATFORM_COMMISSION_RATE, 2)
+    platform_fee = float(compute_platform_fee(config, booking.price_usd))
     advisor_fee = round(booking.price_usd - platform_fee, 2)
     can_reschedule, can_cancel = compute_capabilities(
         booking,
-        cancellation_notice_hours=cancellation_notice_hours,
+        config=config,
         viewer_role=viewer_role,
     )
     return BookingRead(
@@ -342,8 +412,9 @@ def build_read(
         service_id=booking.service_id,
         name=booking.name,
         duration_minutes=booking.duration_minutes,
-        advisor_fee_usd=advisor_fee,
-        platform_fee_usd=platform_fee,
+        # the split stays with the people it concerns (QA BUG2, PM 2026-10-22)
+        advisor_fee_usd=None if viewer_role == UserRole.seeker else advisor_fee,
+        platform_fee_usd=None if viewer_role == UserRole.seeker else platform_fee,
         price_usd=booking.price_usd,
         scheduled_start=as_utc(booking.scheduled_start),
         scheduled_end=as_utc(booking.scheduled_end),
@@ -363,7 +434,10 @@ def build_read(
         updated_at=booking.updated_at,
         can_reschedule=can_reschedule,
         can_cancel=can_cancel,
-        cancellation_notice_hours=cancellation_notice_hours,
+        cancel_available_at=cancel_available_at(booking),
+        cancellation_notice_hours=config.seeker_reschedule_window_hours,
+        reschedule_deadline=reschedule_deadline(booking, config),
+        cancellation_deadline=cancellation_deadline(booking, config),
         meeting_join_url=(
             booking.meeting_join_url
             if viewer_role == UserRole.seeker and is_meeting_joinable(booking)
@@ -500,14 +574,6 @@ async def _assert_service_offered(
     )
 
 
-async def get_notice_hours(session: AsyncSession, advisor_id: uuid.UUID) -> int:
-    result = await session.execute(
-        select(AdvisorProfile.cancellation_notice_hours).where(AdvisorProfile.user_id == advisor_id)
-    )
-    hours = result.scalar_one_or_none()
-    return hours if hours is not None else DEFAULT_NOTICE_HOURS
-
-
 def _floor_to_minute(dt: datetime) -> datetime:
     """Strip microseconds/seconds for stable comparison across JSON round-trips."""
     return dt.replace(second=0, microsecond=0)
@@ -560,6 +626,21 @@ async def _assert_slot_free(
     raise AppError("Requested time is not available", code="slot_unavailable")
 
 
+async def assert_advisor_payable(session: AsyncSession, advisor_id: uuid.UUID) -> None:
+    """PAY-101: a seeker cannot book an advisor whose Connect account cannot take a
+    destination charge. Advisor-created (free) bookings never call this."""
+    profile = (
+        await session.execute(select(AdvisorProfile).where(AdvisorProfile.user_id == advisor_id))
+    ).scalar_one_or_none()
+    if (
+        profile is None
+        or not profile.stripe_account_id
+        or profile.needs_stripe_connect
+        or not profile.stripe_charges_enabled
+    ):
+        raise AppError("Advisor is not set up to receive payments yet", code="advisor_not_payable")
+
+
 async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Booking:
     if seeker.role != UserRole.seeker:
         raise PermissionDeniedError("Seeker account required")
@@ -567,6 +648,9 @@ async def create(session: AsyncSession, seeker: User, data: BookingCreate) -> Bo
         raise AppError("Cannot book yourself", code="invalid_booking")
 
     await _resolve_advisor(session, data.advisor_id)
+    await assert_advisor_payable(session, data.advisor_id)
+    # Booking is a core platform feature (PM, 2026-10-08): no plan quota applies to
+    # the marketplace transaction itself, for seekers or advisors.
     service = await _resolve_service(session, data.advisor_id, service_id=data.service_id)
 
     if data.scheduled_start.tzinfo is None and data.timezone:
@@ -623,6 +707,7 @@ async def create_by_advisor(
     if seeker is None or seeker.role != UserRole.seeker or not seeker.is_active:
         raise NotFoundError("Client not found")
 
+    # Advisor-created bookings are free for the seeker and never a plan quota.
     service = await _assert_service_offered(session, advisor.id, service_id=data.service_id)
     duration_minutes = service.duration_minutes or data.duration_minutes
 
@@ -863,7 +948,7 @@ async def read_booking(
     advisor_photos = await advisor_photo_keys(session, {booking.advisor_id})
     seeker_photos = await seeker_photo_keys(session, {booking.seeker_id})
     review_ids = await review_ids_by_booking(session, {booking.id})
-    notice_hours = await get_notice_hours(session, booking.advisor_id)
+    config = await payment_config_service.get_config(session)
     return build_read(
         booking,
         seeker,
@@ -872,7 +957,7 @@ async def read_booking(
         advisor_profile_photo_key=advisor_photos.get(booking.advisor_id),
         seeker_profile_photo_key=seeker_photos.get(booking.seeker_id),
         review_id=review_ids.get(booking.id),
-        cancellation_notice_hours=notice_hours,
+        config=config,
         viewer_role=viewer_role,
     )
 
@@ -891,18 +976,55 @@ def _assert_active(booking: Booking) -> None:
         raise AppError("Booking is no longer active", code="invalid_state")
 
 
-async def _enforce_seeker_notice(
+def _assert_not_started(booking: Booking, now: datetime) -> None:
+    if not _before_start(booking, now):
+        raise AppError("The consultation has already started", code="consultation_started")
+
+
+async def _assert_cancel_allowed(
     session: AsyncSession, booking: Booking, actor_id: uuid.UUID
 ) -> None:
-    """Seekers must act outside the advisor's cancellation notice window."""
-    if actor_id != booking.seeker_id:
-        return  # advisors may act any time
-    hours = await get_notice_hours(session, booking.advisor_id)
-    deadline = as_utc(booking.scheduled_start) - timedelta(hours=hours)
-    if datetime.now(UTC) > deadline:
+    """Document §3.1 / §3.2: seekers never cancel; advisors only outside the window."""
+    if actor_id == booking.seeker_id:
+        raise PermissionDeniedError(
+            "Consultations cannot be cancelled by the seeker; reschedule instead",
+            code="seeker_cannot_cancel",
+        )
+    now = datetime.now(UTC)
+    _assert_not_started(booking, now)
+    if actor_id != booking.advisor_id:
+        return  # admin: any time before start
+    if in_cancel_cooldown(booking, now):
         raise AppError(
-            f"Changes require at least {hours} hours notice",
-            code="late_cancellation",
+            "You cannot cancel yet. The payment is still settling; cancellation opens "
+            "two minutes after payment.",
+            code="cancel_cooldown",
+        )
+    config = await payment_config_service.get_config(session)
+    if now > cancellation_deadline(booking, config):
+        raise AppError(
+            f"Cancellation requires at least {config.advisor_cancellation_window_hours} "
+            "hours notice",
+            code="cancellation_window_closed",
+        )
+
+
+async def _assert_reschedule_allowed(
+    session: AsyncSession, booking: Booking, actor_id: uuid.UUID
+) -> None:
+    """Document §3.1: the seeker reschedules only outside the reschedule window.
+
+    The advisor (and admin) may reschedule until the start (decision D2).
+    """
+    now = datetime.now(UTC)
+    _assert_not_started(booking, now)
+    if actor_id != booking.seeker_id:
+        return
+    config = await payment_config_service.get_config(session)
+    if now > reschedule_deadline(booking, config):
+        raise AppError(
+            f"Rescheduling requires at least {config.seeker_reschedule_window_hours} hours notice",
+            code="reschedule_window_closed",
         )
 
 
@@ -914,15 +1036,17 @@ async def cancel(
     settings: Settings,
 ) -> tuple[Booking, Decimal | None]:
     _assert_active(booking)
-    await _enforce_seeker_notice(session, booking, actor_id)
+    await _assert_cancel_allowed(session, booking, actor_id)
     booking.status = BookingStatus.cancelled
     booking.cancellation_reason = reason
     booking.cancelled_by = actor_id
     booking.updated_by = actor_id
     session.add(booking)
     await session.flush()
+    # Only the advisor reaches this point (seekers are refused above, admins have no
+    # cancel path: business decision, 2026-10-07), so the refund kind is fixed.
     refund_amount = await payment_service.auto_refund_booking_if_paid(
-        session, booking, actor_id, reason, settings
+        session, booking, actor_id, reason, settings, kind="advisor_cancel"
     )
     await booking_meeting_service.remove_meeting(session, booking, settings)
     await _notify_booking(
@@ -947,7 +1071,7 @@ async def reschedule(
     settings: Settings,
 ) -> Booking:
     _assert_active(booking)
-    await _enforce_seeker_notice(session, booking, actor_id)
+    await _assert_reschedule_allowed(session, booking, actor_id)
 
     start_utc = as_utc(new_start)
     if start_utc <= datetime.now(UTC):
@@ -963,6 +1087,8 @@ async def reschedule(
 
     booking.scheduled_start = start_utc
     booking.scheduled_end = end_utc
+    if actor_id == booking.seeker_id:
+        booking.reschedule_count = (booking.reschedule_count or 0) + 1
     booking.updated_by = actor_id
     session.add(booking)
     await session.flush()
@@ -1037,7 +1163,9 @@ async def reject(
     session.add(booking)
     await session.flush()
     await session.refresh(booking)
-    await payment_service.auto_refund_booking_if_paid(session, booking, actor_id, reason, settings)
+    await payment_service.auto_refund_booking_if_paid(
+        session, booking, actor_id, reason, settings, kind="rejection"
+    )
     await booking_meeting_service.remove_meeting(session, booking, settings)
     await _notify_booking(
         session,
@@ -1091,9 +1219,10 @@ async def expire_unaccepted_pending_bookings(session: AsyncSession, settings: Se
             await payment_service.auto_refund_booking_if_paid(
                 session,
                 booking,
-                booking.seeker_id,
+                None,
                 UNACCEPTED_BOOKING_EXPIRY_REASON,
                 settings,
+                kind="expiry",
             )
 
         await booking_meeting_service.remove_meeting(session, booking, settings)
@@ -1347,10 +1476,10 @@ async def build_history(
     docs_result = await session.execute(booking_document_service.list_for_booking_stmt(booking.id))
     docs = list(docs_result.scalars().all())
 
-    notice_hours = await get_notice_hours(session, booking.advisor_id)
+    config = await payment_config_service.get_config(session)
     can_reschedule, can_cancel = compute_capabilities(
         booking,
-        cancellation_notice_hours=notice_hours,
+        config=config,
         viewer_role=viewer_role,
     )
 
@@ -1376,7 +1505,10 @@ async def build_history(
         created_at=booking.created_at,
         can_reschedule=can_reschedule,
         can_cancel=can_cancel,
-        cancellation_notice_hours=notice_hours,
+        cancel_available_at=cancel_available_at(booking),
+        cancellation_notice_hours=config.seeker_reschedule_window_hours,
+        reschedule_deadline=reschedule_deadline(booking, config),
+        cancellation_deadline=cancellation_deadline(booking, config),
     )
 
 
@@ -1432,9 +1564,7 @@ async def build_details(
     else:
         amount_paid = 0.0
 
-    description = (booking.seeker_note or "").strip() or (
-        f"Consultation for {booking.name}"
-    )
+    description = (booking.seeker_note or "").strip() or (f"Consultation for {booking.name}")
 
     attachments: list[BookingAttachmentRead] = []
     docs_result = await session.execute(booking_document_service.list_for_booking_stmt(booking.id))
@@ -1542,10 +1672,10 @@ async def build_session_detail(
         else None
     )
 
-    notice_hours = await get_notice_hours(session, booking.advisor_id)
+    config = await payment_config_service.get_config(session)
     can_reschedule, can_cancel = compute_capabilities(
         booking,
-        cancellation_notice_hours=notice_hours,
+        config=config,
         viewer_role=viewer_role,
     )
 
@@ -1555,7 +1685,10 @@ async def build_session_detail(
         scheduled_start=as_utc(booking.scheduled_start),
         can_reschedule=can_reschedule,
         can_cancel=can_cancel,
-        cancellation_notice_hours=notice_hours,
+        cancel_available_at=cancel_available_at(booking),
+        cancellation_notice_hours=config.seeker_reschedule_window_hours,
+        reschedule_deadline=reschedule_deadline(booking, config),
+        cancellation_deadline=cancellation_deadline(booking, config),
         client=SessionClientRead(
             name=seeker.full_name if seeker else None,
             email=seeker.email if seeker else None,
@@ -1629,7 +1762,13 @@ async def build_client_reads(
     clients: list[User],
     settings: Settings,
 ) -> list[ClientRead]:
-    """Enrich client picker rows with latest booking + optional lead match_score."""
+    """Enrich client picker rows with the latest booking and the profile match.
+
+    ``match_score`` is the same number the seeker sees for this advisor on Find
+    Advisor (``advisor_matching_service.match_percentage`` from the seeker's
+    profile intent), never the AI lead score — one pair, one figure (#337).
+    ``None`` when the seeker's profile has no destination / visa to match on.
+    """
     if not clients:
         return []
 
@@ -1652,23 +1791,18 @@ async def build_client_reads(
         if booking.seeker_id not in latest_booking:
             latest_booking[booking.seeker_id] = booking
 
-    leads = (
-        (
+    advisor_profile = await advisor_profile_service.get_by_user_id(session, advisor_id)
+    average_rating, _ = await review_service.rating_summary(session, advisor_id)
+    intents: dict[uuid.UUID, tuple[str | None, str | None]] = {
+        sp.user_id: (sp.intended_destination, sp.intended_visa_type)
+        for sp in (
             await session.execute(
-                select(AdvisorLead)
-                .where(AdvisorLead.advisor_id == advisor_id)
-                .where(AdvisorLead.seeker_id.in_(seeker_ids))
-                .where(AdvisorLead.status != AdvisorLeadStatus.dismissed)
-                .order_by(AdvisorLead.created_at.desc())
+                select(SeekerProfile).where(SeekerProfile.user_id.in_(seeker_ids))
             )
         )
         .scalars()
         .all()
-    )
-    latest_lead: dict[uuid.UUID, AdvisorLead] = {}
-    for lead in leads:
-        if lead.seeker_id not in latest_lead:
-            latest_lead[lead.seeker_id] = lead
+    }
 
     photos = await seeker_photo_keys(session, set(seeker_ids))
 
@@ -1678,7 +1812,10 @@ async def build_client_reads(
     rows: list[ClientRead] = []
     for client in clients:
         latest = latest_booking.get(client.id)
-        lead_row = latest_lead.get(client.id)
+        destination, visa_type = intents.get(client.id, (None, None))
+        match = advisor_matching_service.match_percentage(
+            advisor_profile, destination, visa_type, average_rating
+        )
         appt = appointment_id_str(latest) if latest is not None else None
         rows.append(
             ClientRead(
@@ -1691,7 +1828,7 @@ async def build_client_reads(
                 consultation_number=appt,
                 appointment_id=appt,
                 consultation_type=latest.name if latest is not None else None,
-                match_score=lead_row.match_score if lead_row is not None else None,
+                match_score=float(match) if match is not None else None,
                 status=latest.status if latest is not None else None,
                 is_important=latest.is_important if latest is not None else False,
                 is_unread=unread_flags.get(latest.id, False) if latest is not None else False,

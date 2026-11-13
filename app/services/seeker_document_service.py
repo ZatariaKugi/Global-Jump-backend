@@ -6,7 +6,7 @@ import uuid
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import ColumnElement, Select, delete, exists, func, or_, select
+from sqlalchemy import ColumnElement, Select, delete, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -44,7 +44,7 @@ from app.schemas.seeker_document import (
     SeekerDocumentStatusUpdate,
     SeekerDocumentUpdate,
 )
-from app.services import booking_service, notification_service
+from app.services import booking_service, notification_service, payment_config_service
 from app.services.availability_service import as_utc
 
 # Required portfolio categories — left-to-right tab order on the Documents page.
@@ -62,6 +62,21 @@ CHECKLIST_LABELS: dict[DocumentCategory, str] = {
     DocumentCategory.supporting: "Supporting",
     DocumentCategory.other: "Other",
 }
+
+
+async def count_active(session: AsyncSession, seeker_id: uuid.UUID) -> int:
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(SeekerDocument)
+                .where(
+                    SeekerDocument.seeker_id == seeker_id,
+                    SeekerDocument.is_archived.is_(False),
+                )
+            )
+        ).scalar_one()
+    )
 
 
 async def create(
@@ -269,7 +284,12 @@ def _review_stale_after_document_update(
     document: SeekerDocument,
     review: SeekerDocumentAdvisorReview,
 ) -> bool:
-    """True when the file/metadata changed after this review (e.g. seeker re-uploaded)."""
+    """True when the file/metadata changed after this review (e.g. seeker re-uploaded).
+
+    Only writes that change the document may move ``updated_at``; the comments-read
+    stamp deliberately pins it (``mark_comments_read``), and comment rows never touch
+    the document at all (QA BUG4).
+    """
     if document.status != SeekerDocumentStatus.under_review:
         return False
     if document.updated_at is None:
@@ -549,8 +569,7 @@ async def portfolio_summary(
     approved = sum(
         1
         for d in docs
-        if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
-        == SeekerDocumentStatus.approved
+        if seeker_effective_status(d, reviews_by_doc.get(d.id, [])) == SeekerDocumentStatus.approved
     )
     under_review = sum(
         1
@@ -561,8 +580,7 @@ async def portfolio_summary(
     rejected = sum(
         1
         for d in docs
-        if seeker_effective_status(d, reviews_by_doc.get(d.id, []))
-        == SeekerDocumentStatus.rejected
+        if seeker_effective_status(d, reviews_by_doc.get(d.id, [])) == SeekerDocumentStatus.rejected
     )
 
     by_category: dict[DocumentCategory, list[SeekerDocument]] = defaultdict(list)
@@ -593,9 +611,7 @@ async def portfolio_summary(
     progress_percent = int(round(100 * filled / required_n)) if required_n else 0
 
     expiring_soon_docs = await _expiring_soon_docs(session, seeker_id, visa_type=visa_type)
-    expiring_soon = await build_reads(
-        session, expiring_soon_docs, settings, include_unread=True
-    )
+    expiring_soon = await build_reads(session, expiring_soon_docs, settings, include_unread=True)
 
     return DocumentPortfolioSummary(
         total=total,
@@ -654,11 +670,25 @@ async def add_comment(
 async def mark_comments_read(
     session: AsyncSession, document: SeekerDocument, actor_id: uuid.UUID
 ) -> None:
-    """Idempotent: seeker opened the comments sheet."""
-    document.comments_last_read_at = datetime.now(UTC)
-    document.updated_by = actor_id
-    session.add(document)
+    """Idempotent: seeker opened the comments sheet.
+
+    Written as a targeted UPDATE that pins ``updated_at`` to its current value. Reading
+    comments is not a change to the document: through the ORM the row's ``onupdate``
+    bumped ``updated_at``, and ``_review_stale_after_document_update`` then hid every
+    advisor approval older than that instant — an approved document flipped to Under
+    Review the moment the seeker opened its Reviews sheet (QA BUG4, 2026-10-23).
+    """
+    await session.execute(
+        update(SeekerDocument)
+        .where(SeekerDocument.id == document.id)
+        .values(
+            comments_last_read_at=datetime.now(UTC),
+            updated_by=actor_id,
+            updated_at=SeekerDocument.updated_at,
+        )
+    )
     await session.flush()
+    session.expire(document, ["comments_last_read_at", "updated_by"])
 
 
 async def notify_seeker_of_advisor_comment(
@@ -857,9 +887,7 @@ async def build_read_enriched(
             reviewed_at=review.reviewed_at if review is not None else None,
             reviewed_by=review.advisor_id if review is not None else None,
         )
-    doc_reviews = list(
-        (await reviews_by_document(session, [document.id])).get(document.id, [])
-    )
+    doc_reviews = list((await reviews_by_document(session, [document.id])).get(document.id, []))
     latest = _latest_review(doc_reviews)
     return build_read(
         document,
@@ -1085,9 +1113,7 @@ async def build_customer_document_rows(
         counts[pair] = bucket
 
     rows: list[CustomerDocumentsRowRead] = []
-    notice_map = await booking_service.notice_hours_by_advisor(
-        session, {b.advisor_id for b in bookings}
-    )
+    config = await payment_config_service.get_config(session)
     for booking in bookings:
         seeker = seekers.get(booking.seeker_id)
         if seeker is None:
@@ -1103,10 +1129,9 @@ async def build_customer_document_rows(
             tallies["rejected"],
         )
         updated = latest_doc_at.get(booking.seeker_id) or booking.updated_at or booking.created_at
-        notice_hours = notice_map.get(booking.advisor_id, booking_service.DEFAULT_NOTICE_HOURS)
         can_reschedule, _can_cancel = booking_service.compute_capabilities(
             booking,
-            cancellation_notice_hours=notice_hours,
+            config=config,
             viewer_role=UserRole.advisor,
         )
         rows.append(
@@ -1140,7 +1165,7 @@ async def notify_seeker_of_document_status_update(
 ) -> None:
     advisor_name = advisor.full_name or "Your advisor"
     status_capitalized = status.capitalize()
-    
+
     body = f'{advisor_name} {status} your document "{document.document_name}"'
     if note:
         preview = " ".join(note.split())
@@ -1149,7 +1174,7 @@ async def notify_seeker_of_document_status_update(
         body = f"{body}: {preview}"
     if len(body) > 1000:
         body = body[:997] + "..."
-        
+
     await notification_service.notify(
         session,
         user_id=document.seeker_id,
@@ -1160,4 +1185,3 @@ async def notify_seeker_of_document_status_update(
         entity_id=document.id,
         actor_id=advisor.id,
     )
-

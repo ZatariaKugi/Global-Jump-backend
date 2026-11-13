@@ -217,7 +217,7 @@ async def get_dashboard(
     )
     application_state = visa_journey_service.application_status_state(state.statuses)
 
-    matched, ai_failure, ai_attempted = await seeker_recommendation_service.matches_for_dashboard(
+    matches = await seeker_recommendation_service.matches_for_dashboard(
         session,
         seeker_id,
         settings,
@@ -230,7 +230,8 @@ async def get_dashboard(
     score = 0.0 if raw_score is None else float(raw_score)
     eligibility = max(0, min(int(round(score)), 100))
     breakdown = EligibilityBreakdownRead(
-        center_percent=journey_progress,
+        # the centre of the eligibility ring is the eligibility score (QA #330)
+        center_percent=eligibility,
         segments=[
             EligibilityBreakdownSegment(key="eligibility", label="Eligibility", value=eligibility),
             EligibilityBreakdownSegment(
@@ -263,7 +264,9 @@ async def get_dashboard(
         ),
         journey_stages=_build_stages(state.statuses, doc_progress),
         eligibility_breakdown=breakdown,
-        matched_advisors=matched,
+        matched_advisors=matches.matched,
+        ai_recommended_advisors=matches.ai_recommended,
+        ai_recommendations_locked=matches.ai_locked,
         assessment_id=assessment.id if assessment is not None else None,
-        ai_match=ai_match_status(ai_failure, attempted=ai_attempted),
+        ai_match=ai_match_status(matches.ai_failure, attempted=matches.ai_attempted),
     )

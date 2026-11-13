@@ -100,6 +100,27 @@ async def get_current_principal(
 CurrentPrincipal = Annotated[Principal, Depends(get_current_principal)]
 
 
+async def get_optional_principal(
+    token: TokenDep,
+    settings: SettingsDep,
+    session: SessionDep,
+) -> Principal | None:
+    """``get_current_principal`` for public pages that behave better when signed in.
+
+    No token, or a token that no longer authenticates, both read as "anonymous";
+    the route decides what an anonymous caller may see.
+    """
+    if not token:
+        return None
+    try:
+        return await get_current_principal(token, settings, session)
+    except AuthenticationError:
+        return None
+
+
+OptionalPrincipal = Annotated[Principal | None, Depends(get_optional_principal)]
+
+
 async def get_current_user(principal: CurrentPrincipal) -> User:
     """Require a *local* user account (rejects external-only principals)."""
     if principal.user is None:

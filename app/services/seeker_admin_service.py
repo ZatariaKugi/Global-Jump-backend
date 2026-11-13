@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import secrets
 import uuid
+from typing import Any
 
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,7 +17,7 @@ from app.core.exceptions import ConflictError, NotFoundError
 from app.core.security import hash_password
 from app.core.visa_types import parse_visa_type, visa_type_name
 from app.models.assessment import Assessment
-from app.models.booking import Booking
+from app.models.booking import Booking, BookingStatus, PaymentStatus
 from app.models.seeker_profile import SeekerProfile
 from app.models.user import User, UserRole
 from app.models.visa_type import VisaType
@@ -63,6 +64,18 @@ def list_seekers_stmt(
     return stmt
 
 
+# "Total Bookings" counts consultations that were paid for and went ahead (QA doc,
+# phase-2 bug 5), the same rule as the advisor "Total Sessions" column.
+COUNTED_BOOKING_STATUSES = (BookingStatus.confirmed, BookingStatus.completed)
+
+
+def counted_booking_filters() -> list[Any]:
+    return [
+        Booking.payment_status == PaymentStatus.paid,
+        Booking.status.in_(COUNTED_BOOKING_STATUSES),
+    ]
+
+
 async def build_list_read(session: AsyncSession, users: list[User]) -> list[SeekerListRead]:
     """Bulk-enrich one page: profiles + AI Assessment Count + Total Bookings,
     each a single grouped query keyed by the page's user ids — not N+1."""
@@ -91,7 +104,7 @@ async def build_list_read(session: AsyncSession, users: list[User]) -> list[Seek
     booking_count_rows = (
         await session.execute(
             select(Booking.seeker_id, func.count())
-            .where(Booking.seeker_id.in_(ids))
+            .where(Booking.seeker_id.in_(ids), *counted_booking_filters())
             .group_by(Booking.seeker_id)
         )
     ).all()
@@ -139,7 +152,9 @@ async def get_seeker_detail(session: AsyncSession, user_id: uuid.UUID) -> Seeker
     ).scalar_one()
     total_bookings = (
         await session.execute(
-            select(func.count()).select_from(Booking).where(Booking.seeker_id == user_id)
+            select(func.count())
+            .select_from(Booking)
+            .where(Booking.seeker_id == user_id, *counted_booking_filters())
         )
     ).scalar_one()
     return SeekerDetailRead(
@@ -192,7 +207,5 @@ async def create_seeker(
         await session.flush()
     await session.refresh(user)
     raw_token = await auth_service.create_password_reset_token_for_user(session, user, settings)
-    schedule_email(
-        send_password_reset_email(user.email, user.full_name or "", raw_token, settings)
-    )
+    schedule_email(send_password_reset_email(user.email, user.full_name or "", raw_token, settings))
     return await get_seeker_detail(session, user.id)

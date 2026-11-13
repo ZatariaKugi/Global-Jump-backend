@@ -5,7 +5,9 @@ Thanks for your payment. Here's your receipt.
   Invoice:       #{{ invoice_number }}
   Service:       {{ name }}
   Advisor:       {{ advisor_name }}
-  Amount paid:   ${{ amount_usd }}
+{% if tax_usd %}  Consultation:  ${{ consultation_usd }}
+  {{ tax_label }}:  ${{ tax_usd }}
+{% endif %}  Amount paid:   ${{ amount_usd }}
 
 You can view or download the full invoice from your {{ app_name }} dashboard at any time.
 

@@ -12,6 +12,10 @@
   {{ details_row("Invoice", "#" ~ invoice_number) }}
   {{ details_row("Service", name) }}
   {{ details_row("Advisor", advisor_name) }}
+  {% if tax_usd %}
+  {{ details_row("Consultation", "$" ~ consultation_usd) }}
+  {{ details_row(tax_label, "$" ~ tax_usd) }}
+  {% endif %}
   {{ details_row("Amount paid", "$" ~ amount_usd) }}
   {{ details_close() }}
   <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">

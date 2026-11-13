@@ -9,6 +9,8 @@ in ``advisor_leads`` and ``GET /assessments/{id}/matched-advisors``.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -91,6 +93,52 @@ async def notify_seekers_about_new_advisor(
     return notified
 
 
+async def announce_advisor_if_bookable(
+    session: AsyncSession,
+    advisor_user_id: uuid.UUID,
+    *,
+    settings: Settings,
+) -> int:
+    """Tell matching seekers about an advisor once they are approved AND bookable.
+
+    QA #333 (2026-10-27): the approval announcement ignored the Stripe / Zoom readiness
+    gate that hides an advisor from Find Advisor, the dashboard matches and booking, so
+    seekers were told about advisors they could neither find nor book. Called at approval
+    and again whenever readiness is refreshed (Stripe ``account.updated``, the live
+    Connect status check, a Zoom connect); announces exactly once per advisor.
+    """
+    from app.models.notification import Notification
+    from app.models.user import UserRole, VerificationStatus
+    from app.services import advisor_search_service
+
+    advisor = await session.get(User, advisor_user_id)
+    if (
+        advisor is None
+        or advisor.role != UserRole.advisor
+        or not advisor.is_active
+        or advisor.verification_status != VerificationStatus.approved
+    ):
+        return 0
+    if not await advisor_search_service.is_integrations_ready(session, advisor.id):
+        return 0
+    already = await session.scalar(
+        select(Notification.id)
+        .where(
+            Notification.type == NotificationType.new_relevant_advisor.value,
+            Notification.actor_id == advisor.id,
+        )
+        .limit(1)
+    )
+    if already is not None:
+        return 0
+    profile = await session.scalar(
+        select(AdvisorProfile).where(AdvisorProfile.user_id == advisor.id)
+    )
+    if profile is None:
+        return 0
+    return await notify_seekers_about_new_advisor(session, advisor, profile, settings=settings)
+
+
 async def list_for_seeker(
     session: AsyncSession,
     seeker_id: uuid.UUID,
@@ -112,12 +160,43 @@ async def list_for_seeker(
         )
     )
     if destination:
-        stmt = stmt.where(
-            SeekerAdvisorRecommendation.destination_country == destination.upper()
-        )
+        stmt = stmt.where(SeekerAdvisorRecommendation.destination_country == destination.upper())
     if visa_type:
         stmt = stmt.where(SeekerAdvisorRecommendation.visa_type == visa_type)
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def only_ai_eligible(session: AsyncSession, rows: list[Any]) -> list[Any]:
+    """Keep the advisors whose current plan grants ``ai_recommended``.
+
+    AI recommendations are a paid advisor perk; ordinary matches and the directory
+    are not filtered (PM, 2026-10-09), so this is applied only on the AI paths.
+    """
+    from app.services import entitlement_service
+
+    eligible: dict[uuid.UUID, bool] = {}
+    out = []
+    for r in rows:
+        aid = r.advisor_id
+        if aid not in eligible:
+            eligible[aid] = await entitlement_service.can_use(session, aid, "ai_recommended")
+        if eligible[aid]:
+            out.append(r)
+    return out
+
+
+async def clear_for_advisor(session: AsyncSession, advisor_id: uuid.UUID) -> None:
+    """Forget every cached recommendation naming this advisor.
+
+    Called when the advisor's subscription ends or changes plan, so an advisor who
+    stopped paying for ``ai_recommended`` drops out of AI results at once rather
+    than when each seeker's cache happens to refresh (discussion §31).
+    """
+    await session.execute(
+        delete(SeekerAdvisorRecommendation).where(
+            SeekerAdvisorRecommendation.advisor_id == advisor_id
+        )
+    )
 
 
 async def clear_for_seeker(session: AsyncSession, seeker_id: uuid.UUID) -> None:
@@ -150,10 +229,14 @@ async def replace_from_matches(
     profiles_by_id: dict[uuid.UUID, AdvisorProfile] = {}
     if advisor_ids:
         profile_rows = (
-            await session.execute(
-                select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
+            (
+                await session.execute(
+                    select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         profiles_by_id = {p.user_id: p for p in profile_rows}
 
     rows: list[SeekerAdvisorRecommendation] = []
@@ -259,9 +342,9 @@ async def as_match_reads(
     advisor_ids = [r.advisor_id for r in recs]
     users = {
         u.id: u
-        for u in (
-            await session.execute(select(User).where(User.id.in_(advisor_ids)))
-        ).scalars().all()
+        for u in (await session.execute(select(User).where(User.id.in_(advisor_ids))))
+        .scalars()
+        .all()
     }
     profiles = {
         p.user_id: p
@@ -269,7 +352,9 @@ async def as_match_reads(
             await session.execute(
                 select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     }
     ratings = await review_service.rating_summaries(session, advisor_ids)
     reads: list[AdvisorMatchRead] = []
@@ -290,15 +375,11 @@ async def as_match_reads(
                     if profile is not None
                     else None
                 ),
-                years_of_experience=(
-                    profile.years_of_experience if profile is not None else None
-                ),
+                years_of_experience=(profile.years_of_experience if profile is not None else None),
                 average_rating=avg,
                 starting_price_usd=advisor_profile_service.starting_price_usd(profile),
                 match_score=rec.match_score,
-                public_profile_slug=(
-                    profile.public_profile_slug if profile is not None else None
-                ),
+                public_profile_slug=(profile.public_profile_slug if profile is not None else None),
                 match_reasons=rec.match_reasons,
                 rule_score=rec.rule_score,
                 ai_score=rec.ai_score,
@@ -317,6 +398,76 @@ async def as_match_reads(
     return reads
 
 
+@dataclass(slots=True)
+class DashboardMatches:
+    """The two tabs of the dashboard card (QA 2026-10-09, "Profile Based Recommendations").
+
+    ``matched`` is every advisor the profile matching ranked, paying or not: booking
+    is never a plan feature, so a free seeker must see them. ``ai_recommended`` is the
+    premium shortlist (advisors whose own plan grants ``ai_recommended``), filled only
+    when the seeker's plan includes ``matched_advisors``; otherwise it stays empty and
+    ``ai_locked`` tells the client to show a lock with an upgrade message rather than
+    an empty list.
+    """
+
+    matched: list[AdvisorMatchRead] = field(default_factory=list)
+    ai_recommended: list[AdvisorMatchRead] = field(default_factory=list)
+    ai_locked: bool = False
+    ai_failure: AiMatchFailure | None = None
+    ai_attempted: bool = False
+
+
+async def _as_directory_reads(
+    session: AsyncSession,
+    seeker_id: uuid.UUID,
+    recs: list[SeekerAdvisorRecommendation],
+    settings: Settings,
+    *,
+    limit: int,
+) -> list[AdvisorMatchRead]:
+    """The "Matched Advisors" tab, scored exactly as the Find Advisor card (PM, 2026-10-10).
+
+    The directory shows the plain rule percentage from the seeker's profile intent
+    (``advisor_matching_service.match_percentage``, no AI blend); the dashboard tab
+    must read the same number for the same advisor, best first. The AI engine's
+    blended score stays on the AI tab, as it does behind ``?recommended=true``.
+    """
+    reads = await as_match_reads(session, recs, settings)
+    if not reads:
+        return []
+    destination, visa_type = await advisor_matching_service.match_context_from_profile(
+        session, seeker_id
+    )
+    advisor_ids = [r.user_id for r in reads]
+    profiles = {
+        p.user_id: p
+        for p in (
+            await session.execute(
+                select(AdvisorProfile).where(AdvisorProfile.user_id.in_(advisor_ids))
+            )
+        )
+        .scalars()
+        .all()
+    }
+    plain: list[AdvisorMatchRead] = []
+    for read in reads:
+        pct = advisor_matching_service.match_percentage(
+            profiles.get(read.user_id), destination, visa_type, read.average_rating
+        )
+        plain.append(
+            read.model_copy(
+                update={
+                    "match_score": float(pct or 0),
+                    "rule_score": float(pct or 0),
+                    "ai_score": None,
+                    "match_reasons": None,
+                }
+            )
+        )
+    plain.sort(key=lambda m: (m.match_score, m.average_rating or 0), reverse=True)
+    return plain[:limit]
+
+
 async def matches_for_dashboard(
     session: AsyncSession,
     seeker_id: uuid.UUID,
@@ -325,22 +476,29 @@ async def matches_for_dashboard(
     visa_type: VisaType | None = None,
     country: str | None = None,
     limit: int = 10,
-) -> tuple[list[AdvisorMatchRead], AiMatchFailure | None, bool]:
-    """Dashboard ``matched_advisors`` from ``seeker_advisor_recommendations``.
+) -> DashboardMatches:
+    """Dashboard matches from ``seeker_advisor_recommendations``, in two lists.
 
     Refreshes the profile cache on a full miss. Query ``visa_type`` / ``country``
     filter saved rows; they never pull AI Assessment matches.
 
-    The third value is True when a live refresh (and optional AI re-rank) ran.
+    ``ai_attempted`` is True when a live refresh (and optional AI re-rank) ran.
     """
-    ai_failure: AiMatchFailure | None = None
-    ai_attempted = False
-    recs, ai_failure, ai_attempted = await refresh_for_seeker(
-        session, seeker_id, settings=settings
-    )
+    from app.services import entitlement_service
+
+    recs, ai_failure, ai_attempted = await refresh_for_seeker(session, seeker_id, settings=settings)
     if country is not None:
         dest = country.upper()
         recs = [r for r in recs if r.destination_country == dest]
     if visa_type is not None:
         recs = [r for r in recs if r.visa_type == visa_type.value]
-    return await as_match_reads(session, recs[:limit], settings), ai_failure, ai_attempted
+    out = DashboardMatches(ai_failure=ai_failure, ai_attempted=ai_attempted)
+    out.matched = await _as_directory_reads(session, seeker_id, recs, settings, limit=limit)
+    # The AI shortlist is the seeker's paid perk; without it nothing of the list is
+    # sent, so the client cannot show what the plan does not include.
+    if await entitlement_service.can_use(session, seeker_id, "matched_advisors"):
+        ai_recs = await only_ai_eligible(session, recs)
+        out.ai_recommended = await as_match_reads(session, ai_recs[:limit], settings)
+    else:
+        out.ai_locked = True
+    return out

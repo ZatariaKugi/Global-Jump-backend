@@ -1,0 +1,17 @@
+Hi {{ full_name }},
+
+We could not charge your card for the {{ plan_name }} plan.
+
+Your plan stays active for a short grace period. Update your payment method to keep it:
+{{ manage_url }}
+
+If the card is not updated before the grace period ends, the plan will end and its features will pause.
+
+— The {{ app_name }} Team
+
+—
+{{ app_name }}
+© {{ year }} {{ app_name }}. All rights reserved.
+Need help? {{ support_email }}
+How it works: {{ how_it_works_url }}
+FAQs: {{ faq_url }}

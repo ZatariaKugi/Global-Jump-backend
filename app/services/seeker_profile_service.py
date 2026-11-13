@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -248,3 +249,12 @@ async def build_read(
         except Exception:  # noqa: BLE001
             logger.warning("passport_decrypt_failed", profile_id=str(profile.id))
     return read
+
+
+async def mark_ai_recommendations_viewed(session: AsyncSession, user_id: uuid.UUID) -> None:
+    """First use of AI recommended advisors; idempotent (the first instant is kept)."""
+    profile = await get_or_create(session, user_id)
+    if profile.ai_recommendations_viewed_at is None:
+        profile.ai_recommendations_viewed_at = datetime.now(UTC)
+        session.add(profile)
+        await session.flush()

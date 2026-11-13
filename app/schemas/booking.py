@@ -35,6 +35,7 @@ class BookingCreate(BaseModel):
         ),
     )
 
+
 class AdvisorBookingCreate(BaseModel):
     """Advisor books a consultation directly for one of their existing clients."""
 
@@ -43,6 +44,7 @@ class AdvisorBookingCreate(BaseModel):
     scheduled_start: datetime
     duration_minutes: int = Field(ge=15, le=480)
     seeker_note: str | None = Field(default=None, max_length=1000)
+
 
 class ClientRead(BaseModel):
     """Advisor Clients table / picker row.
@@ -61,6 +63,7 @@ class ClientRead(BaseModel):
     consultation_number: str | None = None
     appointment_id: str | None = None
     consultation_type: str | None = None
+    # Seeker-facing profile match (same as Find Advisor); None = nothing to match on.
     match_score: float | None = None
     status: BookingStatus | None = None
     # From the latest booking — drives Clients-table bookmark / red-dot.
@@ -104,9 +107,11 @@ class BookingRead(BaseModel):
     service_id: uuid.UUID | None = None
     name: str
     duration_minutes: int
-    # ``price_usd`` is the total charge; fee split uses PLATFORM_COMMISSION_RATE.
-    advisor_fee_usd: float
-    platform_fee_usd: float
+    # ``price_usd`` is the total charge; the fee split comes from the admin payment settings.
+    # Null for a seeker: how the price splits between the advisor and the platform is
+    # their business, never the seeker's (QA BUG2, PM 2026-10-22).
+    advisor_fee_usd: float | None
+    platform_fee_usd: float | None
     price_usd: float
     scheduled_start: datetime
     scheduled_end: datetime
@@ -126,7 +131,12 @@ class BookingRead(BaseModel):
     updated_at: datetime
     can_reschedule: bool = False
     can_cancel: bool = False
+    # The advisor's Cancel unlocks here after payment (PM, 2026-10-15); None when unpaid.
+    cancel_available_at: datetime | None = None
+    # Seeker reschedule window in hours (kept for older clients); prefer the deadlines.
     cancellation_notice_hours: int = 24
+    reschedule_deadline: datetime | None = None
+    cancellation_deadline: datetime | None = None
     meeting_join_url: str | None = None
     meeting_start_url: str | None = None
 
@@ -182,7 +192,12 @@ class BookingHistoryRead(BaseModel):
     created_at: datetime
     can_reschedule: bool = False
     can_cancel: bool = False
+    # The advisor's Cancel unlocks here after payment (PM, 2026-10-15); None when unpaid.
+    cancel_available_at: datetime | None = None
+    # Seeker reschedule window in hours (kept for older clients); prefer the deadlines.
     cancellation_notice_hours: int = 24
+    reschedule_deadline: datetime | None = None
+    cancellation_deadline: datetime | None = None
 
 
 class BookingAttachmentRead(BaseModel):
@@ -253,7 +268,12 @@ class SessionDetailRead(BaseModel):
     scheduled_start: datetime
     can_reschedule: bool = False
     can_cancel: bool = False
+    # The advisor's Cancel unlocks here after payment (PM, 2026-10-15); None when unpaid.
+    cancel_available_at: datetime | None = None
+    # Seeker reschedule window in hours (kept for older clients); prefer the deadlines.
     cancellation_notice_hours: int = 24
+    reschedule_deadline: datetime | None = None
+    cancellation_deadline: datetime | None = None
     client: SessionClientRead
     timeline: list[SessionTimelineStepRead]
     session_type: str

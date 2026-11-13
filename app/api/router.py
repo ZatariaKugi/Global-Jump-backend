@@ -23,8 +23,10 @@ from app.api.v1 import (
     notifications,
     payments,
     pre_registrations,
+    pricing_plans,
     reviews,
     seeker_profiles,
+    subscriptions,
     support,
     tickets,
     uploads,
@@ -44,6 +46,9 @@ api_router.include_router(advisor_offered_services.router)
 api_router.include_router(bookings.router)
 api_router.include_router(bookmarks.router)
 api_router.include_router(payments.router)
+api_router.include_router(pricing_plans.router)
+api_router.include_router(subscriptions.router)
+api_router.include_router(subscriptions.entitlements_router)
 api_router.include_router(reviews.router)
 api_router.include_router(conversations.router)
 api_router.include_router(devices.router)

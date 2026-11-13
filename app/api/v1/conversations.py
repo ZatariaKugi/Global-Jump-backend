@@ -18,7 +18,7 @@ from app.core.security import decode_token
 from app.db.session import SessionDep
 from app.models.conversation import Conversation
 from app.models.message import Message, MessageAttachment
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.schemas.conversation import (
     ConversationCreate,
     ConversationRead,
@@ -26,10 +26,11 @@ from app.schemas.conversation import (
     MessageRead,
     MessageReport,
     MessageSend,
+    UnreadSummaryRead,
 )
 from app.schemas.response import Meta, ResponseEnvelope
 from app.schemas.token import TokenPayload
-from app.services import conversation_service, email_service, user_service
+from app.services import conversation_service, email_service, entitlement_service, user_service
 from app.services.ws_manager import inbox_manager, manager
 
 router = APIRouter(tags=["conversations"])
@@ -51,8 +52,15 @@ async def _inbox_push_to_participants(
     event_type: str,
     base_payload: dict[str, Any],
 ) -> None:
-    """Send a per-user inbox event (includes that user's ``unread_count``)."""
+    """Send a per-user inbox event (includes that user's ``unread_count``).
+
+    A participant whose plan lacks ``chats`` gets nothing: the preview and the unread
+    count would show them what their plan does not include (deliver and hide, PM
+    2026-10-10). The row stays; it is theirs to read once they upgrade.
+    """
     for user_id in (conversation.seeker_id, conversation.advisor_id):
+        if not await _may_chat(session, user_id):
+            continue
         unread = await conversation_service.unread_count(session, conversation.id, user_id)
         await inbox_manager.send_user(
             user_id,
@@ -74,13 +82,13 @@ async def _send_new_message_email(
 ) -> None:
     """Email the other participant that they received a new message."""
     recipient_id = (
-        conversation.advisor_id
-        if sender.id == conversation.seeker_id
-        else conversation.seeker_id
+        conversation.advisor_id if sender.id == conversation.seeker_id else conversation.seeker_id
     )
     recipient = await session.get(User, recipient_id)
     if recipient is None or recipient.id == sender.id:
         return
+    if not await _may_chat(session, recipient.id):
+        return  # the preview would leak the message to a plan without chat
     email_service.schedule_email(
         email_service.send_new_message_email(
             recipient.email,
@@ -93,6 +101,23 @@ async def _send_new_message_email(
     )
 
 
+async def _assert_may_chat(session: AsyncSession, user: User) -> None:
+    """``chats`` is a plan perk for seekers *and* advisors (PM, 2026-10-08); a booking
+    never unlocks it by itself. Admins are never gated.
+
+    Since QA GJ-CHAT-001 (2026-10-10) this guards *reading* too: the thread list,
+    history, read receipts, edits, deletes, reports and both sockets. A participant
+    whose plan lacks chat sees the lock, not the other side's messages.
+    """
+    if user.role in (UserRole.seeker, UserRole.advisor):
+        await entitlement_service.check(session, user, "chats")
+
+
+async def _may_chat(session: AsyncSession, user_id: uuid.UUID) -> bool:
+    """``_assert_may_chat`` as a boolean for a participant we hold the id of."""
+    return await entitlement_service.can_use(session, user_id, "chats")
+
+
 @router.post("/conversations", status_code=201, response_model=ResponseEnvelope[ConversationRead])
 async def create_conversation(
     data: ConversationCreate,
@@ -101,6 +126,7 @@ async def create_conversation(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[ConversationRead]:
+    await _assert_may_chat(session, current_user)
     conversation = await conversation_service.get_or_create(
         session, current_user, data.other_user_id
     )
@@ -121,6 +147,7 @@ async def list_conversations(
     request_id: RequestIdDep,
     q: str | None = None,
 ) -> ResponseEnvelope[list[ConversationRead]]:
+    await _assert_may_chat(session, current_user)
     stmt = conversation_service.list_for_user_stmt(current_user.id, q)
     conversations, total = await paginate(session, stmt, params)
     data = [
@@ -129,6 +156,33 @@ async def list_conversations(
     ]
     return ResponseEnvelope[list[ConversationRead]](
         data=data, meta=page_meta(params, total, request_id)
+    )
+
+
+@router.get("/conversations/unread-summary", response_model=ResponseEnvelope[UnreadSummaryRead])
+async def unread_summary(
+    current_user: CurrentUser,
+    session: SessionDep,
+    request_id: RequestIdDep,
+) -> ResponseEnvelope[UnreadSummaryRead]:
+    """Counts only, open to a plan that lacks ``chats`` (QA BUG 3, PM 2026-10-23).
+
+    The one read under ``/conversations`` that skips ``_assert_may_chat``: it tells a
+    locked participant *that* messages wait and from whom, never what they say. The
+    list, the history and both sockets keep refusing until the plan includes chat.
+    """
+    messages, threads, sender = await conversation_service.unread_summary(session, current_user.id)
+    locked = current_user.role in (UserRole.seeker, UserRole.advisor) and not await _may_chat(
+        session, current_user.id
+    )
+    return ResponseEnvelope[UnreadSummaryRead](
+        data=UnreadSummaryRead(
+            unread_messages=messages,
+            unread_conversations=threads,
+            latest_sender_name=sender,
+            chat_locked=locked,
+        ),
+        meta=Meta(request_id=request_id),
     )
 
 
@@ -144,6 +198,7 @@ async def list_messages(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[list[MessageRead]]:
+    await _assert_may_chat(session, current_user)
     conversation = await conversation_service.get_for_user(
         session, conversation_id, current_user.id
     )
@@ -176,6 +231,7 @@ async def send_message(
     settings: SettingsDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[MessageRead]:
+    await _assert_may_chat(session, current_user)
     conversation = await conversation_service.get_for_user(
         session, conversation_id, current_user.id
     )
@@ -234,6 +290,7 @@ async def mark_message_read(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[MessageRead]:
+    await _assert_may_chat(session, current_user)
     message = await conversation_service.get_message_for_user(session, message_id, current_user.id)
     message = await conversation_service.mark_read(session, message, current_user)
     sender = await session.get(User, message.sender_id)
@@ -276,6 +333,7 @@ async def edit_message(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[MessageRead]:
+    await _assert_may_chat(session, current_user)
     message = await conversation_service.get_message_for_user(session, message_id, current_user.id)
     message = await conversation_service.edit_message(session, message, current_user.id, data.body)
     photos = await conversation_service.profile_photo_keys(session, [current_user.id])
@@ -319,6 +377,7 @@ async def delete_message(
     current_user: CurrentUser,
     session: SessionDep,
 ) -> None:
+    await _assert_may_chat(session, current_user)
     message = await conversation_service.get_message_for_user(session, message_id, current_user.id)
     message = await conversation_service.delete_message(session, message, current_user.id)
 
@@ -361,6 +420,7 @@ async def report_message(
     session: SessionDep,
     request_id: RequestIdDep,
 ) -> ResponseEnvelope[MessageRead]:
+    await _assert_may_chat(session, current_user)
     message = await conversation_service.get_message_for_user(session, message_id, current_user.id)
     message = await conversation_service.report(session, message, current_user.id, data.reason)
     sender = await session.get(User, message.sender_id)
@@ -406,9 +466,7 @@ async def _authenticate_websocket(
     user = await user_service.get_by_id(session, payload.sub)
     if user is None or not user.is_active:
         return None
-    if (
-        payload.token_version if payload.token_version is not None else 0
-    ) != user.token_version:
+    if (payload.token_version if payload.token_version is not None else 0) != user.token_version:
         return None
     return user
 
@@ -429,6 +487,9 @@ async def inbox_websocket(
     user = await _authenticate_websocket(websocket, session, settings)
     if user is None:
         await websocket.close(code=4401)
+        return
+    if not await _may_chat(session, user.id):
+        await websocket.close(code=4403)  # plan without chat: no previews, no unread
         return
 
     inbox_manager.register(user.id, websocket)
@@ -456,6 +517,9 @@ async def conversation_websocket(
     user = await _authenticate_websocket(websocket, session, settings)
     if user is None:
         await websocket.close(code=4401)
+        return
+    if not await _may_chat(session, user.id):
+        await websocket.close(code=4403)  # plan without chat: no live thread
         return
 
     try:

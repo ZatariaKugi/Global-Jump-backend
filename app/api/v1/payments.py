@@ -24,7 +24,7 @@ from app.schemas.payment import (
     SeekerPaymentSummaryRead,
 )
 from app.schemas.response import Meta, ResponseEnvelope
-from app.services import payment_service
+from app.services import payment_config_service, payment_service, stripe_config_service
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
@@ -75,14 +75,31 @@ async def _get_accessible_transaction(
 @router.get("/config", response_model=ResponseEnvelope[PaymentConfigRead])
 async def get_payment_config(
     settings: SettingsDep,
+    session: SessionDep,
     request_id: RequestIdDep,
-    _current_user: CurrentUser,
+    current_user: CurrentUser,
 ) -> ResponseEnvelope[PaymentConfigRead]:
-    """Stripe publishable key + commission rate for frontend Checkout / fee math."""
+    """Stripe publishable key + the admin payment rules (never any secret).
+
+    A seeker gets the tax flag and the windows but not the commission rule: the split
+    between the advisor and the platform is not theirs to read (QA BUG2, 2026-10-22).
+    """
+    seeker = current_user.role == UserRole.seeker
+    config = await payment_config_service.get_config(session)
+    keys = await stripe_config_service.effective_keys(session, settings)
+    legacy_rate = (
+        float(config.commission_value) / 100 if config.commission_type == "percent" else None
+    )
     return ResponseEnvelope[PaymentConfigRead](
         data=PaymentConfigRead(
-            publishable_key=settings.STRIPE_PUBLISHABLE_KEY,
-            platform_commission_rate=settings.PLATFORM_COMMISSION_RATE,
+            publishable_key=keys.publishable_key,
+            commission_type=None if seeker else config.commission_type,
+            commission_value=None if seeker else float(config.commission_value),
+            seeker_reschedule_window_hours=config.seeker_reschedule_window_hours,
+            advisor_cancellation_window_hours=config.advisor_cancellation_window_hours,
+            platform_fee_refund_behavior=config.platform_fee_refund_behavior,
+            platform_commission_rate=None if seeker else legacy_rate,
+            automatic_tax_enabled=config.automatic_tax_enabled,
         ),
         meta=Meta(request_id=request_id),
     )

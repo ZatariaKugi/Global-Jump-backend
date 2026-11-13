@@ -182,9 +182,17 @@ async def create(
 
 
 async def create_for_user(
-    session: AsyncSession, data: TicketSelfCreate, user: User
+    session: AsyncSession,
+    data: TicketSelfCreate,
+    user: User,
+    *,
+    priority: TicketPriority = TicketPriority.medium,
 ) -> SupportTicket:
-    """Seeker/advisor self-service ticket creation. Owner is the current user."""
+    """Seeker/advisor self-service ticket creation. Owner is the current user.
+
+    ``priority`` is decided by the caller (EPIC 04: ``high`` when the user's plan
+    grants ``priority_support``).
+    """
     snapshot: dict[str, object | None] = {}
     if data.booking_id is not None:
         snapshot = await _booking_snapshot(session, data.booking_id, user)
@@ -194,7 +202,7 @@ async def create_for_user(
         subject=data.subject,
         description=data.description,
         category=data.category,
-        priority=TicketPriority.medium,
+        priority=priority,
         status=TicketStatus.open,
         created_by=user.id,
         **snapshot,
@@ -345,9 +353,7 @@ async def ticket_read(
     *,
     include_internal: bool = True,
 ) -> TicketRead:
-    rows = await build_list_reads(
-        session, [ticket], settings, include_internal=include_internal
-    )
+    rows = await build_list_reads(session, [ticket], settings, include_internal=include_internal)
     return rows[0]
 
 
@@ -405,11 +411,7 @@ async def build_list_reads(
             seeker_photos[seeker.user_id] = seeker.profile_photo_url
             phones[seeker.user_id] = seeker.phone
         for admin in (
-            (
-                await session.execute(
-                    select(AdminProfile).where(AdminProfile.user_id.in_(user_ids))
-                )
-            )
+            (await session.execute(select(AdminProfile).where(AdminProfile.user_id.in_(user_ids))))
             .scalars()
             .all()
         ):

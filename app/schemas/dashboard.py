@@ -46,6 +46,10 @@ class DashboardSummaryRead(BaseModel):
     verified_advisors: int  # verification_status=approved; same window
     active_advisors: int  # approved + is_active; same window
     revenue_today_usd: float  # today's UTC calendar date only, unaffected by window_days
+    # The two halves of revenue_today_usd (QA BUG16): consultations net of same-day
+    # refunds, and subscription invoices paid today. Subscriptions never refund.
+    consultation_revenue_today_usd: float = 0.0
+    subscription_revenue_today_usd: float = 0.0
     user_registration_trend: list[MonthlyCountPoint]  # YYYY-MM; YYYY-MM-DD when days=7
     ai_assessment_volume: list[MonthlyCountPoint]  # same bucket rules as user_registration_trend
     revenue_breakdown: list[RevenueBreakdownSliceRead]  # empty buckets omitted

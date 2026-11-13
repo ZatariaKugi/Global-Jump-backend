@@ -399,6 +399,17 @@ def _search_clause(q: str) -> ColumnElement[bool]:
     return or_(*clauses)
 
 
+async def is_within_newest(
+    session: AsyncSession, user_id: uuid.UUID, assessment: Assessment, cap: int
+) -> bool:
+    """Whether ``assessment`` is one of the seeker's ``cap`` newest (history order)."""
+    if cap <= 0:
+        return False
+    stmt = list_for_user_stmt(user_id).with_only_columns(Assessment.id).limit(cap)
+    newest = set((await session.execute(stmt)).scalars().all())
+    return assessment.id in newest
+
+
 def list_for_user_stmt(
     user_id: uuid.UUID,
     *,
@@ -576,9 +587,7 @@ async def delete_question(session: AsyncSession, question: AssessmentQuestion) -
     await session.flush()
 
 
-async def bulk_set_active(
-    session: AsyncSession, is_active: bool, admin_id: uuid.UUID
-) -> int:
+async def bulk_set_active(session: AsyncSession, is_active: bool, admin_id: uuid.UUID) -> int:
     """Set ``is_active`` on every assessment question in one UPDATE."""
     result = await session.execute(
         update(AssessmentQuestion).values(

@@ -1,0 +1,24 @@
+{% extends "_base.html" %}
+{% from "_macros.html" import headline, cta, details_open, details_row, details_close %}
+
+{% block title %}{% if renewed %}Subscription renewed{% else %}Subscription active{% endif %} — {{ app_name }}{% endblock %}
+
+{% block content %}
+  {{ headline("Subscription renewed" if renewed else "Subscription active") }}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    Hi {{ full_name }}, {% if renewed %}your {{ plan_name }} plan has renewed{% else %}your {{ plan_name }} plan is now active{% endif %}. Thanks for your payment.
+  </p>
+  {{ details_open() }}
+  {{ details_row("Plan", plan_name) }}
+  {{ details_row("Amount paid", "$" ~ amount_usd) }}
+  {% if period_end_str %}
+    {{ details_row("Paid through", period_end_str) }}
+  {% endif %}
+  {{ details_close() }}
+  {% if invoice_url %}
+    {{ cta(invoice_url, "View invoice") }}
+  {% endif %}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    You can manage your plan, card and invoices any time from your dashboard.
+  </p>
+{% endblock %}

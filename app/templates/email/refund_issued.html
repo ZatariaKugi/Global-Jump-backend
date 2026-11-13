@@ -1,0 +1,18 @@
+{% extends "_base.html" %}
+{% from "_macros.html" import headline, details_open, details_row, details_close %}
+
+{% block title %}Refund issued — {{ app_name }}{% endblock %}
+
+{% block content %}
+  {{ headline("Refund issued") }}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    Hi {{ full_name }}, a refund has been issued for your consultation.
+  </p>
+  {{ details_open() }}
+  {{ details_row("Consultation", booking_name) }}
+  {{ details_row("Refunded", "$" ~ amount_usd) }}
+  {{ details_close() }}
+  <p class="body-text" style="margin:0 0 16px;color:#5C5C5E;font-size:14px;line-height:22px;">
+    The money goes back to your original payment method and may take 5-10 business days to appear on your statement.
+  </p>
+{% endblock %}

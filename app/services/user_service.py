@@ -73,15 +73,45 @@ async def build_user_read(session: AsyncSession, user: User, settings: Settings)
     base = UserRead.model_validate(user)
     return base.model_copy(
         update={
-            "profile_photo_url": resolve_media_url(await profile_photo_key(session, user), settings)
+            "profile_photo_url": resolve_media_url(
+                await profile_photo_key(session, user), settings
+            ),
+            "plan_choice_required": await plan_choice_required(session, user),
         }
     )
 
 
+async def plan_choice_required(session: AsyncSession, user: User) -> bool:
+    """Whether the first-time plans page still has to be shown (discussion §4).
+
+    Set to rest by ``subscription_service.choose_free`` or a completed paid checkout.
+    Anyone who already holds a subscription row chose a plan before this existed.
+    """
+    from app.models.subscription import Subscription
+
+    if user.role not in (UserRole.seeker, UserRole.advisor):
+        return False
+    if user.plan_choice_acknowledged_at is not None:
+        return False
+    held = (
+        await session.execute(
+            select(Subscription.id).where(Subscription.user_id == user.id).limit(1)
+        )
+    ).first()
+    return held is None
+
+
 async def _notify_admins_user_registered(session: AsyncSession, user: User) -> None:
+    # The admin's deep link needs the role (#340): a seeker opens Seeker Management, an
+    # advisor the Verification Queue. The notification row carries no role field, so the
+    # type says it.
     await notification_service.notify_admins(
         session,
-        type=NotificationType.user_registered,
+        type=(
+            NotificationType.seeker_registered
+            if user.role == UserRole.seeker
+            else NotificationType.user_registered
+        ),
         title="New user registered",
         body=f"{user.full_name or user.email} signed up as {user.role.value}",
         entity_type=NotificationEntityType.user,
